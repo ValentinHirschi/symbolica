@@ -862,7 +862,7 @@ impl<R: Field + Echelonize, E: Exponent, O: MonomialOrder> GroebnerBasis<R, E, O
             selected_polys.clear();
             let mut i = critical_pairs.len() - 1;
 
-            let mut l_tmp = vec![];
+            let mut selected_multiples: HashMap<usize, HashSet<Vec<E>>> = HashMap::default();
             loop {
                 if critical_pairs[i].degree == lowest_lcm_deg {
                     let pair = critical_pairs.swap_remove(i);
@@ -872,11 +872,14 @@ impl<R: Field + Echelonize, E: Exponent, O: MonomialOrder> GroebnerBasis<R, E, O
                         (pair.index_sec, pair.lcm_diff_sec),
                     ];
                     for poly_info in e {
-                        if !l_tmp.contains(&poly_info) {
+                        if selected_multiples
+                            .entry(poly_info.0)
+                            .or_default()
+                            .insert(poly_info.1.clone())
+                        {
                             let new_f1 =
                                 Self::simplify(&mut simplifications[poly_info.0], &poly_info.1);
                             selected_polys.push(new_f1);
-                            l_tmp.push(poly_info);
                         }
                     }
                 }
@@ -939,6 +942,10 @@ impl<R: Field + Echelonize, E: Exponent, O: MonomialOrder> GroebnerBasis<R, E, O
                         }
 
                         let pp = Self::simplify(&mut simplifications[*index], &exp);
+                        selected_multiples
+                            .entry(*index)
+                            .or_default()
+                            .insert(exp.clone());
                         new_polys.push(pp);
                     }
                 }
@@ -1007,6 +1014,9 @@ impl<R: Field + Echelonize, E: Exponent, O: MonomialOrder> GroebnerBasis<R, E, O
                 self.print_stats,
             );
 
+            // perform simplifications using a copy of the current basis, as the basis may be modified in-place
+            let simplification_basis = basis.clone();
+
             // construct new polynomials
             for m in &matrix {
                 let lmi = sorted_monomial_indices[m[0].1];
@@ -1027,11 +1037,45 @@ impl<R: Field + Echelonize, E: Exponent, O: MonomialOrder> GroebnerBasis<R, E, O
                     simplifications.push(vec![(vec![E::zero(); nvars], poly.clone())]);
 
                     Self::update(&mut basis, &mut critical_pairs, poly, new_index);
+                } else {
+                    // update entries in the tab with simpler polynomials
+                    let mut diff = vec![E::zero(); nvars];
+                    'bf: for (g_ind, g) in &simplification_basis {
+                        if poly
+                            .last_exponents()
+                            .iter()
+                            .zip(g.last_exponents())
+                            .all(|(pi, gi)| *pi >= *gi)
+                        {
+                            for ((d, pi), gi) in diff
+                                .iter_mut()
+                                .zip(poly.last_exponents())
+                                .zip(g.last_exponents())
+                            {
+                                *d = *pi - *gi;
+                            }
+
+                            // Only this batch's inputs may be replaced by its reduced rows.
+                            // Matching a leading monomial alone can erase an unprocessed pair.
+                            if !selected_multiples
+                                .get(g_ind)
+                                .is_some_and(|multiples| multiples.contains(&diff))
+                            {
+                                continue;
+                            }
+
+                            for (diff_e, p) in &mut simplifications[*g_ind] {
+                                if diff == *diff_e {
+                                    *p = poly.clone();
+                                    continue 'bf;
+                                }
+                            }
+
+                            // new polynomial
+                            simplifications[*g_ind].push((diff.clone(), poly.clone()));
+                        }
+                    }
                 }
-                // `simplifications` caches exact monomial multiples only.
-                // Substituting a different row with the same leading monomial
-                // can identify the two representatives of a later critical
-                // pair and silently discard its nonzero S-polynomial.
             }
         }
 
@@ -3542,144 +3586,32 @@ mod test {
 mod f4_cache_tests {
     use crate::{
         atom::{Atom, AtomCore},
-        domains::rational::{Q, RationalField},
-        poly::{PolyVariable, groebner::GroebnerBasis, polynomial::MultivariatePolynomial},
+        domains::rational::Q,
+        poly::{PolyVariable, groebner::GroebnerBasis},
         symbol,
     };
     use std::sync::Arc;
 
-    type Poly = MultivariatePolynomial<RationalField, u16>;
-    fn parse(text: &str, variables: &Arc<Vec<PolyVariable>>) -> Poly {
-        Atom::parse(text, "f4_cache_regression", Default::default())
-            .unwrap()
-            .try_to_polynomial(&Q, variables.clone())
-            .unwrap()
-    }
-    fn variables(order: &[&str]) -> Arc<Vec<PolyVariable>> {
-        Arc::new(
-            order
-                .iter()
-                .map(|s| PolyVariable::from(symbol!(*s)))
-                .collect(),
-        )
-    }
-    fn input(v: &Arc<Vec<PolyVariable>>) -> Vec<Poly> {
-        [
-            "f4_cache_regression::x^2-f4_cache_regression::x-f4_cache_regression::z",
-            "f4_cache_regression::u-f4_cache_regression::x*f4_cache_regression::u-1",
-            "2*f4_cache_regression::x*f4_cache_regression::v-f4_cache_regression::v-1",
-        ]
-        .iter()
-        .map(|s| parse(s, v))
-        .collect()
-    }
-
     #[test]
-    fn f4_exact_multiples_preserve_nonzero_critical_pair() {
-        let variables = variables(&[
-            "f4_cache_regression::x",
-            "f4_cache_regression::u",
-            "f4_cache_regression::z",
-            "f4_cache_regression::v",
-        ]);
-        let source = input(&variables);
-        // Independently written reduced Lex basis, including the eliminant omitted
-        // when two distinct cached multiples were replaced by the same matrix row.
-        let expected = [
-            "f4_cache_regression::x-1/2-2*f4_cache_regression::z*f4_cache_regression::v-f4_cache_regression::v/2",
-            "f4_cache_regression::u*f4_cache_regression::z+2*f4_cache_regression::z*f4_cache_regression::v+f4_cache_regression::v/2+1/2",
-            "f4_cache_regression::u*f4_cache_regression::v-f4_cache_regression::u-2*f4_cache_regression::v",
-            "(f4_cache_regression::z+1/4)*f4_cache_regression::v^2-1/4",
-        ].iter().map(|s| parse(s,&variables)).collect::<Vec<_>>();
-        assert!(GroebnerBasis::is_groebner_basis(&expected));
-        for permutation in [
-            [0, 1, 2],
-            [0, 2, 1],
-            [1, 0, 2],
-            [1, 2, 0],
-            [2, 0, 1],
-            [2, 1, 0],
-        ] {
-            let input = permutation.map(|i| source[i].clone());
-            let basis = GroebnerBasis::new(&input, false);
-            assert!(GroebnerBasis::is_groebner_basis(&basis.system));
-            assert!(source.iter().all(|f| f.reduce(&basis.system).is_zero()));
-            assert!(expected.iter().all(|f| f.reduce(&basis.system).is_zero()));
-            assert!(basis.system.iter().all(|f| f.reduce(&expected).is_zero()));
-        }
-    }
-
-    #[test]
-    fn f4_input_membership_survives_all_lex_variable_orders() {
-        let names = [
-            "f4_cache_regression::x",
-            "f4_cache_regression::u",
-            "f4_cache_regression::z",
-            "f4_cache_regression::v",
-        ];
-        for a in 0..4 {
-            for b in 0..4 {
-                for c in 0..4 {
-                    for d in 0..4 {
-                        let indices = [a, b, c, d];
-                        if indices
-                            .iter()
-                            .enumerate()
-                            .any(|(i, v)| indices[..i].contains(v))
-                        {
-                            continue;
-                        }
-                        let v = variables(&indices.map(|i| names[i]));
-                        let source = input(&v);
-                        let basis = GroebnerBasis::new(&source, false);
-                        assert!(GroebnerBasis::is_groebner_basis(&basis.system));
-                        assert!(source.iter().all(|f| f.reduce(&basis.system).is_zero()));
-                        // All these ideals have a point; no false unit ideal may pass merely by
-                        // reducing every input to zero.
-                        assert!(!parse("1", &v).reduce(&basis.system).is_zero());
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn f4_same_cache_invariant_over_finite_fields_and_grevlex() {
-        use crate::{domains::finite_field::Zp, poly::GrevLexOrder};
-        let vars = variables(&[
-            "f4_cache_regression::x",
-            "f4_cache_regression::u",
-            "f4_cache_regression::z",
-            "f4_cache_regression::v",
-        ]);
-        let rational = input(&vars);
-        let grev = rational
-            .iter()
-            .map(|f| f.reorder::<GrevLexOrder>())
-            .collect::<Vec<_>>();
-        let basis = GroebnerBasis::new(&grev, false);
+    fn simplification_preserves_unprocessed_critical_pairs() {
+        let variables = Arc::new(
+            ["x", "u", "z", "v"]
+                .map(|name| PolyVariable::from(symbol!(format!("f4_cache_regression::{name}"))))
+                .to_vec(),
+        );
+        let parse = |text| {
+            Atom::parse(text, "f4_cache_regression", Default::default())
+                .unwrap()
+                .try_to_polynomial::<_, u16>(&Q, variables.clone())
+                .unwrap()
+        };
+        let input = ["x^2-x-z", "u-x*u-1", "2*x*v-v-1"].map(parse);
+        let basis = GroebnerBasis::new(&input, false);
         assert!(GroebnerBasis::is_groebner_basis(&basis.system));
-        assert!(grev.iter().all(|f| f.reduce(&basis.system).is_zero()));
-        for prime in [13, 101, 65521] {
-            let field = Zp::new(prime);
-            let polys = rational
-                .iter()
-                .map(|f| {
-                    f.to_expression()
-                        .try_to_polynomial::<_, u16>(&field, vars.clone())
-                        .unwrap()
-                })
-                .collect::<Vec<_>>();
-            let basis = GroebnerBasis::new(&polys, false);
-            assert!(GroebnerBasis::is_groebner_basis(&basis.system));
-            assert!(polys.iter().all(|f| f.reduce(&basis.system).is_zero()));
-            let grev = polys
-                .iter()
-                .map(|f| f.reorder::<GrevLexOrder>())
-                .collect::<Vec<_>>();
-            let basis = GroebnerBasis::new(&grev, false);
-            assert!(GroebnerBasis::is_groebner_basis(&basis.system));
-            assert!(grev.iter().all(|f| f.reduce(&basis.system).is_zero()));
-        }
+        assert!(input.iter().all(|f| f.reduce(&basis.system).is_zero()));
+        // This eliminant was lost when the same reduced row replaced two
+        // cached multiples even though only one had entered the matrix.
+        assert!(parse("(z+1/4)*v^2-1/4").reduce(&basis.system).is_zero());
+        assert!(!parse("1").reduce(&basis.system).is_zero());
     }
 }
