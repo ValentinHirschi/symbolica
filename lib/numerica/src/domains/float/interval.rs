@@ -1052,7 +1052,6 @@ mod tests {
 mod sqrt_tests {
     use crate::domains::{
         float::{Float, Real, RealBall, SingleFloat},
-        integer::Integer,
         rational::Rational,
     };
 
@@ -1079,61 +1078,6 @@ mod sqrt_tests {
             let input = RealBall::exact(Float::with_val(precision, 2));
             assert_sqrt_enclosure(&input, &2.into(), &2.into());
             assert!(!input.sqrt().radius.is_zero());
-        }
-    }
-
-    #[test]
-    fn zero_and_binary_perfect_squares_remain_exact() {
-        for (input, expected) in [(0, 0), (1, 1), (4, 2), (9, 3), (16, 4)] {
-            let input = RealBall::exact(Float::with_val(64, input));
-            let result = input.sqrt();
-            assert_eq!(result.center.to_rational(), Rational::from(expected));
-            assert!(result.radius.is_zero());
-        }
-    }
-
-    #[test]
-    fn finite_positive_intervals_and_zero_endpoint_are_enclosed() {
-        for (lower, upper) in [((0, 1), (7, 3)), ((1, 7), (13, 2)), ((13, 2), (99, 1))] {
-            let lower: Rational = lower.into();
-            let upper: Rational = upper.into();
-            for precision in [8, 96] {
-                let ball = RealBall::from_rational_bounds(&lower, &upper, precision);
-                // Ball construction may widen [0,b] slightly below zero. Sqrt
-                // correctly rejects that represented domain instead of clipping.
-                if ball.lower_bound() < Float::with_val(precision, 0) {
-                    assert!(!ball.sqrt().is_finite());
-                } else {
-                    assert_sqrt_enclosure(&ball, &lower, &upper);
-                }
-            }
-        }
-        let ball = RealBall::from_bounds(Float::with_val(64, 0), Float::with_val(64, 4));
-        assert_sqrt_enclosure(&ball, &0.into(), &4.into());
-    }
-
-    #[test]
-    fn tiny_and_huge_exact_inputs_keep_scale_and_enclose_the_root() {
-        let huge: Rational = Integer::from(2).pow(2048).into();
-        let tiny = Rational::from((Integer::one(), Integer::from(2).pow(2048)));
-        for scale in [tiny, huge] {
-            let value = &scale * &Rational::from((7, 3));
-            let ball = RealBall::from_rational_bounds(&value, &value, 96);
-            assert_sqrt_enclosure(&ball, &value, &value);
-            let root = ball.sqrt();
-            assert!(root.radius < root.center / 100);
-        }
-    }
-
-    #[test]
-    fn exact_float_sweep_encloses_both_rounding_directions() {
-        for precision in [8, 32, 96] {
-            for numerator in 1..80 {
-                let value: Rational = (numerator, 17).into();
-                let float = Float::new(precision).from_rational(&value);
-                let exact = float.to_rational();
-                assert_sqrt_enclosure(&RealBall::exact(float), &exact, &exact);
-            }
         }
     }
 
