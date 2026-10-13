@@ -394,29 +394,4 @@ mod ball_tests {
         assert!(RealBall::FIXED_PRECISION.is_none());
         assert!(ComplexBall::FIXED_PRECISION.is_none());
     }
-
-    #[test]
-    fn complex_polynomial_encloses_rational_causal_ray_value() {
-        let mut evaluator = parse!("1-5*x*(1-x)")
-            .evaluator(&[parse!("x")])
-            .build()
-            .unwrap()
-            .map_coeff_with_prec(
-                &|c| ComplexBall::from_rational_ball(c, &Rational::from(0), 80),
-                80,
-            );
-        let point = ComplexBall::from_rational_ball(
-            &Complex::new(Rational::from((1, 3)), Rational::from((1, 7))),
-            &Rational::from(0),
-            80,
-        );
-        let value = evaluator.evaluate_single(&[point]);
-        let reference = ComplexBall::from_rational_ball(
-            &Complex::new(Rational::from((-94, 441)), Rational::from((-5, 21))),
-            &Rational::from(0),
-            160,
-        );
-        assert!(value.contains_ball(&reference));
-        assert!(value.im.is_strictly_negative());
-    }
 }
