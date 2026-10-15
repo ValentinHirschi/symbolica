@@ -10,8 +10,9 @@ use std::{ops::Neg, sync::Arc};
 
 mod bracketed;
 pub use bracketed::{
-    BracketedRoot, BracketedRootConvergence, BracketedRootError, BracketedRootOptions,
-    BracketedRootTermination, nsolve_bracketed,
+    BracketedRoot, BracketedRootCandidate, BracketedRootConvergence, BracketedRootError,
+    BracketedRootOptions, BracketedRootTermination, ObservedBracketedRoot, nsolve_bracketed,
+    nsolve_bracketed_observed,
 };
 
 use ahash::{HashMap, HashSet};
