@@ -4,20 +4,40 @@ mod retained;
 
 impl<T: Default + Clone> ExpressionEvaluator<T> {
     /// Import a generated evaluator's scalar constants and shared function table.
-    fn import_vector_context(
+    fn import_vector_context<V: Vectorize<T> + ?Sized>(
         &self,
+        vectorizer: &V,
         ins: &mut InstructionList<T>,
         external_functions: &mut Vec<ExternalFunctionContainer<T>>,
     ) -> (Vec<Slot>, Vec<usize>) {
         let mut slots = Vec::new();
         let mut constants = Vec::new();
-        for value in &self.stack[self.param_count..self.reserved_indices] {
-            constants.push(ins.constants.len());
-            slots.push(Slot::Const(ins.constants.len()));
-            // InstructionList tracks constants in vector-sized groups.
-            ins.constants.push(value.clone());
-            ins.constants.extend((1..ins.dim).map(|_| T::default()));
-            ins.unknown_constants.push(false);
+        let unknown: HashSet<_> = self
+            .external_fns
+            .iter()
+            .filter_map(|external| external.constant_index)
+            .collect();
+        for (index, value) in self.stack[self.param_count..self.reserved_indices]
+            .iter()
+            .enumerate()
+        {
+            let slot = if unknown.contains(&index) {
+                // Registered constants can have equal placeholder values. Keep
+                // their identities distinct and exclude them from interning
+                // before any later literal is imported.
+                let slot = Slot::Const(ins.constants.len());
+                ins.constants.push(value.clone());
+                ins.constants.extend((1..ins.dim).map(|_| T::default()));
+                ins.unknown_constants.push(true);
+                slot
+            } else {
+                vectorizer.import_scalar_constant(value.clone(), ins)
+            };
+            let Slot::Const(index) = slot else {
+                panic!("Imported scalar constants must use constant slots");
+            };
+            constants.push(index);
+            slots.push(slot);
         }
         let mut functions = Vec::new();
         for external in &self.external_fns {
@@ -46,14 +66,16 @@ impl<T: Default + Clone> ExpressionEvaluator<T> {
     }
 
     /// Inline generated scalar instructions without dualizing them again.
-    fn inline_vector_components(
+    fn inline_vector_components<V: Vectorize<T> + ?Sized>(
         &self,
+        vectorizer: &V,
         args: &[Slot],
         ins: &mut InstructionList<T>,
         external_functions: &mut Vec<ExternalFunctionContainer<T>>,
         next_label: &mut usize,
     ) -> Vec<Slot> {
-        let (constants, functions) = self.import_vector_context(ins, external_functions);
+        let (constants, functions) =
+            self.import_vector_context(vectorizer, ins, external_functions);
         let mut slots = args.to_vec();
         slots.extend(constants);
         slots.resize(self.stack.len(), Slot::Temp(0));
@@ -374,7 +396,7 @@ impl<T: Default + Clone> ExpressionEvaluator<T> {
                                 }
                                 let generated = &bodies[&key];
                                 let (constants, function_indices) = generated
-                                    .import_vector_context(&mut ins, &mut new_external_fns);
+                                    .import_vector_context(v, &mut ins, &mut new_external_fns);
                                 let mut components = Vec::with_capacity(v.get_dimension());
                                 for component in 0..v.get_dimension() {
                                     let mut evaluator = generated.clone();
@@ -483,6 +505,7 @@ impl<T: Default + Clone> ExpressionEvaluator<T> {
                             })
                             .collect::<Vec<_>>();
                         let results = generated.inline_vector_components(
+                            v,
                             &args,
                             &mut ins,
                             &mut new_external_fns,
@@ -678,6 +701,26 @@ pub trait Vectorize<T> {
     /// `false` if each constant only appears in the first slot and has zeros for all other slots.
     fn duplicate_constants(&self) -> bool;
 
+    /// Import an already-generated scalar constant, without vectorizing it again.
+    /// The returned slot must be a [`Slot::Const`] holding `value`. Implementations
+    /// may reuse an existing literal constant. Registered constants are imported
+    /// separately so equal placeholders cannot merge distinct symbolic values.
+    ///
+    /// The default keeps a separate vector-sized storage group for each scalar,
+    /// preserving compatibility with vectorizers over types without equality.
+    fn import_scalar_constant(&self, value: T, instructions: &mut InstructionList<T>) -> Slot
+    where
+        T: Default + Clone,
+    {
+        let slot = Slot::Const(instructions.constants.len());
+        instructions.constants.push(value);
+        instructions
+            .constants
+            .extend((1..instructions.dim).map(|_| T::default()));
+        instructions.unknown_constants.push(false);
+        slot
+    }
+
     /// Map an instruction applied to a vector of slots (components accessible with [Slot::index])
     /// to a vector of instructions of [Vectorize::get_dimension] length.
     fn map_instruction(
@@ -773,6 +816,14 @@ impl<T: DualNumberStructure> Vectorize<Complex<Rational>> for Dualizer<T> {
             dual: Arc::clone(&self.dual),
             zero_components: zero_components.into_iter().collect(),
         }))
+    }
+
+    fn import_scalar_constant(
+        &self,
+        value: Complex<Rational>,
+        instructions: &mut InstructionList<Complex<Rational>>,
+    ) -> Slot {
+        instructions.add_constant_in_first_component(value)
     }
 
     fn map_instruction_in_function(
@@ -1305,11 +1356,18 @@ impl<T: DualNumberStructure> Vectorize<Complex<Rational>> for Dualizer<T> {
 
 #[cfg(test)]
 mod test {
-    use numerica::domains::{dual::HyperDual, float::Complex, rational::Rational};
+    use numerica::domains::{
+        dual::HyperDual,
+        float::{Complex, Float},
+        rational::Rational,
+    };
 
     use crate::{
-        atom::{Atom, AtomCore, EvaluationInfo},
-        evaluate::{Dualizer, FunctionMap, FunctionRegistrationOptions, InliningPolicy},
+        atom::{Atom, AtomCore, EvaluationInfo, Symbol},
+        evaluate::{
+            Dualizer, FunctionMap, FunctionRegistrationOptions, InliningPolicy, InstructionList,
+            Slot, VectorInstruction, Vectorize,
+        },
         function, parse, symbol,
     };
 
@@ -1538,6 +1596,188 @@ mod test {
             evaluator.evaluate(&[c, 0., x, 2.], &mut out);
             assert_eq!(out, expected);
         }
+    }
+
+    #[test]
+    fn deep_shared_dual_constants_stay_bounded() {
+        let shape = vec![vec![0, 0], vec![1, 0], vec![0, 1], vec![2, 0], vec![1, 1]];
+        let build = |depth, inlining| {
+            let x = symbol!("dual_pool_x");
+            let z = symbol!("dual_pool_z");
+            let condition = symbol!("dual_pool_condition");
+            let functions: Vec<_> = (0..depth)
+                .map(|i| symbol!(format!("dual_pool_function_{i}")))
+                .collect();
+            let mut map = FunctionMap::new();
+            for (index, &function) in functions.iter().enumerate() {
+                let body = if index == 0 {
+                    Symbol::IF.call((
+                        condition,
+                        (z.to_atom() + 2).sqrt() + Symbol::PI,
+                        z.to_atom().pow(2),
+                    ))
+                } else {
+                    functions[index - 1].call((z,)) + z.to_atom().pow(2)
+                };
+                map.add_function_with_options(
+                    function,
+                    vec![z],
+                    body,
+                    FunctionRegistrationOptions::new().inlining(inlining),
+                )
+                .unwrap();
+            }
+            functions[depth - 1]
+                .call((x,))
+                .evaluator(&[x.to_atom(), condition.to_atom()])
+                .function_map(map)
+                .build()
+                .unwrap()
+                .vectorize(&Dualizer::new(HyperDual::<f64>::new(shape.clone()), vec![]))
+                .unwrap()
+        };
+        for depth in [1, 2, 4, 8] {
+            let exact = build(depth, InliningPolicy::Never);
+            let constants = exact.reserved_indices - exact.param_count;
+            // This family introduces the same literals at every level. Its
+            // constant pool must not grow by the Dual dimension per level.
+            assert!(
+                constants <= 64 * shape.len(),
+                "depth={depth}, constants={constants}"
+            );
+            let max_parameters = exact
+                .external_fns
+                .iter()
+                .filter_map(|external| external.body.as_ref().map(|body| body.param_count))
+                .max()
+                .unwrap();
+            assert!(
+                max_parameters <= 128 * shape.len(),
+                "depth={depth}, captures={max_parameters}"
+            );
+            eprintln!(
+                "shared Dual depth={depth}, constants={constants}, max_parameters={max_parameters}"
+            );
+            let map = |v: &Complex<Rational>| Complex::new(v.re.to_f64(), v.im.to_f64());
+            let mut shared = exact.map_coeff(&map);
+            let mut inline = build(depth, InliningPolicy::Always).map_coeff(&map);
+            let c = |re, im| Complex::new(re, im);
+            for (x, condition) in [(c(0.3, 0.2), 1.), (c(-2., 0.), 0.), (c(1.2, -0.1), 1.)] {
+                let input = [
+                    x,
+                    c(0., 1.),
+                    c(1., -0.5),
+                    c(0.25, 0.),
+                    c(0., 0.5),
+                    c(condition, 0.),
+                    c(0., 0.),
+                    c(0., 0.),
+                    c(0., 0.),
+                    c(0., 0.),
+                ];
+                let mut actual = [c(0., 0.); 5];
+                let mut expected = actual;
+                shared.evaluate(&input, &mut actual);
+                inline.evaluate(&input, &mut expected);
+                for (actual, expected) in actual.into_iter().zip(expected) {
+                    assert!((actual.re - expected.re).abs() < 1e-11);
+                    assert!((actual.im - expected.im).abs() < 1e-11);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn imported_registered_constants_keep_distinct_placeholders() {
+        let first = symbol!(
+            "dual_pool_registered_first",
+            eval =
+                EvaluationInfo::constant(|_, precision| Ok(Float::with_val(precision, 2).into()))
+        );
+        let second = symbol!(
+            "dual_pool_registered_second",
+            eval =
+                EvaluationInfo::constant(|_, precision| Ok(Float::with_val(precision, 3).into()))
+        );
+        let x = symbol!("dual_pool_registered_x");
+        let source = (first.to_atom() * x + second + 1)
+            .evaluator(&[x.to_atom()])
+            .build()
+            .unwrap();
+        let expected = source.clone().map_coeff_with_prec(
+            &|v| Complex::new(v.re.to_multi_prec_float(192), v.im.to_multi_prec_float(192)),
+            192,
+        );
+        let vectorizer = Dualizer::new(HyperDual::<f64>::new(vec![vec![0], vec![1]]), vec![]);
+        let mut instructions = InstructionList {
+            instructions: vec![],
+            constants: vec![],
+            unknown_constants: vec![],
+            dim: 2,
+        };
+        let mut functions = vec![];
+        let (slots, _) =
+            source.import_vector_context(&vectorizer, &mut instructions, &mut functions);
+        let registered: Vec<_> = functions.iter().filter_map(|f| f.constant_index).collect();
+        assert_eq!(registered.len(), 2);
+        assert_ne!(registered[0], registered[1]);
+        let zero = vectorizer.import_scalar_constant(Complex::default(), &mut instructions);
+        assert!(registered.iter().all(|index| zero != Slot::Const(*index)));
+        let mut values: Vec<_> = instructions
+            .constants
+            .iter()
+            .map(|v| Complex::new(v.re.to_multi_prec_float(192), v.im.to_multi_prec_float(192)))
+            .collect();
+        for function in functions {
+            if let Some(index) = function.constant_index {
+                values[index] = function.evaluate_constant::<Complex<Float>>(192).unwrap();
+            }
+        }
+        for (slot, expected) in slots
+            .iter()
+            .zip(&expected.stack[expected.param_count..expected.reserved_indices])
+        {
+            let Slot::Const(index) = slot else {
+                unreachable!()
+            };
+            assert_eq!(&values[*index], expected);
+            assert_eq!(values[*index].re.prec(), expected.re.prec());
+            assert_eq!(values[*index].im.prec(), expected.im.prec());
+        }
+    }
+
+    #[test]
+    fn scalar_constant_import_keeps_vectorizers_without_equality_supported() {
+        #[derive(Clone, Default)]
+        struct Value(i32);
+        struct Custom;
+        impl Vectorize<Value> for Custom {
+            fn duplicate_constants(&self) -> bool {
+                false
+            }
+            fn get_dimension(&self) -> usize {
+                2
+            }
+            fn map_instruction(
+                &self,
+                _: &VectorInstruction,
+                _: &mut InstructionList<Value>,
+            ) -> Vec<VectorInstruction> {
+                unreachable!()
+            }
+        }
+        let mut instructions = InstructionList {
+            instructions: vec![],
+            constants: vec![],
+            unknown_constants: vec![],
+            dim: 2,
+        };
+        assert_eq!(
+            Custom.import_scalar_constant(Value(7), &mut instructions),
+            Slot::Const(0)
+        );
+        assert_eq!(instructions.constants[0].0, 7);
+        assert_eq!(instructions.constants[1].0, 0);
     }
 
     #[test]
