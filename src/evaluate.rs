@@ -24,9 +24,11 @@ use std::{
 #[cfg(feature = "native_code_generation")]
 use symjit::{Applet, Composer, Config, Defuns, Storage, Translator};
 
+mod aliases;
 #[cfg(feature = "native_code_generation")]
 mod backend;
 mod batch;
+mod boolean;
 mod domain;
 mod dual;
 mod evaluator;
@@ -36,6 +38,8 @@ mod external;
 mod function_map;
 mod instruction;
 mod optimize;
+mod parameter_rows;
+mod specialize;
 mod tree;
 
 #[cfg(feature = "native_code_generation")]
@@ -53,6 +57,8 @@ pub use instruction::{
     Instruction, InstructionList, Label, Slot, VectorInstruction,
 };
 pub use optimize::*;
+pub use parameter_rows::*;
+pub use specialize::ParameterRows;
 pub use tree::*;
 
 use function_map::Expr;
@@ -72,8 +78,7 @@ use crate::{
         integer::Integer,
         rational::Rational,
     },
-    error, get_symbol,
-    info,
+    error, get_symbol, info,
     license::LicenseManager,
     numerical_integration::MonteCarloRng,
     utils::AbortCheck,

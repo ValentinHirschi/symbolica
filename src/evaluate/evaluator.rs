@@ -36,6 +36,21 @@ pub(super) struct ProgramView<'a, T> {
 }
 
 impl<T> ExpressionEvaluator<T> {
+    /// Return the number of parameter values required for one evaluation.
+    pub fn get_input_len(&self) -> usize {
+        self.param_count
+    }
+
+    /// Return the number of results produced by one evaluation.
+    pub fn get_output_len(&self) -> usize {
+        self.result_indices.len()
+    }
+
+    /// Borrow the numerical constants stored by the evaluator.
+    pub fn get_constants(&self) -> &[T] {
+        &self.stack[self.param_count..self.reserved_indices]
+    }
+
     pub(super) fn program(&self) -> ProgramView<'_, T> {
         ProgramView {
             instructions: &self.instructions,
@@ -724,21 +739,6 @@ impl<T: Default> ExpressionEvaluator<T> {
             external_fns: self.external_fns.iter().map(|x| x.map()).collect(),
             settings: self.settings.clone(),
         }
-    }
-
-    /// Return the number of parameter values required for one evaluation.
-    pub fn get_input_len(&self) -> usize {
-        self.param_count
-    }
-
-    /// Return the number of results produced by one evaluation.
-    pub fn get_output_len(&self) -> usize {
-        self.result_indices.len()
-    }
-
-    /// Borrow the numerical constants stored by the evaluator.
-    pub fn get_constants(&self) -> &[T] {
-        &self.stack[self.param_count..self.reserved_indices]
     }
 
     /// Return the total number of operations.

@@ -259,10 +259,98 @@ fn register_constant_external_container<T>(
 }
 
 // Shared by the root and every function compiled in this build.
+struct FunctionBindings {
+    arguments: Vec<usize>,
+    globals: Vec<Slot>,
+}
+
+#[cfg(test)]
+mod compact_function_arguments_tests {
+    use super::*;
+    use crate::{domains::dual::HyperDual, function, symbol};
+
+    #[test]
+    fn opt_in_compacts_nested_body_arguments_and_preserves_captures() {
+        let inner = symbol!("compact_function_arguments::inner");
+        let outer = symbol!("compact_function_arguments::outer");
+        let x = symbol!("compact_function_arguments::x");
+        let y = symbol!("compact_function_arguments::y");
+        let global = symbol!("compact_function_arguments::global");
+        let formal = symbol!("compact_function_arguments::formal");
+        let unused = symbol!("compact_function_arguments::unused");
+        for prune in [false, true] {
+            let options = FunctionRegistrationOptions::new()
+                .inlining(InliningPolicy::Never)
+                .prune_unused_arguments(prune);
+            let mut functions = FunctionMap::new();
+            functions
+                .add_function_with_options(
+                    inner,
+                    vec![formal, unused],
+                    Atom::var(formal).pow(2) + Atom::var(global),
+                    options.clone(),
+                )
+                .unwrap();
+            functions
+                .add_function_with_options(
+                    outer,
+                    vec![global, unused],
+                    function!(inner, Atom::var(global), Atom::var(unused)),
+                    options,
+                )
+                .unwrap();
+            let expression = function!(outer, Atom::var(x), Atom::var(y));
+            let inputs = [Atom::var(x), Atom::var(y), Atom::var(global)];
+            let evaluator = expression
+                .evaluator(&inputs)
+                .function_map(functions.clone())
+                .build()
+                .unwrap();
+            assert_eq!(evaluator.external_fns.len(), 2);
+            for function in &evaluator.external_fns {
+                assert_eq!(
+                    function.body.as_ref().unwrap().param_count,
+                    if prune { 2 } else { 3 }
+                );
+            }
+            assert_eq!(
+                evaluator
+                    .clone()
+                    .map_coeff(&|c| c.re.to_f64())
+                    .evaluate_single(&[3., 99., 7.]),
+                16.
+            );
+            let vector = evaluator
+                .vectorize(&Dualizer::new(
+                    HyperDual::<Complex<Rational>>::new(vec![vec![0], vec![1]]),
+                    vec![(1, 1), (2, 1)],
+                ))
+                .unwrap();
+            let mut output = [0.; 2];
+            vector
+                .map_coeff(&|c| c.re.to_f64())
+                .evaluate(&[3., 1., 99., 0., 7., 0.], &mut output);
+            assert_eq!(output, [16., 6.]);
+            let invalid = function!(outer, Atom::var(x))
+                .evaluator(&inputs)
+                .function_map(functions)
+                .build();
+            assert!(matches!(
+                invalid,
+                Err(EvaluationError::WrongNumberOfArguments {
+                    expected: 2,
+                    actual: 1,
+                    ..
+                })
+            ));
+        }
+    }
+}
+
 struct LinearizationContext<'a> {
     external_functions: Vec<ExternalFunctionContainer<Complex<Rational>>>,
     // Hidden global slots for each body; a pending entry detects recursive definitions.
-    functions: HashMap<usize, Option<Vec<Slot>>>,
+    functions: HashMap<usize, Option<FunctionBindings>>,
     // None denotes a registered constant whose value is resolved in the numerical domain.
     constants: Vec<Option<Complex<Rational>>>,
     constant_indices: HashMap<Complex<Rational>, usize>,
@@ -845,14 +933,56 @@ impl<'a> AtomView<'a> {
             )?;
             // Root inputs and constants stay symbolic during construction. Compact only
             // the surviving references, including globals forwarded to callees, once the
-            // body is complete. Declared arguments retain their original positions.
+            // body is complete. Explicit argument compaction is opt-in and does
+            // not change the registered function's public arity.
             let mut globals = Vec::new();
             let root_param_count = context.inputs.len();
-            let mut param_count = function.args.len();
+            let mut used_arguments =
+                vec![!function.options.should_prune_unused_arguments(); function.args.len()];
+            let mut record = |slot: &Slot| {
+                if let Slot::Param(index) = slot
+                    && *index >= root_param_count
+                {
+                    used_arguments[index - root_param_count] = true;
+                }
+            };
+            for instruction in &instr {
+                match instruction {
+                    Instruction::Add(_, args, _) | Instruction::Mul(_, args, _) => {
+                        args.iter().for_each(&mut record)
+                    }
+                    Instruction::Pow(_, input, _, _)
+                    | Instruction::Assign(_, input)
+                    | Instruction::IfElse(input, _) => record(input),
+                    Instruction::Powf(_, left, right, _) => {
+                        record(left);
+                        record(right);
+                    }
+                    Instruction::Fun(_, function, _) => function.2.iter().for_each(&mut record),
+                    Instruction::Join(_, condition, left, right) => {
+                        record(condition);
+                        record(left);
+                        record(right);
+                    }
+                    Instruction::Goto(_) | Instruction::Label(_) => {}
+                }
+            }
+            result_indices.iter().for_each(record);
+            let arguments = used_arguments
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, used)| used.then_some(index))
+                .collect::<Vec<_>>();
+            let argument_positions = arguments
+                .iter()
+                .enumerate()
+                .map(|(new, old)| (*old, new))
+                .collect::<HashMap<_, _>>();
+            let mut param_count = arguments.len();
             let mut indices = HashMap::default();
             let mut lower_global = |slot: &mut Slot| match *slot {
                 Slot::Param(index) if index >= root_param_count => {
-                    *slot = Slot::Param(index - root_param_count);
+                    *slot = Slot::Param(argument_positions[&(index - root_param_count)]);
                 }
                 Slot::Param(_) | Slot::Const(_) => {
                     let index = *indices.entry(*slot).or_insert_with(|| {
@@ -912,16 +1042,22 @@ impl<'a> AtomView<'a> {
                     tags.clone(),
                     Arc::new(body),
                 ));
-            context.functions.insert(function.id, Some(globals));
+            context
+                .functions
+                .insert(function.id, Some(FunctionBindings { arguments, globals }));
         }
-        let globals = context.functions[&function.id]
+        let bindings = context.functions[&function.id]
             .as_ref()
             .ok_or_else(recursive_call)?;
 
         // Global slots bypass local name bindings, including shadowing arguments.
         // The caller's final lowering pass will compact them in its own signature.
-        let mut call_args = arg_slots;
-        call_args.extend_from_slice(globals);
+        let mut call_args = bindings
+            .arguments
+            .iter()
+            .map(|index| arg_slots[*index])
+            .collect::<Vec<_>>();
+        call_args.extend_from_slice(&bindings.globals);
 
         let result = Slot::Temp(instr.len());
         instr.push(Instruction::Fun(
@@ -1197,6 +1333,12 @@ impl<'a> AtomView<'a> {
                             }
                             Instruction::Pow(_, base, exp, _) => {
                                 if let Some(base_val) = resolve(*base, instr, constants) {
+                                    if *exp < 0 && base_val.is_zero() {
+                                        // An invalid exact inverse is not a
+                                        // proof of a branch condition. Preserve
+                                        // the native operation and its domain.
+                                        return None;
+                                    }
                                     if *exp == -1 {
                                         Some(base_val.inv())
                                     } else if *exp < 0 {

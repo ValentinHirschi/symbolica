@@ -1,5 +1,7 @@
 use super::*;
 
+mod retained;
+
 impl<T: Default + Clone> ExpressionEvaluator<T> {
     /// Import a generated evaluator's scalar constants and shared function table.
     fn import_vector_context(
@@ -24,18 +26,17 @@ impl<T: Default + Clone> ExpressionEvaluator<T> {
                 *index = constants[*index];
                 ins.unknown_constants[*index / ins.dim] = true;
             }
-            if let Some(body) = external.body.as_mut() {
-                let body = Arc::make_mut(body);
-                for (instruction, _) in &mut body.instructions {
-                    if let Instr::ExternalFun(_, function, _) = instruction {
-                        *function = functions[*function];
-                    }
-                }
-            }
             let index = external_functions
                 .iter()
                 .position(|f| f == &external && f.constant_index == external.constant_index)
                 .unwrap_or_else(|| {
+                    if let Some(body) = external.body.as_mut() {
+                        for (instruction, _) in &mut Arc::make_mut(body).instructions {
+                            if let Instr::ExternalFun(_, function, _) = instruction {
+                                *function = functions[*function];
+                            }
+                        }
+                    }
                     external_functions.push(external);
                     external_functions.len() - 1
                 });
@@ -108,63 +109,6 @@ impl<T: Default + Clone> ExpressionEvaluator<T> {
         self.result_indices.iter().map(|i| slots[*i]).collect()
     }
 
-    /// Retain one vector component without executing instructions exclusive to
-    /// other components. Keep control-flow instructions and their conditions so
-    /// singular expressions in inactive branches remain unevaluated.
-    fn retain_vector_component(&mut self, component: usize) {
-        self.result_indices = vec![self.result_indices[component]];
-        self.undo_stack_optimization();
-        let mut needed = vec![false; self.stack.len()];
-        needed[self.result_indices[0]] = true;
-        self.instructions = self
-            .instructions
-            .drain(..)
-            .rev()
-            .filter_map(|entry| {
-                match &entry.0 {
-                    Instr::Add(out, args)
-                    | Instr::Mul(out, args)
-                    | Instr::ExternalFun(out, _, args) => {
-                        if !needed[*out] {
-                            return None;
-                        }
-                        for arg in args {
-                            needed[*arg] = true;
-                        }
-                    }
-                    Instr::Pow(out, arg, _) | Instr::BuiltinFun(out, _, arg) => {
-                        if !needed[*out] {
-                            return None;
-                        }
-                        needed[*arg] = true;
-                    }
-                    Instr::Powf(out, a, b) => {
-                        if !needed[*out] {
-                            return None;
-                        }
-                        needed[*a] = true;
-                        needed[*b] = true;
-                    }
-                    Instr::Join(out, c, a, b) => {
-                        if !needed[*out] {
-                            return None;
-                        }
-                        needed[*c] = true;
-                        needed[*a] = true;
-                        needed[*b] = true;
-                    }
-                    Instr::IfElse(c, _) => needed[*c] = true,
-                    Instr::Goto(_) | Instr::Label(_) => {}
-                }
-                Some(entry)
-            })
-            .collect();
-        self.instructions.reverse();
-        self.undo_stack_optimization();
-        self.optimize_stack();
-        self.fix_labels();
-    }
-
     /// Redefine every operation to take `n` components in and
     /// yield `n` components. This can be used to define efficient
     /// evaluation over dual numbers.
@@ -204,14 +148,17 @@ impl<T: Default + Clone> ExpressionEvaluator<T> {
     ///
     /// assert!(dest.iter().all(|x| x.abs() < 1e-10));
     /// ```
-    pub fn vectorize<V: Vectorize<T>>(self, v: &V) -> Result<ExpressionEvaluator<T>, String> {
+    pub fn vectorize<V: Vectorize<T> + ?Sized>(
+        self,
+        v: &V,
+    ) -> Result<ExpressionEvaluator<T>, String> {
         self.vectorize_impl(v, &mut HashMap::default(), false)
     }
 
-    fn vectorize_impl<V: Vectorize<T>>(
+    fn vectorize_impl<V: Vectorize<T> + ?Sized>(
         mut self,
         v: &V,
-        bodies: &mut HashMap<usize, ExpressionEvaluator<T>>,
+        bodies: &mut HashMap<retained::Request, ExpressionEvaluator<T>>,
         function_scope: bool,
     ) -> Result<ExpressionEvaluator<T>, String> {
         let mut new_external_fns = vec![];
@@ -326,7 +273,8 @@ impl<T: Default + Clone> ExpressionEvaluator<T> {
         };
 
         let mut generated_functions = HashMap::default();
-        let mut shared_functions: HashMap<usize, (Vec<usize>, Vec<Slot>)> = HashMap::default();
+        let mut shared_functions: HashMap<retained::Request, retained::Functions> =
+            HashMap::default();
         let mut next_label = self
             .instructions
             .iter()
@@ -357,15 +305,38 @@ impl<T: Default + Clone> ExpressionEvaluator<T> {
                 }
                 Instr::ExternalFun(o, f, a) => {
                     if let Some(body) = &self.external_fns[f].body {
-                        let (functions, constants) = match shared_functions.entry(f) {
+                        let args = a
+                            .iter()
+                            .flat_map(|x| {
+                                let slot = get_slot!(slot_map[x]);
+                                (0..v.get_dimension()).map(move |k| slot.index(k))
+                            })
+                            .collect::<Vec<_>>();
+                        // Only derivatives acquire inferred assumptions: a
+                        // zero primal argument must preserve the scalar body's
+                        // numerical domain. A custom function-scope fallback
+                        // cannot reuse assumptions about root parameter indices.
+                        let zeros = if function_scope {
+                            Vec::new()
+                        } else {
+                            args.iter()
+                                .enumerate()
+                                .filter(|(index, slot)| {
+                                    index % v.get_dimension() != 0 && v.is_zero(slot, &ins)
+                                })
+                                .map(|(index, _)| {
+                                    (index / v.get_dimension(), index % v.get_dimension())
+                                })
+                                .collect()
+                        };
+                        let shared = match shared_functions.entry((f, zeros.clone())) {
                             Entry::Occupied(entry) => entry.into_mut(),
                             Entry::Vacant(entry) => {
-                                let key = Arc::as_ptr(body) as usize;
+                                let key = (Arc::as_ptr(body) as usize, zeros.clone());
                                 if !bodies.contains_key(&key) {
                                     let mut external_fns = self.external_fns[..f].to_vec();
-                                    // The function's existing constants are captured
-                                    // parameters. They are resolved in the root, not
-                                    // in this temporary evaluator's empty constant pool.
+                                    // Existing constants are captured parameters;
+                                    // their values are resolved by the caller.
                                     for external in &mut external_fns {
                                         external.constant_index = None;
                                     }
@@ -377,21 +348,41 @@ impl<T: Default + Clone> ExpressionEvaluator<T> {
                                         result_indices: vec![body.result_index],
                                         external_fns,
                                         settings: self.settings.clone(),
-                                    }
-                                    .vectorize_impl(v, bodies, true)?;
-                                    bodies.insert(key, evaluator);
+                                    };
+                                    let evaluator = match v.rebind_parameters(zeros) {
+                                        Ok(rebound) => evaluator.vectorize_impl(
+                                            rebound.as_ref(),
+                                            bodies,
+                                            false,
+                                        )?,
+                                        Err(_) if key.1.is_empty() => {
+                                            // Preserve the generic Vectorize API:
+                                            // custom vectorizers can still handle
+                                            // helper-local scopes through the
+                                            // existing instruction-mapping hook.
+                                            evaluator.vectorize_impl(v, bodies, true)?
+                                        }
+                                        Err(error) => return Err(error),
+                                    };
+                                    bodies.insert(key.clone(), evaluator);
                                 }
                                 let generated = &bodies[&key];
                                 let (constants, function_indices) = generated
                                     .import_vector_context(&mut ins, &mut new_external_fns);
-                                let mut functions = Vec::with_capacity(v.get_dimension());
+                                let mut components = Vec::with_capacity(v.get_dimension());
                                 for component in 0..v.get_dimension() {
                                     let mut evaluator = generated.clone();
-                                    evaluator.retain_vector_component(component);
-                                    // Exported functions are identified by symbol and
-                                    // tags. Distinguish components and vectorization
-                                    // rules, including different Dual shapes with the
-                                    // same dimension, when exporting or merging.
+                                    let inputs = evaluator.retain_vector_component(component);
+                                    if component != 0 && evaluator.instructions.is_empty() {
+                                        components.push(retained::Component::Input(
+                                            inputs[evaluator.result_indices[0]],
+                                        ));
+                                        continue;
+                                    }
+                                    // Preserve a primal call even for constant
+                                    // and identity bodies. Replacing its output
+                                    // by a literal zero could cancel an invalid
+                                    // caller operation such as retained_zero()/x.
                                     let mut signature =
                                         std::collections::hash_map::DefaultHasher::new();
                                     format!("{:?}", evaluator.instructions).hash(&mut signature);
@@ -412,9 +403,7 @@ impl<T: Default + Clone> ExpressionEvaluator<T> {
                                         tags,
                                         Arc::new(FunctionBody {
                                             instructions: evaluator.instructions,
-                                            // Newly generated constants are explicit
-                                            // scalar captures after the flattened inputs.
-                                            param_count: evaluator.reserved_indices,
+                                            param_count: evaluator.param_count,
                                             result_index: evaluator.result_indices[0],
                                             stack_size: evaluator.stack.len(),
                                         }),
@@ -430,21 +419,31 @@ impl<T: Default + Clone> ExpressionEvaluator<T> {
                                             new_external_fns.push(external);
                                             new_external_fns.len() - 1
                                         });
-                                    functions.push(index);
+                                    components
+                                        .push(retained::Component::Function { index, inputs });
                                 }
-                                entry.insert((functions, constants))
+                                entry.insert(retained::Functions {
+                                    components,
+                                    constants,
+                                })
                             }
                         };
-                        let args = a
-                            .iter()
-                            .flat_map(|x| {
-                                let slot = get_slot!(slot_map[x]);
-                                (0..v.get_dimension()).map(move |k| slot.index(k))
-                            })
-                            .chain(constants.iter().copied())
+                        let args = args
+                            .into_iter()
+                            .chain(shared.constants.iter().copied())
                             .collect::<Vec<_>>();
-                        for function in functions {
-                            ins.add(VectorInstruction::ExternalFun(*function, args.clone()));
+                        for component in &shared.components {
+                            match component {
+                                retained::Component::Input(index) => {
+                                    ins.add(VectorInstruction::Assign(args[*index]));
+                                }
+                                retained::Component::Function { index, inputs } => {
+                                    ins.add(VectorInstruction::ExternalFun(
+                                        *index,
+                                        inputs.iter().map(|input| args[*input]).collect(),
+                                    ));
+                                }
+                            }
                         }
                         slot_map.insert(
                             o,
@@ -699,6 +698,25 @@ pub trait Vectorize<T> {
     /// Get the dimension of the vectorization.
     fn get_dimension(&self) -> usize;
 
+    /// Whether an input component is identically zero for this vectorization.
+    /// Retained calls propagate these assumptions to their local arguments.
+    fn is_zero(&self, _slot: &Slot, _instructions: &InstructionList<T>) -> bool {
+        false
+    }
+
+    /// Rebind component assumptions to a function's arguments and captures.
+    ///
+    /// Pairs are `(argument, component)` indices. The component structure must
+    /// stay unchanged. Ordinary retained vectorization can use the existing
+    /// function-scope hook when no assumptions are needed; staged row evaluation
+    /// requires this operation to enforce its coefficient derivative contract.
+    fn rebind_parameters(
+        &self,
+        _zero_components: Vec<(usize, usize)>,
+    ) -> Result<Box<dyn Vectorize<T> + '_>, String> {
+        Err("This vectorizer does not support retained function arguments".into())
+    }
+
     /// Generate a scalar evaluator whose inputs and outputs are flattened vector
     /// components. Called for external functions without an explicit `_v` symbol.
     /// Return `None` if automatic vectorization is not supported.
@@ -736,6 +754,23 @@ impl<T: DualNumberStructure> Dualizer<T> {
 impl<T: DualNumberStructure> Vectorize<Complex<Rational>> for Dualizer<T> {
     fn duplicate_constants(&self) -> bool {
         false
+    }
+
+    fn is_zero(&self, slot: &Slot, instructions: &InstructionList<Complex<Rational>>) -> bool {
+        instructions.is_zero_with_parameters(slot, |index| {
+            self.zero_components
+                .contains(&(index / self.get_dimension(), index % self.get_dimension()))
+        })
+    }
+
+    fn rebind_parameters(
+        &self,
+        zero_components: Vec<(usize, usize)>,
+    ) -> Result<Box<dyn Vectorize<Complex<Rational>> + '_>, String> {
+        Ok(Box::new(Self {
+            dual: Arc::clone(&self.dual),
+            zero_components: zero_components.into_iter().collect(),
+        }))
     }
 
     fn map_instruction_in_function(
@@ -845,17 +880,7 @@ impl<T: DualNumberStructure> Vectorize<Complex<Rational>> for Dualizer<T> {
             dualizer: &Dualizer<T>,
             instrs: &InstructionList<Complex<Rational>>,
         ) -> bool {
-            if instrs.is_zero(a) {
-                return true;
-            }
-
-            if let Slot::Param(x) = a {
-                dualizer
-                    .zero_components
-                    .contains(&(*x / dualizer.get_dimension(), *x % dualizer.get_dimension()))
-            } else {
-                false
-            }
+            dualizer.is_zero(a, instrs)
         }
 
         fn scalar_add<T: DualNumberStructure>(

@@ -506,14 +506,71 @@ impl<T: PartialEq + Clone + std::fmt::Debug> InstructionList<T> {
 }
 
 impl<T: SingleFloat> InstructionList<T> {
-    /// Return whether `slot` refers to a known constant component equal to zero.
+    /// Return whether `slot` is a known zero constant or a copy, sum, or branch
+    /// whose inputs are all known zero. Products are not inferred to be zero:
+    /// a zero multiplied by a non-finite value must keep its numerical domain.
     pub fn is_zero(&self, slot: &Slot) -> bool {
+        self.is_zero_with_parameters(slot, |_| false)
+    }
+
+    pub(super) fn is_zero_with_parameters(
+        &self,
+        slot: &Slot,
+        parameter_is_zero: impl Fn(usize) -> bool,
+    ) -> bool {
         match slot {
-            Slot::Const(c) => {
-                self.constants[*c].is_zero() && !self.unknown_constants[*c / self.dim]
+            Slot::Const(index) => {
+                return self.constants[*index].is_zero()
+                    && !self.unknown_constants[*index / self.dim];
             }
-            _ => false,
+            Slot::Param(index) => return parameter_is_zero(*index),
+            Slot::Out(_) => return false,
+            Slot::Temp(index)
+                if !matches!(
+                    self.instructions[*index],
+                    VectorInstruction::Assign(_)
+                        | VectorInstruction::Add(_, _)
+                        | VectorInstruction::Join(_, _, _)
+                ) =>
+            {
+                return false;
+            }
+            Slot::Temp(_) => {}
         }
+        // Iterative traversal also handles long chains of zero derivatives
+        // without recursive stack growth. Shared DAG nodes are visited once.
+        let mut pending = vec![*slot];
+        let mut visited = HashSet::default();
+        while let Some(slot) = pending.pop() {
+            match slot {
+                Slot::Const(index) => {
+                    if !self.constants[index].is_zero() || self.unknown_constants[index / self.dim]
+                    {
+                        return false;
+                    }
+                }
+                Slot::Param(index) => {
+                    if !parameter_is_zero(index) {
+                        return false;
+                    }
+                }
+                Slot::Temp(index) => {
+                    if !visited.insert(index) {
+                        continue;
+                    }
+                    match self.instructions[index] {
+                        VectorInstruction::Assign(input) => pending.push(input),
+                        VectorInstruction::Add(left, right)
+                        | VectorInstruction::Join(_, left, right) => {
+                            pending.extend([left, right]);
+                        }
+                        _ => return false,
+                    }
+                }
+                Slot::Out(_) => return false,
+            }
+        }
+        true
     }
 
     /// Return whether `slot` refers to a known constant component equal to one.
@@ -554,6 +611,21 @@ pub(super) enum Instr {
     Goto(Label),
     Label(Label),
     Join(usize, usize, usize, usize),
+}
+
+impl Instr {
+    /// Native storage read by the instruction, excluding its destination.
+    pub(super) fn input_indices(&self) -> Vec<usize> {
+        match self {
+            Self::Add(_, args) | Self::Mul(_, args) | Self::ExternalFun(_, _, args) => args.clone(),
+            Self::Pow(_, input, _) | Self::BuiltinFun(_, _, input) | Self::IfElse(input, _) => {
+                vec![*input]
+            }
+            Self::Powf(_, base, exponent) => vec![*base, *exponent],
+            Self::Join(_, condition, yes, no) => vec![*condition, *yes, *no],
+            Self::Goto(_) | Self::Label(_) => Vec::new(),
+        }
+    }
 }
 
 /// The phase of an operation in a complex evaluator.
