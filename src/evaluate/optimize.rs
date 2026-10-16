@@ -499,6 +499,91 @@ impl<T: Default + Clone + Eq + Hash> ExpressionEvaluator<T> {
 }
 
 impl<T> ExpressionEvaluator<T> {
+    /// Remove unused registrations after native program partitioning. Constant
+    /// slots stay in place, so their indices and the program's stack layout do
+    /// not change. Retained bodies are copied only if a callee index changes.
+    pub(super) fn prune_unused_external_functions(&mut self) {
+        let constants = self
+            .instructions
+            .iter()
+            .flat_map(|(instruction, _)| instruction.input_indices())
+            .chain(self.result_indices.iter().copied())
+            .filter(|slot| *slot >= self.param_count && *slot < self.reserved_indices)
+            .map(|slot| slot - self.param_count)
+            .collect::<HashSet<_>>();
+        let mut pending = self
+            .instructions
+            .iter()
+            .filter_map(|(instruction, _)| match instruction {
+                Instr::ExternalFun(_, index, _) => Some(*index),
+                _ => None,
+            })
+            .chain(
+                self.external_fns
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, external)| {
+                        external
+                            .constant_index
+                            .is_some_and(|slot| constants.contains(&slot))
+                            .then_some(index)
+                    }),
+            )
+            .collect::<Vec<_>>();
+        let mut live = vec![false; self.external_fns.len()];
+        while let Some(index) = pending.pop() {
+            if std::mem::replace(&mut live[index], true) {
+                continue;
+            }
+            if let Some(body) = &self.external_fns[index].body {
+                pending.extend(body.instructions.iter().filter_map(|(instruction, _)| {
+                    match instruction {
+                        Instr::ExternalFun(_, index, _) => Some(*index),
+                        _ => None,
+                    }
+                }));
+            }
+        }
+        if live.iter().all(|live| *live) {
+            return;
+        }
+        let mut remapping = vec![usize::MAX; live.len()];
+        for (new, old) in live
+            .iter()
+            .enumerate()
+            .filter_map(|(index, live)| live.then_some(index))
+            .enumerate()
+        {
+            remapping[old] = new;
+        }
+        for (instruction, _) in &mut self.instructions {
+            if let Instr::ExternalFun(_, index, _) = instruction {
+                *index = remapping[*index];
+            }
+        }
+        self.external_fns = std::mem::take(&mut self.external_fns)
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, mut external)| {
+                if !live[index] {
+                    return None;
+                }
+                if let Some(body) = &mut external.body
+                    && body.instructions.iter().any(|(instruction, _)| {
+                        matches!(instruction, Instr::ExternalFun(_, index, _) if remapping[*index] != *index)
+                    })
+                {
+                    for (instruction, _) in &mut Arc::make_mut(body).instructions {
+                        if let Instr::ExternalFun(_, index, _) = instruction {
+                            *index = remapping[*index];
+                        }
+                    }
+                }
+                Some(external)
+            })
+            .collect();
+    }
+
     /// Reduce temporary storage by reusing stack slots after their last use,
     /// remapping instructions while preserving the evaluator's results.
     pub fn optimize_stack(&mut self) {

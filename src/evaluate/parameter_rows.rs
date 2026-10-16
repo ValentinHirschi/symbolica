@@ -956,6 +956,7 @@ fn partition(
     let mut prelude = prelude.finish(shared_outputs);
     prelude.remove_common_instructions();
     prelude.optimize_stack();
+    prelude.prune_unused_external_functions();
 
     let port_map = ports
         .iter()
@@ -999,6 +1000,7 @@ fn partition(
     body.fix_labels();
     body.undo_stack_optimization();
     body.optimize_stack();
+    body.prune_unused_external_functions();
     Ok((prelude, body, gathers, prelude_values))
 }
 
@@ -1130,6 +1132,152 @@ impl<'a> Prelude<'a> {
 mod tests {
     use super::*;
     use crate::{parse, symbol};
+
+    #[test]
+    fn stage_registries_keep_only_reachable_calls_and_preserve_shared_leaf_bodies() {
+        let params = [parse!("stage_registry::x"), parse!("stage_registry::c")];
+        let inner = symbol!("stage_registry::inner");
+        let outer = symbol!("stage_registry::outer");
+        let exact = parse!(
+            "stage_registry::outer(stage_registry::x+stage_registry::c)+sqrt(stage_registry::x+pi)"
+        )
+        .evaluator(&params)
+        .add_function_with_options(
+            inner,
+            vec![symbol!("stage_registry::u")],
+            parse!("1/stage_registry::u"),
+            FunctionRegistrationOptions::new().inlining(InliningPolicy::Never),
+        )
+        .unwrap()
+        .add_function_with_options(
+            outer,
+            vec![symbol!("stage_registry::v")],
+            parse!("if(stage_registry::v,stage_registry::inner(stage_registry::v),0)"),
+            FunctionRegistrationOptions::new().inlining(InliningPolicy::Never),
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        let leaf = exact
+            .external_fns
+            .iter()
+            .find(|function| function.symbol == inner)
+            .unwrap()
+            .body
+            .clone()
+            .unwrap();
+        let staged = ParameterRowEvaluator::new(
+            exact,
+            vec![1],
+            vec![vec![1.into()], vec![2.into()], vec![3.into()]],
+        )
+        .unwrap();
+        assert!(staged.prelude.get_output_len() > 0);
+        assert!(
+            staged
+                .prelude
+                .external_fns
+                .iter()
+                .all(|function| function.body.is_none())
+        );
+        assert!(staged.prelude.external_fns.iter().any(|function| {
+            function.symbol == Symbol::PI && function.constant_index.is_some()
+        }));
+        assert!(
+            staged
+                .body
+                .external_fns
+                .iter()
+                .all(|function| function.constant_index.is_none())
+        );
+        assert_eq!(staged.body.external_fns.len(), 2);
+        let restored_leaf = staged
+            .body
+            .external_fns
+            .iter()
+            .find(|function| function.symbol == inner)
+            .unwrap()
+            .body
+            .as_ref()
+            .unwrap();
+        assert!(
+            Arc::ptr_eq(&leaf, restored_leaf),
+            "unchanged leaf bodies must remain shared"
+        );
+        let mut eager = staged.clone().map_coeff(&|value| value.re.to_f64());
+        for x in [-2.0_f64, 3.0] {
+            let expected = (1..=3)
+                .map(|row| {
+                    let argument = x + f64::from(row);
+                    if argument == 0. { 0. } else { 1. / argument }
+                })
+                .sum::<f64>()
+                + 3. * (x + std::f64::consts::PI).sqrt();
+            let mut output = [0.];
+            eager.evaluate(&[x], &mut output, Rational::to_f64).unwrap();
+            assert!((output[0] - expected).abs() < 1e-12);
+            #[cfg(feature = "native_code_generation")]
+            for direct in [false, true] {
+                let (plan, prelude, body) = staged
+                    .clone()
+                    .map_coeff(&|value| value.re.to_f64())
+                    .into_parts();
+                let cpp = prelude
+                    .export_cpp_str::<f64>(
+                        "prelude",
+                        ExportSettings::new().inline_asm(InlineASM::None),
+                    )
+                    .unwrap();
+                for symbol in [inner, outer] {
+                    assert!(
+                        !cpp.contains(&format!("{}_", symbol.get_stripped_ascii_name().unwrap()))
+                    );
+                }
+                let settings = JITCompilationSettings::new()
+                    .optimization_level(2)
+                    .direct_translation(direct);
+                let mut prelude = prelude.jit_compile(settings.clone()).unwrap();
+                let mut body = body.jit_compile(settings).unwrap();
+                plan.evaluate_with(
+                    &[x],
+                    &mut output,
+                    &mut ParameterRowWorkspace::default(),
+                    Rational::to_f64,
+                    |input, output| {
+                        prelude.evaluate(input, output);
+                        Ok(())
+                    },
+                    |input, output| {
+                        body.evaluate(input, output);
+                        Ok(())
+                    },
+                )
+                .unwrap();
+                assert!((output[0] - expected).abs() < 1e-12);
+            }
+        }
+    }
+
+    #[test]
+    fn stage_registry_keeps_external_constants_referenced_only_by_outputs() {
+        let parameter = parse!("stage_constant::c");
+        let staged = Atom::var(Symbol::PI)
+            .evaluator(std::slice::from_ref(&parameter))
+            .build_parameter_rows(&[parameter], &[vec![1.into()], vec![2.into()]])
+            .unwrap();
+        assert_eq!(staged.prelude.get_output_len(), 0);
+        assert!(staged.prelude.external_fns.is_empty());
+        assert!(staged.body.instructions.is_empty());
+        assert_eq!(staged.body.external_fns.len(), 1);
+        assert_eq!(staged.body.external_fns[0].symbol, Symbol::PI);
+        assert!(staged.body.external_fns[0].constant_index.is_some());
+        let mut numeric = staged.map_coeff(&|value| value.re.to_f64());
+        let mut output = [0.];
+        numeric
+            .evaluate(&[], &mut output, Rational::to_f64)
+            .unwrap();
+        assert_eq!(output, [2. * std::f64::consts::PI]);
+    }
 
     #[test]
     fn row_branch_selection_uses_the_runtime_coefficient_precision() {
