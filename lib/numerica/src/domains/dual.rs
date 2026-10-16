@@ -385,10 +385,10 @@ pub fn dual_norm<T: Real, D: DualNumber<T> + Clone>(value: &D) -> D {
         return value.clone();
     }
     let norm = value.values()[0].norm();
-    let mut result = value.clone();
-    result.values_mut()[0] = norm.clone();
     if norm.is_fully_zero() {
         // The norm has no derivative at a zero primal with a nonzero jet.
+        let mut result = value.clone();
+        result.values_mut()[0] = norm.clone();
         for component in &mut result.values_mut()[1..] {
             *component = component.zero() / &norm;
         }
@@ -403,9 +403,28 @@ pub fn dual_norm<T: Real, D: DualNumber<T> + Clone>(value: &D) -> D {
     let phase = (phase / &phase_norm).conj();
     let two = norm.from_usize(2);
     let scale = norm.sqrt() * (phase_norm * &two).sqrt();
-    let mut parallel = Vec::with_capacity(value.values().len());
-    let mut transverse = Vec::with_capacity(value.values().len());
-    for component in value.values() {
+    let scaled_product = |left: &T, right: &T| {
+        let normalized_left = left.clone() / &scale;
+        let normalized_right = right.clone() / &scale;
+        let lost_range = |original: &T, normalized: &T| {
+            (!original.is_fully_zero() && normalized.is_fully_zero())
+                || !(normalized.clone() - normalized).is_fully_zero()
+        };
+        if lost_range(left, &normalized_left) || lost_range(right, &normalized_right) {
+            // When scale<1, overflowing a normalized factor implies that a
+            // representable final product has a non-underflowing numerator.
+            // When scale>1, underflowing a factor implies that numerator cannot
+            // overflow. Keep the original nonfinite domain if inputs already
+            // exceed range; this only changes the order of finite arithmetic.
+            (left.clone() * right) / &scale / &scale
+        } else {
+            normalized_left * normalized_right
+        }
+    };
+    // Cloned carriers preserve stack-allocated arrays for static dual types.
+    let mut parallel = value.clone();
+    let mut transverse = value.clone();
+    for (index, component) in value.values().iter().enumerate() {
         let rotated = component.clone() * &phase;
         let conjugate = rotated.conj();
         let difference = rotated.clone() - &conjugate;
@@ -420,15 +439,18 @@ pub fn dual_norm<T: Real, D: DualNumber<T> + Clone>(value: &D) -> D {
             let conjugate = half.conj();
             (half.clone() + &conjugate, half - conjugate)
         };
-        parallel.push(real);
-        transverse.push(imaginary);
+        parallel.values_mut()[index] = real;
+        transverse.values_mut()[index] = imaginary;
     }
 
     // Write |z| = a+d in the fixed primal frame, where a is the real
     // projection, b is the imaginary projection, and b_0=d_0=0. Then
     // 2*a*d+d^2 = b*conj(b). This avoids cancelling large parallel squares.
     // Each non-primal coefficient depends only on lower total degrees.
-    let mut correction = parallel.iter().map(FloatLike::zero).collect::<Vec<_>>();
+    let mut correction = value.clone();
+    for component in correction.values_mut() {
+        *component = component.zero();
+    }
     let shape = value.get_shape();
     let mut order = (1..shape.len()).collect::<Vec<_>>();
     order.sort_by_key(|index| shape[*index].iter().sum::<usize>());
@@ -443,23 +465,37 @@ pub fn dual_norm<T: Real, D: DualNumber<T> + Clone>(value: &D) -> D {
             // second coefficient could be formed. Exact zero jet factors
             // contribute nothing, even if a different higher coefficient has
             // already exceeded the number type's range.
-            if !transverse[left].is_fully_zero() && !transverse[right].is_fully_zero() {
-                coefficient +=
-                    (transverse[left].clone() / &scale) * (transverse[right].conj() / &scale);
+            if !transverse.values()[left].is_fully_zero()
+                && !transverse.values()[right].is_fully_zero()
+            {
+                coefficient += scaled_product(
+                    &transverse.values()[left],
+                    &transverse.values()[right].conj(),
+                );
             }
-            if !parallel[left].is_fully_zero() && !correction[right].is_fully_zero() {
+            if !parallel.values()[left].is_fully_zero()
+                && !correction.values()[right].is_fully_zero()
+            {
                 coefficient -=
-                    (parallel[left].clone() / &scale) * (correction[right].clone() / &scale) * &two;
+                    scaled_product(&parallel.values()[left], &correction.values()[right]) * &two;
             }
-            if !correction[left].is_fully_zero() && !correction[right].is_fully_zero() {
+            if !correction.values()[left].is_fully_zero()
+                && !correction.values()[right].is_fully_zero()
+            {
                 coefficient -=
-                    (correction[left].clone() / &scale) * (correction[right].clone() / &scale);
+                    scaled_product(&correction.values()[left], &correction.values()[right]);
             }
         }
-        result.values_mut()[index] = parallel[index].clone() + &coefficient;
-        correction[index] = coefficient;
+        correction.values_mut()[index] = coefficient;
     }
-    result
+    parallel.values_mut()[0] = norm;
+    for (component, correction) in parallel.values_mut()[1..]
+        .iter_mut()
+        .zip(&correction.values()[1..])
+    {
+        *component += correction;
+    }
+    parallel
 }
 
 /// Create a new hyperdual number, from a specification of the components.
@@ -2557,6 +2593,7 @@ mod test {
 
     #[test]
     fn norm_preserves_reordered_mixed_arb_coefficients_and_zero_convention() {
+        use super::DualNumberStructure;
         use crate::domains::float::{Complex, Float, SingleFloat};
 
         let number = |value| Float::new(192).from_i64(value);
@@ -2602,6 +2639,39 @@ mod test {
         .norm();
         assert_eq!(cusp.values[0], Complex::new(0., 0.));
         assert!(!cusp.values[1].is_finite());
+    }
+
+    #[test]
+    fn norm_mixed_products_rescale_only_unrepresentable_intermediates() {
+        use crate::domains::float::Complex;
+
+        for (primal, first, second) in [(1e-320_f64, 1e200_f64, 1e-250_f64), (1e308, 1e-200, 1e308)]
+        {
+            let values = [
+                Complex::new(primal, 0.),
+                Complex::new(0., first),
+                Complex::new(0., second),
+                Complex::new(0., 0.),
+                Complex::new(0., 0.),
+            ];
+            let fixed = NormDual { values }.norm();
+            let dynamic = HyperDual::from_values(
+                vec![vec![0, 0], vec![1, 0], vec![0, 1], vec![2, 0], vec![1, 1]],
+                values.to_vec(),
+            )
+            .norm();
+            let expected = (first * second) / primal;
+            for values in [&fixed.values[..], &dynamic.values[..]] {
+                assert_eq!(values[0], Complex::new(primal, 0.));
+                assert_eq!(values[1], Complex::new(0., 0.));
+                assert_eq!(values[2], Complex::new(0., 0.));
+                // The x^2 coefficient may overflow. Its independent mixed
+                // coefficient remains finite and uses its own relative scale.
+                assert!(values[4].re.is_finite());
+                assert!((values[4].re / expected - 1.).abs() < 64. * f64::EPSILON);
+                assert_eq!(values[4].im, 0.);
+            }
+        }
     }
 
     #[test]
