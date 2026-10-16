@@ -80,7 +80,7 @@ impl<'a> BooleanEvaluation<'a> {
                     Some(NativeBoolean(if *power % 2 == 0 { 1 } else { value }))
                 }
             }
-            Instr::Join(_, condition, yes, no) => {
+            Instr::Join(_, condition, yes, no) | Instr::Select(_, condition, yes, no) => {
                 values[if values[*condition]?.is_zero() {
                     *no
                 } else {
@@ -134,9 +134,11 @@ impl<'a> BooleanEvaluation<'a> {
                 | Instr::Mul(output, _)
                 | Instr::Pow(output, _, _)
                 | Instr::Powf(output, _, _)
+                | Instr::Div(output, _, _)
                 | Instr::BuiltinFun(output, _, _)
                 | Instr::ExternalFun(output, _, _)
-                | Instr::Join(output, _, _, _) => {
+                | Instr::Join(output, _, _, _)
+                | Instr::Select(output, _, _, _) => {
                     values[*output] = Some(self.value(instruction, &values)?);
                 }
             }

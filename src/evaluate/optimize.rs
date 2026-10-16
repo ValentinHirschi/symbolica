@@ -153,6 +153,16 @@ impl<T: Default + PartialEq> ExpressionEvaluator<Complex<T>> {
                     }
                     subcomponents[*r] = *sc;
                 }
+                Instr::Div(r, numerator, denominator) => {
+                    *sc = if subcomponents[*numerator] == ComplexPhase::Real
+                        && subcomponents[*denominator] == ComplexPhase::Real
+                    {
+                        ComplexPhase::Real
+                    } else {
+                        ComplexPhase::Any
+                    };
+                    subcomponents[*r] = *sc;
+                }
                 Instr::BuiltinFun(r, s, a) => {
                     if s.is_real() {
                         *sc = ComplexPhase::Real;
@@ -183,7 +193,7 @@ impl<T: Default + PartialEq> ExpressionEvaluator<Complex<T>> {
 
                     subcomponents[*r] = *sc;
                 }
-                Instr::Join(r, _, t, f) => {
+                Instr::Join(r, _, t, f) | Instr::Select(r, _, t, f) => {
                     if subcomponents[*t] == subcomponents[*f] {
                         *sc = subcomponents[*t];
                     } else {
@@ -349,7 +359,7 @@ impl<T: Default + Clone + Eq + Hash> ExpressionEvaluator<T> {
                             *b += delta;
                         }
                     }
-                    Instr::Powf(r, b, e) => {
+                    Instr::Powf(r, b, e) | Instr::Div(r, b, e) => {
                         *r += delta;
                         if *b >= self.reserved_indices {
                             *b += delta;
@@ -363,7 +373,7 @@ impl<T: Default + Clone + Eq + Hash> ExpressionEvaluator<T> {
                             *c += delta;
                         }
                     }
-                    Instr::Join(r, c, t, f) => {
+                    Instr::Join(r, c, t, f) | Instr::Select(r, c, t, f) => {
                         *r += delta;
                         if *c >= self.reserved_indices {
                             *c += delta;
@@ -418,7 +428,7 @@ impl<T: Default + Clone + Eq + Hash> ExpressionEvaluator<T> {
                         *b = constant_indices[*b - other.param_count];
                     }
                 }
-                Instr::Powf(r, b, e) => {
+                Instr::Powf(r, b, e) | Instr::Div(r, b, e) => {
                     *r += delta;
                     if *b >= other.reserved_indices {
                         *b += delta;
@@ -440,7 +450,7 @@ impl<T: Default + Clone + Eq + Hash> ExpressionEvaluator<T> {
 
                     l.0 += self.instructions.len();
                 }
-                Instr::Join(r, c, t, f) => {
+                Instr::Join(r, c, t, f) | Instr::Select(r, c, t, f) => {
                     *r += delta;
                     if *c >= other.reserved_indices {
                         *c += delta;
@@ -599,11 +609,11 @@ impl<T> ExpressionEvaluator<T> {
                 Instr::Pow(_, b, _) | Instr::BuiltinFun(_, _, b) => {
                     last_use[*b] = i;
                 }
-                Instr::Powf(_, a, b) => {
+                Instr::Powf(_, a, b) | Instr::Div(_, a, b) => {
                     last_use[*a] = i;
                     last_use[*b] = i;
                 }
-                Instr::Join(_, c, a, b) => {
+                Instr::Join(_, c, a, b) | Instr::Select(_, c, a, b) => {
                     last_use[*c] = i;
                     last_use[*a] = i;
                     last_use[*b] = i;
@@ -636,9 +646,11 @@ impl<T> ExpressionEvaluator<T> {
                 | Instr::Mul(r, _)
                 | Instr::Pow(r, _, _)
                 | Instr::Powf(r, _, _)
+                | Instr::Div(r, _, _)
                 | Instr::BuiltinFun(r, _, _)
                 | Instr::ExternalFun(r, _, _)
-                | Instr::Join(r, _, _, _) => *r,
+                | Instr::Join(r, _, _, _)
+                | Instr::Select(r, _, _, _) => *r,
                 Instr::IfElse(c, _) => {
                     *c = rename_map[*c];
                     continue;
@@ -670,12 +682,12 @@ impl<T> ExpressionEvaluator<T> {
                     *r = new_reg;
                     *b = rename_map[*b];
                 }
-                Instr::Powf(r, a, b) => {
+                Instr::Powf(r, a, b) | Instr::Div(r, a, b) => {
                     *r = new_reg;
                     *a = rename_map[*a];
                     *b = rename_map[*b];
                 }
-                Instr::Join(r, c, a, b) => {
+                Instr::Join(r, c, a, b) | Instr::Select(r, c, a, b) => {
                     *r = new_reg;
                     *c = rename_map[*c];
                     *a = rename_map[*a];
@@ -718,7 +730,7 @@ impl<T: Default> ExpressionEvaluator<T> {
                     unfold.insert(*r, index + self.reserved_indices);
                     *r = index + self.reserved_indices;
                 }
-                Instr::Powf(r, b, e) => {
+                Instr::Powf(r, b, e) | Instr::Div(r, b, e) => {
                     if *b >= self.reserved_indices {
                         *b = unfold[b];
                     }
@@ -733,7 +745,7 @@ impl<T: Default> ExpressionEvaluator<T> {
                         *r = unfold[r];
                     }
                 }
-                Instr::Join(r, c, t, f) => {
+                Instr::Join(r, c, t, f) | Instr::Select(r, c, t, f) => {
                     if *c >= self.reserved_indices {
                         *c = unfold[c];
                     }

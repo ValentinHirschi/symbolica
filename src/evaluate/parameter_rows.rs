@@ -685,6 +685,8 @@ fn output(instruction: &Instr) -> Option<usize> {
         | Instr::Mul(output, _)
         | Instr::Pow(output, _, _)
         | Instr::Powf(output, _, _)
+        | Instr::Div(output, _, _)
+        | Instr::Select(output, _, _, _)
         | Instr::BuiltinFun(output, _, _)
         | Instr::ExternalFun(output, _, _)
         | Instr::Join(output, _, _, _) => Some(*output),
@@ -698,6 +700,12 @@ fn remap(instruction: &Instr, target: usize, mut map: impl FnMut(usize) -> usize
         Instr::Mul(_, args) => Instr::Mul(target, args.iter().map(|input| map(*input)).collect()),
         Instr::Pow(_, input, power) => Instr::Pow(target, map(*input), *power),
         Instr::Powf(_, base, exponent) => Instr::Powf(target, map(*base), map(*exponent)),
+        Instr::Div(_, numerator, denominator) => {
+            Instr::Div(target, map(*numerator), map(*denominator))
+        }
+        Instr::Select(_, condition, yes, no) => {
+            Instr::Select(target, map(*condition), map(*yes), map(*no))
+        }
         Instr::BuiltinFun(_, function, input) => Instr::BuiltinFun(target, *function, map(*input)),
         Instr::ExternalFun(_, function, args) => Instr::ExternalFun(
             target,
@@ -899,6 +907,7 @@ fn partition(
             Instr::BuiltinFun(..)
                 | Instr::ExternalFun(..)
                 | Instr::Powf(..)
+                | Instr::Div(..)
                 | Instr::Pow(_, _, ..=-1)
         );
         if !analysis.dependencies[target].is_empty() && !costly {

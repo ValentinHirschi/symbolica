@@ -258,6 +258,13 @@ impl<T: Real> BatchExpressionEvaluator<T> {
                         std::mem::swap(&mut stack[out * stride + lane], &mut temporary);
                     }
                 }
+                Instr::Div(out, numerator, denominator) => {
+                    for lane in active.iter().copied() {
+                        temporary.set_from(&stack[numerator * stride + lane]);
+                        temporary /= &stack[denominator * stride + lane];
+                        std::mem::swap(&mut stack[out * stride + lane], &mut temporary);
+                    }
+                }
                 Instr::Powf(out, base, exponent) => {
                     for lane in active.iter().copied() {
                         temporary =
@@ -289,6 +296,15 @@ impl<T: Real> BatchExpressionEvaluator<T> {
                             then_value
                         };
                         temporary.set_from(&stack[value * stride + lane]);
+                        std::mem::swap(&mut stack[out * stride + lane], &mut temporary);
+                    }
+                }
+                Instr::Select(out, condition, then_value, else_value) => {
+                    for lane in active.iter().copied() {
+                        temporary = stack[condition * stride + lane].select_nonzero(
+                            &stack[then_value * stride + lane],
+                            &stack[else_value * stride + lane],
+                        );
                         std::mem::swap(&mut stack[out * stride + lane], &mut temporary);
                     }
                 }
