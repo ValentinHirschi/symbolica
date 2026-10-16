@@ -378,6 +378,90 @@ pub trait DualNumber<T>: DualNumberStructure {
     fn values_mut(&mut self) -> &mut [T];
 }
 
+/// Shared component implementation for the static and runtime dual carriers.
+#[doc(hidden)]
+pub fn dual_norm<T: Real, D: DualNumber<T> + Clone>(value: &D) -> D {
+    if value.values().iter().all(FloatLike::is_fully_zero) {
+        return value.clone();
+    }
+    let norm = value.values()[0].norm();
+    let mut result = value.clone();
+    result.values_mut()[0] = norm.clone();
+    if norm.is_fully_zero() {
+        // The norm has no derivative at a zero primal with a nonzero jet.
+        for component in &mut result.values_mut()[1..] {
+            *component = component.zero() / &norm;
+        }
+        return result;
+    }
+
+    // Divide directly, never multiply by the reciprocal of a subnormal norm.
+    // Renormalizing the O(1) phase also removes the relative rounding error of
+    // a subnormal scalar norm. Keep the scalar norm itself as the primal.
+    let phase = value.values()[0].clone() / &norm;
+    let phase_norm = phase.norm();
+    let phase = (phase / &phase_norm).conj();
+    let two = norm.from_usize(2);
+    let scale = norm.sqrt() * (phase_norm * &two).sqrt();
+    let mut parallel = Vec::with_capacity(value.values().len());
+    let mut transverse = Vec::with_capacity(value.values().len());
+    for component in value.values() {
+        let rotated = component.clone() * &phase;
+        let conjugate = rotated.conj();
+        let difference = rotated.clone() - &conjugate;
+        let sum = rotated.clone() + &conjugate;
+        let (real, imaginary) = if difference.is_fully_zero() {
+            (rotated, difference)
+        } else if sum.is_fully_zero() {
+            (sum, rotated)
+        } else {
+            // Halve before adding to avoid overflowing a finite projection.
+            let half = rotated / &two;
+            let conjugate = half.conj();
+            (half.clone() + &conjugate, half - conjugate)
+        };
+        parallel.push(real);
+        transverse.push(imaginary);
+    }
+
+    // Write |z| = a+d in the fixed primal frame, where a is the real
+    // projection, b is the imaginary projection, and b_0=d_0=0. Then
+    // 2*a*d+d^2 = b*conj(b). This avoids cancelling large parallel squares.
+    // Each non-primal coefficient depends only on lower total degrees.
+    let mut correction = parallel.iter().map(FloatLike::zero).collect::<Vec<_>>();
+    let shape = value.get_shape();
+    let mut order = (1..shape.len()).collect::<Vec<_>>();
+    order.sort_by_key(|index| shape[*index].iter().sum::<usize>());
+    for index in order {
+        let mut coefficient = norm.zero();
+        for &(left, right, target) in value.get_multiplication_table() {
+            if target != index || left == 0 || right == 0 {
+                continue;
+            }
+            // Scale each factor by sqrt(2*|z_0|), not by |z_0|. Normalized
+            // first derivatives would otherwise overflow before a finite
+            // second coefficient could be formed. Exact zero jet factors
+            // contribute nothing, even if a different higher coefficient has
+            // already exceeded the number type's range.
+            if !transverse[left].is_fully_zero() && !transverse[right].is_fully_zero() {
+                coefficient +=
+                    (transverse[left].clone() / &scale) * (transverse[right].conj() / &scale);
+            }
+            if !parallel[left].is_fully_zero() && !correction[right].is_fully_zero() {
+                coefficient -=
+                    (parallel[left].clone() / &scale) * (correction[right].clone() / &scale) * &two;
+            }
+            if !correction[left].is_fully_zero() && !correction[right].is_fully_zero() {
+                coefficient -=
+                    (correction[left].clone() / &scale) * (correction[right].clone() / &scale);
+            }
+        }
+        result.values_mut()[index] = parallel[index].clone() + &coefficient;
+        correction[index] = coefficient;
+    }
+    result
+}
+
 /// Create a new hyperdual number, from a specification of the components.
 /// The first components must be the real value and the single derivatives of the variables in order.
 ///
@@ -1077,19 +1161,7 @@ macro_rules! create_hyperdual_from_components {
 
             #[inline(always)]
             fn norm(&self) -> Self {
-                if self.is_fully_zero() {
-                    return self.clone();
-                }
-                let n = self.values[0].norm();
-                // The differentiation parameters are real; complex coefficients
-                // must also be conjugated. Normalize before taking the squared
-                // norm to preserve the scalar norm's overflow/underflow behavior.
-                let normalized = self.clone() * &n.inv();
-                let mut squared = normalized.clone() * normalized.conj();
-                squared.values[0] = n.one();
-                let mut result = squared.sqrt() * &n;
-                result.values[0] = n;
-                result
+                $crate::domains::dual::dual_norm(self)
             }
 
             #[inline(always)]
@@ -2185,16 +2257,7 @@ impl<T: Real> Real for HyperDual<T> {
 
     #[inline(always)]
     fn norm(&self) -> Self {
-        if self.is_fully_zero() {
-            return self.clone();
-        }
-        let n = self.values[0].norm();
-        let normalized = self.clone() * &n.inv();
-        let mut squared = normalized.clone() * normalized.conj();
-        squared.values[0] = n.one();
-        let mut result = squared.sqrt() * &n;
-        result.values[0] = n;
-        result
+        dual_norm(self)
     }
 
     #[inline(always)]
@@ -2432,6 +2495,114 @@ mod test {
     create_hyperdual_from_depths!(Dual, [1, 2, 3]);
     create_hyperdual_from_components!(ReorderedDual, [[0, 0], [0, 1], [1, 0]]);
     create_hyperdual_from_components!(NormDual, [[0, 0], [1, 0], [0, 1], [2, 0], [1, 1]]);
+    create_hyperdual_from_components!(NormRangeDual, [[0], [1], [2]]);
+    create_hyperdual_from_components!(ReorderedNormDual, [[0, 0], [0, 1], [1, 0], [2, 0], [1, 1]]);
+
+    #[test]
+    fn norm_preserves_finite_components_at_extreme_scales() {
+        use crate::domains::float::Complex;
+
+        for x in [1e-320_f64, 1e-200, 1e200] {
+            for (primal, seed, expected) in [
+                (Complex::new(x, 0.), Complex::new(0., 0.), [x, 0., 0.]),
+                (Complex::new(x, 0.), Complex::new(1., 0.), [x, 1., 0.]),
+                (Complex::new(-x, 0.), Complex::new(1., 0.), [x, -1., 0.]),
+                (
+                    Complex::new(x, 0.),
+                    Complex::new(0., 1.),
+                    [x, 0., 1. / (2. * x)],
+                ),
+                (
+                    Complex::new(x, x),
+                    Complex::new(1., 1.),
+                    [x.hypot(x), std::f64::consts::SQRT_2, 0.],
+                ),
+            ] {
+                let values = [primal, seed, Complex::new(0., 0.)];
+                let fixed = NormRangeDual { values }.norm();
+                let dynamic =
+                    HyperDual::from_values(vec![vec![0], vec![1], vec![2]], values.to_vec()).norm();
+                for result in [&fixed.values[..], &dynamic.values[..]] {
+                    assert_eq!(result[0], Complex::new(expected[0], 0.));
+                    for (actual, expected) in result[1..].iter().zip(&expected[1..]) {
+                        if expected.is_infinite() {
+                            assert_eq!(actual.re, *expected);
+                        } else {
+                            assert!(actual.re.is_finite(), "{x}: {result:?}");
+                            let scale = if *expected == 0. { 1. } else { expected.abs() };
+                            assert!(
+                                (actual.re - expected).abs() <= 64. * f64::EPSILON * scale,
+                                "{x}: {actual:?} != {expected}"
+                            );
+                        }
+                        assert_eq!(actual.im, 0.);
+                    }
+                }
+            }
+        }
+        // Squaring this derivative before dividing by the primal overflows,
+        // although the second Taylor coefficient remains representable.
+        let result = HyperDual::from_values(
+            vec![vec![0], vec![1], vec![2]],
+            vec![
+                Complex::new(1e200, 0.),
+                Complex::new(0., 1e200),
+                Complex::new(0., 0.),
+            ],
+        )
+        .norm();
+        assert!((result.values[2].re / 5e199 - 1.).abs() < 64. * f64::EPSILON);
+        assert_eq!(result.values[1], Complex::new(0., 0.));
+    }
+
+    #[test]
+    fn norm_preserves_reordered_mixed_arb_coefficients_and_zero_convention() {
+        use crate::domains::float::{Complex, Float, SingleFloat};
+
+        let number = |value| Float::new(192).from_i64(value);
+        let values = [
+            Complex::new(number(3), number(4)),
+            Complex::new(number(0), number(1)),
+            Complex::new(number(1), number(0)),
+            Complex::new(number(0), number(0)),
+            Complex::new(number(0), number(0)),
+        ];
+        let fixed = ReorderedNormDual {
+            values: values.clone(),
+        }
+        .norm();
+        let dynamic = HyperDual::from_values(
+            vec![vec![0, 0], vec![0, 1], vec![1, 0], vec![2, 0], vec![1, 1]],
+            values.to_vec(),
+        )
+        .norm();
+        assert_eq!(fixed.get_shape(), dynamic.get_shape());
+        for values in [&fixed.values[..], &dynamic.values[..]] {
+            for (actual, (numerator, denominator)) in
+                values
+                    .iter()
+                    .zip([(5, 1), (4, 5), (3, 5), (8, 125), (-12, 125)])
+            {
+                let expected = number(numerator) / number(denominator);
+                assert!((actual.re.clone() - expected).norm() < Float::with_val(192, 1e-40));
+                assert!(actual.im.norm() < Float::with_val(192, 1e-40));
+            }
+        }
+        let zero = NormRangeDual {
+            values: [Complex::new(0., 0.); 3],
+        };
+        assert_eq!(zero.norm().values, zero.values);
+        let cusp = NormRangeDual {
+            values: [
+                Complex::new(0., 0.),
+                Complex::new(1., 0.),
+                Complex::new(0., 0.),
+            ],
+        }
+        .norm();
+        assert_eq!(cusp.values[0], Complex::new(0., 0.));
+        assert!(!cusp.values[1].is_finite());
+    }
 
     #[test]
     fn integer_powers_preserve_components_precision_and_shape() {
