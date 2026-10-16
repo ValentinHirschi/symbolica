@@ -21,6 +21,18 @@ impl<T: Default + Clone> ExpressionEvaluator<T> {
     pub(super) fn retain_vector_component(&mut self, component: usize) -> Vec<usize> {
         self.result_indices = vec![self.result_indices[component]];
         self.undo_stack_optimization();
+        // A native forwarding instruction does not require an outlined
+        // derivative body. Keep the original input/constant binding so its
+        // caller can use it directly after component pruning.
+        while self.result_indices[0] >= self.reserved_indices {
+            let output = self.result_indices[0];
+            match &self.instructions[output - self.reserved_indices].0 {
+                Instr::Add(_, inputs) | Instr::Mul(_, inputs) if inputs.len() == 1 => {
+                    self.result_indices[0] = inputs[0];
+                }
+                _ => break,
+            }
+        }
         let evaluator = self;
         let mut used = HashSet::from_iter(evaluator.result_indices.iter().copied());
         let mut keep = vec![false; evaluator.instructions.len()];
@@ -122,6 +134,29 @@ mod tests {
 
     fn dualizer(shape: Vec<Vec<usize>>, zeros: Vec<(usize, usize)>) -> Dualizer<HyperDual<Number>> {
         Dualizer::new(HyperDual::new(shape), zeros)
+    }
+
+    #[test]
+    fn native_forwarding_instructions_preserve_every_vector_component() {
+        let x = parse!("retained_forwarding::x");
+        let mut scalar = x.evaluator(std::slice::from_ref(&x)).build().unwrap();
+        // Native one-argument arithmetic instructions represent forwarding
+        // edges, including those produced while composing shared programs.
+        let forwarded = scalar.reserved_indices;
+        let result = forwarded + 1;
+        scalar.instructions = vec![
+            (Instr::Add(forwarded, vec![0]), ComplexPhase::Any),
+            (Instr::Mul(result, vec![forwarded]), ComplexPhase::Any),
+        ];
+        scalar.stack.resize(result + 1, Number::default());
+        scalar.result_indices = vec![result];
+        let mut evaluator = scalar
+            .vectorize(&dualizer(vec![vec![0], vec![1], vec![2]], vec![]))
+            .unwrap()
+            .map_coeff(&|value| value.re.to_f64());
+        let mut output = [0.; 3];
+        evaluator.evaluate(&[2., 3., 4.], &mut output);
+        assert_eq!(output, [2., 3., 4.]);
     }
 
     #[test]

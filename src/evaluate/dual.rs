@@ -202,6 +202,9 @@ impl<T: Default + Clone> ExpressionEvaluator<T> {
         let mut new_instr = vec![];
         for (x, c) in &mut self.instructions {
             match x {
+                Instr::Add(_, a) | Instr::Mul(_, a) if a.len() == 1 => {
+                    new_instr.push((x.clone(), *c));
+                }
                 Instr::Add(o, a) => {
                     new_instr.push((Instr::Add(*o, vec![a[0], a[1]]), *c));
                     for x in a.iter().skip(2) {
@@ -287,6 +290,9 @@ impl<T: Default + Clone> ExpressionEvaluator<T> {
 
         for (i, _sc) in self.instructions.drain(..) {
             let (o, instr) = match i {
+                Instr::Add(o, a) | Instr::Mul(o, a) if a.len() == 1 => {
+                    (o, VectorInstruction::Assign(get_slot!(slot_map[&a[0]])))
+                }
                 Instr::Add(o, a) => (
                     o,
                     VectorInstruction::Add(get_slot!(slot_map[&a[0]]), get_slot!(slot_map[&a[1]])),
@@ -398,7 +404,7 @@ impl<T: Default + Clone> ExpressionEvaluator<T> {
                                             *function = function_indices[*function];
                                         }
                                     }
-                                    let mut external = ExternalFunctionContainer::with_body(
+                                    let external = ExternalFunctionContainer::with_body(
                                         self.external_fns[f].symbol,
                                         tags,
                                         Arc::new(FunctionBody {
@@ -407,10 +413,6 @@ impl<T: Default + Clone> ExpressionEvaluator<T> {
                                             result_index: evaluator.result_indices[0],
                                             stack_size: evaluator.stack.len(),
                                         }),
-                                    );
-                                    external.export_name = format!(
-                                        "{}__symbolica_vector_{:x}_{}",
-                                        self.external_fns[f].export_name, signature, component,
                                     );
                                     let index = new_external_fns
                                         .iter()
