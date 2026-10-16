@@ -42,6 +42,7 @@ mod alias;
 mod coefficient;
 mod core;
 mod properties;
+mod query;
 pub mod representation;
 mod zero_test;
 
@@ -75,6 +76,7 @@ use std::{
 
 pub use self::alias::{AliasedAtom, AliasedAtomPrinter};
 pub use self::core::AtomCore;
+pub use self::query::AtomQuery;
 pub use self::representation::{
     Add, AddView, Fun, InlineNum, InlineVar, KeyLookup, ListIterator, ListSlice, Mul, MulView, Num,
     NumView, Pow, PowView, Var, VarView,

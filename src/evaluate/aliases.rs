@@ -1,7 +1,7 @@
 //! Compact repeated factors while preserving alias and function-map boundaries.
 
 use super::*;
-use crate::atom::AliasedAtom;
+use crate::atom::{AliasedAtom, AtomQuery, AtomType};
 
 impl FunctionMap {
     /// Share profitable repeated functions and powers in an owned alias DAG.
@@ -45,14 +45,9 @@ impl FunctionMap {
                 true
             });
         }
-        let algebraic = |view: AtomView<'_>| {
-            let mut found = false;
-            view.visitor(&mut |part| {
-                found |= matches!(part, AtomView::Add(_) | AtomView::Mul(_) | AtomView::Pow(_));
-                !found
-            });
-            found
-        };
+        let algebraic_query =
+            AtomQuery::new().require_any_kind([AtomType::Add, AtomType::Mul, AtomType::Pow]);
+        let algebraic = |view: AtomView<'_>| algebraic_query.matches(&view);
         let sensitive = boundaries
             .iter()
             .copied()
