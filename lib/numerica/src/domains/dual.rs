@@ -385,41 +385,34 @@ pub fn dual_norm<T: Real, D: DualNumber<T> + Clone>(value: &D) -> D {
         return value.clone();
     }
     let norm = value.values()[0].norm();
-    if norm.is_fully_zero() {
-        // The norm has no derivative at a zero primal with a nonzero jet.
-        let mut result = value.clone();
-        result.values_mut()[0] = norm.clone();
-        for component in &mut result.values_mut()[1..] {
-            *component = component.zero() / &norm;
-        }
-        return result;
-    }
-
+    let safe_norm = norm.select_nonzero(&norm, &norm.one());
     // Divide directly, never multiply by the reciprocal of a subnormal norm.
     // Renormalizing the O(1) phase also removes the relative rounding error of
     // a subnormal scalar norm. Keep the scalar norm itself as the primal.
-    let phase = value.values()[0].clone() / &norm;
+    let phase = value.values()[0].clone() / &safe_norm;
     let phase_norm = phase.norm();
+    let phase_norm = phase_norm.select_nonzero(&phase_norm, &phase_norm.one());
     let phase = (phase / &phase_norm).conj();
     let two = norm.from_usize(2);
-    let scale = norm.sqrt() * (phase_norm * &two).sqrt();
+    let scale = safe_norm.sqrt() * (phase_norm * &two).sqrt();
     let scaled_product = |left: &T, right: &T| {
         let normalized_left = left.clone() / &scale;
         let normalized_right = right.clone() / &scale;
-        let lost_range = |original: &T, normalized: &T| {
-            (!original.is_fully_zero() && normalized.is_fully_zero())
-                || !(normalized.clone() - normalized).is_fully_zero()
-        };
-        if lost_range(left, &normalized_left) || lost_range(right, &normalized_right) {
-            // When scale<1, overflowing a normalized factor implies that a
-            // representable final product has a non-underflowing numerator.
-            // When scale>1, underflowing a factor implies that numerator cannot
-            // overflow. Keep the original nonfinite domain if inputs already
-            // exceed range; this only changes the order of finite arithmetic.
-            (left.clone() * right) / &scale / &scale
-        } else {
-            normalized_left * normalized_right
+        let normalized = normalized_left.clone() * &normalized_right;
+        // If a normalized factor loses range, the numerator-first ordering
+        // retains a representable result. Select independently in SIMD lanes.
+        let fallback = (left.clone() * right) / &scale / &scale;
+        let mut result = normalized;
+        for (original, scaled) in [(left, &normalized_left), (right, &normalized_right)] {
+            let underflow = original.select_nonzero(&fallback, &result);
+            result = scaled.select_nonzero(&result, &underflow);
+            let nonfinite = scaled.clone() - scaled;
+            result = nonfinite.select_nonzero(&fallback, &result);
         }
+        // This product is a derivative convolution term, not the primal.
+        let zero = norm.zero();
+        result = left.select_nonzero(&result, &zero);
+        right.select_nonzero(&result, &zero)
     };
     // Cloned carriers preserve stack-allocated arrays for static dual types.
     let mut parallel = value.clone();
@@ -429,16 +422,15 @@ pub fn dual_norm<T: Real, D: DualNumber<T> + Clone>(value: &D) -> D {
         let conjugate = rotated.conj();
         let difference = rotated.clone() - &conjugate;
         let sum = rotated.clone() + &conjugate;
-        let (real, imaginary) = if difference.is_fully_zero() {
-            (rotated, difference)
-        } else if sum.is_fully_zero() {
-            (sum, rotated)
-        } else {
-            // Halve before adding to avoid overflowing a finite projection.
-            let half = rotated / &two;
-            let conjugate = half.conj();
-            (half.clone() + &conjugate, half - conjugate)
-        };
+        let half = rotated / &two;
+        let conjugate_half = half.conj();
+        // Divide the full projection when possible, so a subnormal component
+        // is not rounded away by halving first. The alternate ordering handles
+        // overflowing sums, independently in each SIMD lane.
+        let real =
+            (sum.clone() - &sum).select_nonzero(&(half.clone() + &conjugate_half), &(sum / &two));
+        let imaginary = (difference.clone() - &difference)
+            .select_nonzero(&(half - conjugate_half), &(difference / &two));
         parallel.values_mut()[index] = real;
         transverse.values_mut()[index] = imaginary;
     }
@@ -488,12 +480,18 @@ pub fn dual_norm<T: Real, D: DualNumber<T> + Clone>(value: &D) -> D {
         }
         correction.values_mut()[index] = coefficient;
     }
-    parallel.values_mut()[0] = norm;
+    let mut activity = norm.clone();
+    for component in &value.values()[1..] {
+        activity += component.norm();
+    }
+    let at_zero = activity.select_nonzero(&(norm.zero() / &norm), &norm.zero());
+    parallel.values_mut()[0] = norm.clone();
     for (component, correction) in parallel.values_mut()[1..]
         .iter_mut()
         .zip(&correction.values()[1..])
     {
         *component += correction;
+        *component = norm.select_nonzero(component, &at_zero);
     }
     parallel
 }
@@ -2533,6 +2531,53 @@ mod test {
     create_hyperdual_from_components!(NormDual, [[0, 0], [1, 0], [0, 1], [2, 0], [1, 1]]);
     create_hyperdual_from_components!(NormRangeDual, [[0], [1], [2]]);
     create_hyperdual_from_components!(ReorderedNormDual, [[0, 0], [0, 1], [1, 0], [2, 0], [1, 1]]);
+
+    #[test]
+    fn norm_projection_retains_subnormal_derivative_components() {
+        use crate::domains::float::Complex;
+        for coefficient in [f64::from_bits(1), 1e308] {
+            let value = HyperDual::from_values(
+                vec![vec![0], vec![1]],
+                vec![Complex::new(1., 0.), Complex::new(coefficient, coefficient)],
+            );
+            assert_eq!(value.norm().values[1], Complex::new(coefficient, 0.));
+        }
+    }
+
+    #[test]
+    fn norm_simd_lanes_keep_independent_range_and_zero_domains() {
+        use crate::domains::float::Complex;
+        use wide::f64x4;
+        let primal = f64x4::from([1e-320, -1e308, 0., 0.]);
+        let seed = f64x4::from([1., 1., 0., 1.]);
+        let real = HyperDual::from_values(
+            vec![vec![0], vec![1], vec![2]],
+            vec![primal, seed, f64x4::ZERO],
+        )
+        .norm();
+        assert_eq!(real.values[0].to_array(), [1e-320, 1e308, 0., 0.]);
+        for (actual, expected) in real.values[1].to_array()[..3].iter().zip([1., -1., 0.]) {
+            assert!((*actual - expected).abs() < 1e-12);
+        }
+        assert_eq!(&real.values[2].to_array()[..3], &[0.; 3]);
+        assert!(real.values[1].to_array()[3].is_nan());
+        assert!(real.values[2].to_array()[3].is_nan());
+        let complex = HyperDual::from_values(
+            vec![vec![0], vec![1], vec![2]],
+            vec![
+                Complex::new(primal, f64x4::ZERO),
+                Complex::new(seed, f64x4::ZERO),
+                Complex::new(f64x4::ZERO, f64x4::ZERO),
+            ],
+        )
+        .norm();
+        for (actual, expected) in complex.values.iter().zip(&real.values) {
+            for (actual, expected) in actual.re.to_array().into_iter().zip(expected.to_array()) {
+                assert!(actual == expected || (actual.is_nan() && expected.is_nan()));
+            }
+            assert_eq!(&actual.im.to_array()[..3], &[0.; 3]);
+        }
+    }
 
     #[test]
     fn norm_preserves_finite_components_at_extreme_scales() {
