@@ -410,21 +410,11 @@ impl<T: Default + Clone> ExpressionEvaluator<T> {
                             Entry::Vacant(entry) => {
                                 let key = (Arc::as_ptr(body) as usize, zeros.clone());
                                 if !bodies.contains_key(&key) {
-                                    let mut external_fns = self.external_fns[..f].to_vec();
-                                    // Existing constants are captured parameters;
-                                    // their values are resolved by the caller.
-                                    for external in &mut external_fns {
-                                        external.constant_index = None;
-                                    }
-                                    let evaluator = ExpressionEvaluator {
-                                        stack: vec![T::default(); body.stack_size],
-                                        param_count: body.param_count,
-                                        reserved_indices: body.param_count,
-                                        instructions: body.instructions.clone(),
-                                        result_indices: vec![body.result_index],
-                                        external_fns,
-                                        settings: self.settings.clone(),
-                                    };
+                                    let evaluator = ExpressionEvaluator::from_retained_body(
+                                        body,
+                                        &self.external_fns[..f],
+                                        &self.settings,
+                                    );
                                     let evaluator = match v.rebind_parameters(zeros) {
                                         Ok(rebound) => evaluator.vectorize_impl(
                                             rebound.as_ref(),

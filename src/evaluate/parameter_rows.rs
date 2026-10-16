@@ -9,6 +9,8 @@ use std::{collections::BTreeSet, ops::AddAssign};
 use super::boolean::{BooleanEvaluation, NativeBoolean};
 use super::*;
 
+mod retained;
+
 /// Scheduling data for a shared prelude and an exact parameter-row program.
 ///
 /// It contains no backend-specific evaluator. All cached values belong to one
@@ -608,6 +610,9 @@ impl ParameterRowEvaluator<Complex<Rational>> {
     /// Other inputs remain physical inputs in their original relative order.
     /// This entry point reuses an already prepared native program, including
     /// resolved function scopes, instead of reconstructing symbolic functions.
+    /// Safe row-invariant instructions inside retained functions are extracted
+    /// into shared scalar arguments; their varying kernels remain retained and
+    /// are reused for all rows with the same argument-dependency pattern.
     pub fn new(
         mut evaluator: ExpressionEvaluator<Complex<Rational>>,
         bound_positions: Vec<usize>,
@@ -637,6 +642,7 @@ impl ParameterRowEvaluator<Complex<Rational>> {
             }
         }
         evaluator.undo_stack_optimization();
+        retained::split_calls(&mut evaluator, &bound_positions, &rows)?;
         let physical_positions = (0..evaluator.param_count)
             .filter(|position| !bound_positions.contains(position))
             .collect::<Vec<_>>();
@@ -742,11 +748,22 @@ impl RowAnalysis {
         columns: &[usize],
         rows: &[Vec<Rational>],
     ) -> Self {
+        Self::with_bindings(evaluator, columns, rows.len(), |row, column| {
+            Some(&rows[row][column])
+        })
+    }
+
+    fn with_bindings<'a>(
+        evaluator: &ExpressionEvaluator<Complex<Rational>>,
+        columns: &[usize],
+        row_count: usize,
+        binding: impl Fn(usize, usize) -> Option<&'a Rational>,
+    ) -> Self {
         let slots = evaluator.reserved_indices + evaluator.instructions.len();
         let mut result = Self {
             dependencies: vec![BTreeSet::new(); slots],
-            active: vec![vec![Some(true); rows.len()]; slots],
-            safe: vec![vec![true; rows.len()]; slots],
+            active: vec![vec![Some(true); row_count]; slots],
+            safe: vec![vec![true; row_count]; slots],
             conditions: HashMap::default(),
         };
         for (column, slot) in columns.iter().enumerate() {
@@ -783,12 +800,13 @@ impl RowAnalysis {
             );
         }
         let mut booleans = BooleanEvaluation::new(&evaluator.external_fns);
-        for (row_index, row) in rows.iter().enumerate() {
+        for row_index in 0..row_count {
             let mut known = vec![None; slots];
-            for (slot, value) in columns.iter().zip(row) {
+            for (column, slot) in columns.iter().enumerate() {
                 if proof_inputs.contains(slot) {
-                    known[*slot] =
-                        NativeBoolean::from_exact(&Complex::new(value.clone(), Rational::zero()));
+                    known[*slot] = binding(row_index, column).and_then(|value| {
+                        NativeBoolean::from_exact(&Complex::new(value.clone(), Rational::zero()))
+                    });
                 }
             }
             for (slot, value) in known
@@ -814,7 +832,7 @@ impl RowAnalysis {
                         result
                             .conditions
                             .entry(*condition)
-                            .or_insert_with(|| vec![None; rows.len()])[row_index] = selected;
+                            .or_insert_with(|| vec![None; row_count])[row_index] = selected;
                         branches.push((reach, selected));
                         reach = and(reach, selected);
                     }
@@ -829,7 +847,7 @@ impl RowAnalysis {
                         result
                             .conditions
                             .entry(*condition)
-                            .or_insert_with(|| vec![None; rows.len()])[row_index] = selected;
+                            .or_insert_with(|| vec![None; row_count])[row_index] = selected;
                         known[*target] = selected
                             .and_then(|yes_branch| known[if yes_branch { *yes } else { *no }]);
                         result.active[*target][row_index] = reach;
@@ -979,6 +997,16 @@ fn partition(
     prelude.optimize_stack();
     prelude.prune_unused_external_functions();
 
+    let mut body = body_with_shared_inputs(evaluator, &ports, &used);
+    body.prune_unused_external_functions();
+    Ok((prelude, body, gathers, prelude_values))
+}
+
+fn body_with_shared_inputs(
+    evaluator: &ExpressionEvaluator<Complex<Rational>>,
+    ports: &[usize],
+    used: &HashSet<usize>,
+) -> ExpressionEvaluator<Complex<Rational>> {
     let port_map = ports
         .iter()
         .enumerate()
@@ -1021,8 +1049,7 @@ fn partition(
     body.fix_labels();
     body.undo_stack_optimization();
     body.optimize_stack();
-    body.prune_unused_external_functions();
-    Ok((prelude, body, gathers, prelude_values))
+    body
 }
 
 struct Prelude<'a> {

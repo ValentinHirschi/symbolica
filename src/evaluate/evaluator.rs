@@ -77,6 +77,28 @@ impl FunctionBody {
 }
 
 impl<T: Default + Clone> ExpressionEvaluator<T> {
+    /// Build a native view of a retained body. Its constants are explicit
+    /// captured arguments; root-level constant slots do not belong to this scope.
+    pub(super) fn from_retained_body(
+        body: &FunctionBody,
+        functions: &[ExternalFunctionContainer<T>],
+        settings: &OptimizationSettings,
+    ) -> Self {
+        let mut external_fns = functions.to_vec();
+        for function in &mut external_fns {
+            function.constant_index = None;
+        }
+        Self {
+            stack: vec![T::default(); body.stack_size],
+            param_count: body.param_count,
+            reserved_indices: body.param_count,
+            instructions: body.instructions.clone(),
+            result_indices: vec![body.result_index],
+            external_fns,
+            settings: settings.clone(),
+        }
+    }
+
     /// Keep the selected output's data dependencies and the original lazy branch
     /// structure. Constants become explicit function inputs, as in the native
     /// retained-body builder; unused original arguments are dropped.
