@@ -882,6 +882,18 @@ fn partition(
         {
             continue;
         }
+        // A physical-only scalar may occur in separate coefficient-selected
+        // leaves, each visited by only one row. Move those leaves together so
+        // native CSE can share their common factors across the complete sum.
+        // Unknown physical branches failed the safety check above; their
+        // potentially singular inputs must remain inside their runtime guard.
+        if rows.len() > 1
+            && analysis.dependencies[target].is_empty()
+            && analysis.active[target].contains(&Some(true))
+        {
+            candidates.insert(target);
+            continue;
+        }
         let costly = matches!(
             instruction,
             Instr::BuiltinFun(..)
@@ -1132,6 +1144,124 @@ impl<'a> Prelude<'a> {
 mod tests {
     use super::*;
     use crate::{parse, symbol};
+
+    #[test]
+    fn selected_scalar_leaves_share_factors_without_exposing_physical_poles() {
+        let params = [
+            parse!("selected_scalar::x"),
+            parse!("selected_scalar::c"),
+            parse!("selected_scalar::s"),
+            parse!("selected_scalar::g"),
+        ];
+        let numerator = symbol!("selected_scalar::n");
+        let selected = Symbol::IF.call_args([
+            params[2].clone(),
+            parse!("1/(selected_scalar::x+1)+1/(selected_scalar::x+2)"),
+            parse!("2/(selected_scalar::x+1)+1/(selected_scalar::x+3)"),
+        ]);
+        let term = numerator.call(&params[0] + &params[1]) * selected;
+        let rows = vec![vec![1.into(), 0.into()], vec![2.into(), 1.into()]];
+        for guarded in [false, true] {
+            let expression = if guarded {
+                Symbol::IF.call_args([params[3].clone(), term.clone(), Atom::Zero])
+            } else {
+                term.clone()
+            };
+            let source = expression
+                .evaluator(&params)
+                .add_function_with_options(
+                    numerator,
+                    vec![symbol!("selected_scalar::u")],
+                    parse!("selected_scalar::u^2+1"),
+                    FunctionRegistrationOptions::new().inlining(InliningPolicy::Never),
+                )
+                .unwrap()
+                .build()
+                .unwrap();
+            let source_body = source.external_fns[0].body.clone().unwrap();
+            let staged =
+                ParameterRowEvaluator::new(source.clone(), vec![1, 2], rows.clone()).unwrap();
+            let inversions = |program: &ExpressionEvaluator<Complex<Rational>>| {
+                program
+                    .instructions
+                    .iter()
+                    .filter(|(instruction, _)| matches!(instruction, Instr::Pow(_, _, -1)))
+                    .count()
+            };
+            if guarded {
+                assert_eq!(inversions(&staged.prelude), 0);
+                assert!(inversions(&staged.body) > 0);
+            } else {
+                assert_eq!(inversions(&staged.prelude), 3);
+                assert_eq!(inversions(&staged.body), 0);
+            }
+            assert!(staged.prelude.external_fns.is_empty());
+            assert_eq!(staged.body.external_fns.len(), 1);
+            assert!(Arc::ptr_eq(
+                &source_body,
+                staged.body.external_fns[0].body.as_ref().unwrap()
+            ));
+            let mut oracle = source.clone().map_coeff(&|value| value.re.to_f64());
+            let mut numeric = staged.clone().map_coeff(&|value| value.re.to_f64());
+            for (x, gate) in [(0.25, 1.), (2., 1.), (7., 1.), (-1., 0.)] {
+                if !guarded && gate == 0. {
+                    continue;
+                }
+                let expected = rows
+                    .iter()
+                    .map(|row| oracle.evaluate_single(&[x, row[0].to_f64(), row[1].to_f64(), gate]))
+                    .sum::<f64>();
+                let mut output = [0.];
+                numeric
+                    .evaluate(&[x, gate], &mut output, Rational::to_f64)
+                    .unwrap();
+                assert!(expected.is_finite());
+                assert!((output[0] - expected).abs() < 1e-12);
+                #[cfg(feature = "native_code_generation")]
+                for direct in [false, true] {
+                    let (plan, prelude, body) = staged
+                        .clone()
+                        .map_coeff(&|value| value.re.to_f64())
+                        .into_parts();
+                    let settings = JITCompilationSettings::new()
+                        .optimization_level(2)
+                        .direct_translation(direct);
+                    let mut body = body.jit_compile(settings.clone()).unwrap();
+                    let mut prelude = (prelude.get_output_len() != 0)
+                        .then(|| prelude.jit_compile(settings).unwrap());
+                    plan.evaluate_with(
+                        &[x, gate],
+                        &mut output,
+                        &mut ParameterRowWorkspace::default(),
+                        Rational::to_f64,
+                        |input, output| {
+                            prelude.as_mut().unwrap().evaluate(input, output);
+                            Ok(())
+                        },
+                        |input, output| {
+                            body.evaluate(input, output);
+                            Ok(())
+                        },
+                    )
+                    .unwrap();
+                    assert!((output[0] - expected).abs() < 1e-12);
+                }
+            }
+            if !guarded {
+                let never_selected_rows = vec![vec![1.into(), 0.into()], vec![2.into(), 0.into()]];
+                let staged =
+                    ParameterRowEvaluator::new(source, vec![1, 2], never_selected_rows).unwrap();
+                // The x+2 denominator belongs only to the unused positive arm.
+                assert_eq!(inversions(&staged.prelude), 2);
+                let mut numeric = staged.map_coeff(&|value| value.re.to_f64());
+                let mut output = [0.];
+                numeric
+                    .evaluate(&[-2., 1.], &mut output, Rational::to_f64)
+                    .unwrap();
+                assert_eq!(output, [-3.]);
+            }
+        }
+    }
 
     #[test]
     fn stage_registries_keep_only_reachable_calls_and_preserve_shared_leaf_bodies() {
