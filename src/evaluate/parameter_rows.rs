@@ -39,6 +39,7 @@ pub struct ParameterRowWorkspace<T> {
     shared_input: Vec<T>,
     shared: Vec<T>,
     output: Vec<T>,
+    mapped_output: Vec<T>,
 }
 
 impl<T> Default for ParameterRowWorkspace<T> {
@@ -48,6 +49,7 @@ impl<T> Default for ParameterRowWorkspace<T> {
             shared_input: Vec::new(),
             shared: Vec::new(),
             output: Vec::new(),
+            mapped_output: Vec::new(),
         }
     }
 }
@@ -200,6 +202,78 @@ impl ParameterRowPlan {
         output: &mut [T],
         workspace: &mut ParameterRowWorkspace<T>,
         coefficient: impl Fn(&Rational) -> T,
+        prelude: impl FnMut(&[T], &mut [T]) -> Result<(), EvaluationError>,
+        body: impl FnMut(&[T], &mut [T]) -> Result<(), EvaluationError>,
+    ) -> Result<(), EvaluationError> {
+        self.evaluate_with_input_mapping(
+            physical,
+            output,
+            workspace,
+            coefficient,
+            T::clone_from,
+            prelude,
+            body,
+        )
+    }
+
+    /// Run the native row schedule with application-owned input/output types.
+    ///
+    /// Physical inputs are mapped directly into the reusable native workspace.
+    /// Reduction uses native values and is mapped to outputs only on success.
+    /// The additional reduction buffer is reused across calls; it never caches
+    /// values across physical inputs or changes in numerical precision.
+    #[allow(clippy::too_many_arguments)]
+    pub fn evaluate_mapped_with<I, O, T: Clone + AddAssign<T>>(
+        &self,
+        physical: &[I],
+        output: &mut [O],
+        workspace: &mut ParameterRowWorkspace<T>,
+        coefficient: impl Fn(&Rational) -> T,
+        set_input: impl FnMut(&mut T, &I),
+        mut set_output: impl FnMut(&mut O, &T),
+        prelude: impl FnMut(&[T], &mut [T]) -> Result<(), EvaluationError>,
+        body: impl FnMut(&[T], &mut [T]) -> Result<(), EvaluationError>,
+    ) -> Result<(), EvaluationError> {
+        if physical.len() != self.get_input_len() {
+            return Err(EvaluationError::InvalidParameterCount {
+                expected: self.get_input_len(),
+                actual: physical.len(),
+            });
+        }
+        if output.len() != self.get_output_len() {
+            return Err(EvaluationError::InvalidOutputCount {
+                expected: self.get_output_len(),
+                actual: output.len(),
+            });
+        }
+        let mut native_output = std::mem::take(&mut workspace.mapped_output);
+        native_output.resize_with(output.len(), || coefficient(&Rational::zero()));
+        let result = self.evaluate_with_input_mapping(
+            physical,
+            &mut native_output,
+            workspace,
+            coefficient,
+            set_input,
+            prelude,
+            body,
+        );
+        if result.is_ok() {
+            for (destination, source) in output.iter_mut().zip(&native_output) {
+                set_output(destination, source);
+            }
+        }
+        workspace.mapped_output = native_output;
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn evaluate_with_input_mapping<I, T: Clone + AddAssign<T>>(
+        &self,
+        physical: &[I],
+        output: &mut [T],
+        workspace: &mut ParameterRowWorkspace<T>,
+        coefficient: impl Fn(&Rational) -> T,
+        mut set_input: impl FnMut(&mut T, &I),
         mut prelude: impl FnMut(&[T], &mut [T]) -> Result<(), EvaluationError>,
         mut body: impl FnMut(&[T], &mut [T]) -> Result<(), EvaluationError>,
     ) -> Result<(), EvaluationError> {
@@ -230,14 +304,21 @@ impl ParameterRowPlan {
             .resize(self.shared_outputs * self.components, zero.clone());
         workspace.output.resize(output.len(), zero.clone());
         for (source, destination) in self.physical_positions.iter().enumerate() {
-            workspace.input[destination * self.components..(destination + 1) * self.components]
-                .clone_from_slice(
-                    &physical[source * self.components..(source + 1) * self.components],
-                );
+            for (destination, source) in workspace.input
+                [destination * self.components..(destination + 1) * self.components]
+                .iter_mut()
+                .zip(&physical[source * self.components..(source + 1) * self.components])
+            {
+                set_input(destination, source);
+            }
         }
         if self.shared_outputs != 0 {
             workspace.shared_input.clear();
-            workspace.shared_input.extend_from_slice(physical);
+            for position in &self.physical_positions {
+                workspace.shared_input.extend_from_slice(
+                    &workspace.input[position * self.components..(position + 1) * self.components],
+                );
+            }
             for value in &self.prelude_values {
                 let value = coefficient(value);
                 workspace.shared_input.push(value.clone());
@@ -582,6 +663,27 @@ impl<T: Default> ParameterRowEvaluator<T> {
 }
 
 impl<T: Real> ParameterRowEvaluator<T> {
+    /// Evaluate the ordered row sum with mapped application storage.
+    pub fn evaluate_mapped<I, O>(
+        &mut self,
+        input: &[I],
+        output: &mut [O],
+        coefficient: impl Fn(&Rational) -> T,
+        set_input: impl FnMut(&mut T, &I),
+        set_output: impl FnMut(&mut O, &T),
+    ) -> Result<(), EvaluationError> {
+        self.plan.evaluate_mapped_with(
+            input,
+            output,
+            &mut self.workspace,
+            coefficient,
+            set_input,
+            set_output,
+            |input, output| self.prelude.try_evaluate(input, output),
+            |input, output| self.body.try_evaluate(input, output),
+        )
+    }
+
     /// Evaluate all rows and sum their outputs in row order.
     ///
     /// The converter must use the same precision as the physical inputs. It is

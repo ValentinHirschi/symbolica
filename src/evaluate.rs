@@ -37,6 +37,8 @@ mod export;
 mod external;
 mod function_map;
 mod instruction;
+#[cfg(test)]
+mod mapped_tests;
 mod optimize;
 mod parameter_rows;
 mod specialize;

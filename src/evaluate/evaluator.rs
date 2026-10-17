@@ -448,6 +448,22 @@ impl<T: Real> ExpressionEvaluator<T> {
     /// Evaluate the expression evaluator and write the results in `out`.
     #[inline]
     pub fn try_evaluate(&mut self, params: &[T], out: &mut [T]) -> Result<(), EvaluationError> {
+        self.try_evaluate_mapped(params, out, T::set_from, T::set_from)
+    }
+
+    /// Evaluate using different input and output storage types.
+    ///
+    /// Setters copy directly into the evaluator's existing input stack and from
+    /// its result slots. They may preserve allocation and precision in either
+    /// representation. Lengths are checked before either setter is called.
+    #[inline]
+    pub fn try_evaluate_mapped<I, O>(
+        &mut self,
+        params: &[I],
+        out: &mut [O],
+        mut set_input: impl FnMut(&mut T, &I),
+        mut set_output: impl FnMut(&mut O, &T),
+    ) -> Result<(), EvaluationError> {
         if params.len() != self.param_count {
             return Err(EvaluationError::InvalidParameterCount {
                 expected: self.param_count,
@@ -461,11 +477,11 @@ impl<T: Real> ExpressionEvaluator<T> {
             });
         }
         for (t, p) in self.stack.iter_mut().zip(params) {
-            t.set_from(p);
+            set_input(t, p);
         }
         Self::evaluate_program(&self.instructions, &mut self.stack, &mut self.external_fns);
         for (o, i) in out.iter_mut().zip(&self.result_indices) {
-            o.set_from(&self.stack[*i]);
+            set_output(o, &self.stack[*i]);
         }
         Ok(())
     }
