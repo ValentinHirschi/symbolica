@@ -154,7 +154,7 @@ wolfram-library-link = { version = "0.2.9", optional = true }
 bincode-trait-derive = { version = "0.1.0", optional = true }
 pyo3-log = { version = "0.13", optional = true }
 # Direct division and range-safe complex intrinsics: siravan/symjit#18.
-symjit = { git = "https://github.com/ValentinHirschi/symjit_changes_for_pyamplicol", rev = "77a222f2d81dded9dfa0271e242605c057a01c1e", optional = true }
+symjit = { git = "https://github.com/ValentinHirschi/symjit_changes_for_pyamplicol", rev = "b6ffc8ffe6c4f8e3131823fcc1e8902b4b8c8d79", optional = true }
 divan = { version = "0.1.21", optional = true }
 flint3-sys = { version = "3.6.1", optional = true, features = ["gmp-mpfr-sys"] }
 
