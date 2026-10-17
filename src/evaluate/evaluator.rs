@@ -494,6 +494,10 @@ impl<T: Real> ExpressionEvaluator<T> {
         external_fns: &mut [ExternalFunctionContainer<T>],
     ) {
         let mut tmp = T::new_zero();
+        // Keep the common Add/Mul/Pow dispatch small and its scratch local. Passing
+        // that scratch to the cold path forces spills in the hot arithmetic loop.
+        // Division gets reusable storage only when an instruction actually needs it.
+        let mut div_tmp = None;
         let mut i = 0;
         while i < instructions.len() {
             let (instr, _) = unsafe { &instructions.get_unchecked(i) };
@@ -540,11 +544,6 @@ impl<T: Real> ExpressionEvaluator<T> {
 
                     std::mem::swap(stack.get_unchecked_mut(*r), &mut tmp);
                 },
-                Instr::Div(r, numerator, denominator) => {
-                    tmp.set_from(&stack[*numerator]);
-                    tmp /= &stack[*denominator];
-                    std::mem::swap(&mut stack[*r], &mut tmp);
-                }
                 Instr::Pow(r, b, e) => {
                     if *e == -1 {
                         stack[*r] = stack[*b].inv();
@@ -555,7 +554,9 @@ impl<T: Real> ExpressionEvaluator<T> {
                     }
                 }
                 _ => {
-                    if let Some(idx) = Self::evaluate_impl_no_ops(stack, instr, external_fns) {
+                    if let Some(idx) =
+                        Self::evaluate_impl_no_ops(stack, instr, external_fns, &mut div_tmp)
+                    {
                         i = idx;
                         continue;
                     }
@@ -589,8 +590,15 @@ impl<T: Real> ExpressionEvaluator<T> {
         stack: &mut [T],
         instr: &Instr,
         external_fns: &mut [ExternalFunctionContainer<T>],
+        div_tmp: &mut Option<T>,
     ) -> Option<usize> {
         match instr {
+            Instr::Div(r, numerator, denominator) => {
+                let tmp = div_tmp.get_or_insert_with(T::new_zero);
+                tmp.set_from(&stack[*numerator]);
+                *tmp /= &stack[*denominator];
+                std::mem::swap(&mut stack[*r], tmp);
+            }
             Instr::Powf(r, b, e) => {
                 stack[*r] = stack[*b].powf(&stack[*e]);
             }
@@ -656,9 +664,7 @@ impl<T: Real> ExpressionEvaluator<T> {
             Instr::Select(r, c, a, b) => {
                 stack[*r] = stack[*c].select_nonzero(&stack[*a], &stack[*b]);
             }
-            Instr::Add(..) | Instr::Mul(..) | Instr::Pow(..) | Instr::Div(..) => {
-                unreachable!()
-            }
+            Instr::Add(..) | Instr::Mul(..) | Instr::Pow(..) => unreachable!(),
         }
 
         None
@@ -1987,6 +1993,55 @@ mod cse_tests {
         }
         assert!(eager.evaluate_single(&[0., 0.]).is_nan());
         assert!(eager.evaluate_single(&[1., 1e-320]).is_infinite());
+
+        // Interleave scratch users, including division onto either operand's slot.
+        let alternating = evaluator(
+            3,
+            vec![
+                Instr::Div(3, 0, 1),
+                Instr::Add(4, vec![3, 2]),
+                Instr::Mul(3, vec![4, 1]),
+                Instr::Div(3, 3, 1),
+                Instr::Div(4, 0, 1),
+                Instr::Add(3, vec![3, 4]),
+                Instr::Div(1, 3, 1),
+                Instr::Mul(1, vec![1, 0]),
+            ],
+            vec![3, 1],
+        );
+        let mut interleaved = alternating.clone();
+        for (input, expected) in [
+            ([6., 3., 4.], [8., 16.]),
+            ([2., 4., 1.], [2., 1.]),
+            ([7., 2., -2.], [5., 17.5]),
+            ([6., 3., 4.], [8., 16.]),
+        ] {
+            let mut output = [0.; 2];
+            interleaved.evaluate(&input, &mut output);
+            assert_eq!(output, expected);
+        }
+        #[cfg(feature = "float-mpfr")]
+        {
+            use crate::domains::float::Float;
+            let mut interleaved = alternating.map_coeff(&|value| Float::with_val(192, *value));
+            let mut output = [Float::with_val(32, 0), Float::with_val(32, 0)];
+            for precision in [64, 320, 128, 192] {
+                let input = [6, 3, 4].map(|value| Float::with_val(precision, value));
+                interleaved.evaluate(&input, &mut output);
+                assert_eq!(
+                    output,
+                    [
+                        Float::with_val(precision, 8),
+                        Float::with_val(precision, 16)
+                    ]
+                );
+                assert!(
+                    output
+                        .iter()
+                        .all(|value| value.get_precision() >= precision - 8)
+                );
+            }
+        }
 
         #[cfg(feature = "bincode")]
         {
