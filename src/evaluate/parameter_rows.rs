@@ -739,6 +739,9 @@ struct RowAnalysis {
     dependencies: Vec<BTreeSet<usize>>,
     active: Vec<Vec<Option<bool>>>,
     safe: Vec<Vec<bool>>,
+    /// Selected scalar data are independent of coefficient inputs. A proven
+    /// selector may choose different physical-only values for different rows.
+    invariant: Vec<Vec<bool>>,
     conditions: HashMap<usize, Vec<Option<bool>>>,
 }
 
@@ -764,10 +767,12 @@ impl RowAnalysis {
             dependencies: vec![BTreeSet::new(); slots],
             active: vec![vec![Some(true); row_count]; slots],
             safe: vec![vec![true; row_count]; slots],
+            invariant: vec![vec![true; row_count]; slots],
             conditions: HashMap::default(),
         };
         for (column, slot) in columns.iter().enumerate() {
             result.dependencies[*slot].insert(column);
+            result.invariant[*slot].fill(false);
         }
         for (instruction, _) in &evaluator.instructions {
             if let Some(target) = output(instruction) {
@@ -850,6 +855,9 @@ impl RowAnalysis {
                         known[*target] = selected
                             .and_then(|yes_branch| known[if yes_branch { *yes } else { *no }]);
                         result.active[*target][row_index] = reach;
+                        result.invariant[*target][row_index] = selected.is_some_and(|yes_branch| {
+                            result.invariant[if yes_branch { *yes } else { *no }][row_index]
+                        });
                         result.safe[*target][row_index] = reach == Some(true)
                             && selected.is_some_and(|yes_branch| {
                                 result.safe[if yes_branch { *yes } else { *no }][row_index]
@@ -871,6 +879,8 @@ impl RowAnalysis {
                         let target = output(instruction).unwrap();
                         let args = instruction.input_indices();
                         result.active[target][row_index] = reach;
+                        result.invariant[target][row_index] =
+                            args.iter().all(|input| result.invariant[*input][row_index]);
                         result.safe[target][row_index] = reach == Some(true)
                             && args.iter().all(|input| result.safe[*input][row_index]);
                         if reach == Some(false) {
@@ -910,11 +920,10 @@ fn partition(
         let Some(target) = output(instruction) else {
             continue;
         };
-        if matches!(instruction, Instr::Join(..))
-            || !analysis.active[target]
-                .iter()
-                .zip(&analysis.safe[target])
-                .all(|(active, safe)| *active == Some(false) || *safe)
+        if !analysis.active[target]
+            .iter()
+            .zip(&analysis.safe[target])
+            .all(|(active, safe)| *active == Some(false) || *safe)
         {
             continue;
         }
@@ -924,10 +933,16 @@ fn partition(
         // Unknown physical branches failed the safety check above; their
         // potentially singular inputs must remain inside their runtime guard.
         if rows.len() > 1
-            && analysis.dependencies[target].is_empty()
+            && analysis.active[target]
+                .iter()
+                .zip(&analysis.invariant[target])
+                .all(|(active, invariant)| *active == Some(false) || *invariant)
             && analysis.active[target].contains(&Some(true))
         {
             candidates.insert(target);
+            continue;
+        }
+        if matches!(instruction, Instr::Join(..)) {
             continue;
         }
         let costly = matches!(
@@ -1008,6 +1023,7 @@ fn partition(
     prelude.prune_unused_external_functions();
 
     let mut body = body_with_shared_inputs(evaluator, &ports, &used);
+    body.prune_output_dependencies(false);
     body.prune_unused_external_functions();
     Ok((prelude, body, gathers, prelude_values))
 }
@@ -1057,8 +1073,6 @@ fn body_with_shared_inputs(
         .map(|slot| map(*slot))
         .collect();
     body.fix_labels();
-    body.undo_stack_optimization();
-    body.optimize_stack();
     body
 }
 
@@ -2033,6 +2047,143 @@ mod tests {
                 )
                 .unwrap();
                 assert_eq!(actual, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn selected_scalar_results_drop_empty_control_scopes_without_inlining() {
+        let params = [
+            parse!("row_selected::x"),
+            parse!("row_selected::c"),
+            parse!("row_selected::s"),
+            parse!("row_selected::t"),
+            parse!("row_selected::gate"),
+        ];
+        let function = symbol!("row_selected::n");
+        let expression = parse!(
+            "row_selected::n(row_selected::x+row_selected::c)*if(row_selected::s,if(row_selected::t,1/(row_selected::x+1),1/(row_selected::x+2)),1/(row_selected::x+3))"
+        );
+        let rows = vec![
+            vec![1.into(), 0.into(), 0.into()],
+            vec![2.into(), 1.into(), 0.into()],
+            vec![3.into(), 1.into(), 1.into()],
+        ];
+        for policy in [InliningPolicy::Always, InliningPolicy::Never] {
+            for guarded in [false, true] {
+                let root = if guarded {
+                    Symbol::IF.call_args([params[4].clone(), expression.clone(), Atom::Zero])
+                } else {
+                    expression.clone()
+                };
+                let source = root
+                    .evaluator(&params)
+                    .add_function_with_options(
+                        function,
+                        vec![symbol!("row_selected::a")],
+                        parse!("row_selected::a^2+1"),
+                        FunctionRegistrationOptions::new().inlining(policy),
+                    )
+                    .unwrap()
+                    .build()
+                    .unwrap();
+                let staged =
+                    ParameterRowEvaluator::new(source.clone(), vec![1, 2, 3], rows.clone())
+                        .unwrap();
+                let controls = staged
+                    .body
+                    .instructions
+                    .iter()
+                    .filter(|(instruction, _)| {
+                        matches!(
+                            instruction,
+                            Instr::IfElse(..)
+                                | Instr::Goto(..)
+                                | Instr::Label(..)
+                                | Instr::Join(..)
+                        )
+                    })
+                    .count();
+                eprintln!(
+                    "selected scalar carrier inventory: policy={policy:?}, guarded={guarded}, body_instructions={}, control_instructions={controls}, body_operations={:?}, prelude_instructions={}",
+                    staged.body.instructions.len(),
+                    staged.body.count_operations(),
+                    staged.prelude.instructions.len()
+                );
+                if guarded {
+                    assert!(controls > 0, "the physical guard must remain lazy");
+                } else {
+                    assert_eq!(
+                        controls, 0,
+                        "selected scalar carriers need no repeated native branch calls"
+                    );
+                }
+                let bodies = staged
+                    .body
+                    .external_fns
+                    .iter()
+                    .filter(|function| function.body.is_some())
+                    .count();
+                assert_eq!(bodies, usize::from(policy == InliningPolicy::Never));
+                let mut numeric = staged.clone().map_coeff(&|value| value.re.to_f64());
+                let mut actual = [0.];
+                numeric
+                    .evaluate(&[2., 1.], &mut actual, Rational::to_f64)
+                    .unwrap();
+                let expected = 10. / 5. + 17. / 4. + 26. / 3.;
+                assert!((actual[0] - expected).abs() < 1e-12);
+                if guarded {
+                    numeric
+                        .evaluate(&[-1., 0.], &mut actual, Rational::to_f64)
+                        .unwrap();
+                    assert_eq!(actual, [0.]);
+                }
+                #[cfg(feature = "native_code_generation")]
+                for direct in [false, true] {
+                    let (plan, prelude, body) = staged
+                        .clone()
+                        .map_coeff(&|value| value.re.to_f64())
+                        .into_parts();
+                    let settings = JITCompilationSettings::new()
+                        .optimization_level(2)
+                        .direct_translation(direct);
+                    let mut prelude = (prelude.get_output_len() != 0)
+                        .then(|| prelude.jit_compile(settings.clone()).unwrap());
+                    let mut body = body.jit_compile(settings).unwrap();
+                    for (x, gate, expected) in [(2., 1., expected), (-1., 0., 0.)] {
+                        if !guarded && gate == 0. {
+                            continue;
+                        }
+                        plan.evaluate_with(
+                            &[x, gate],
+                            &mut actual,
+                            &mut ParameterRowWorkspace::default(),
+                            Rational::to_f64,
+                            |input, output| {
+                                prelude.as_mut().unwrap().evaluate(input, output);
+                                Ok(())
+                            },
+                            |input, output| {
+                                body.evaluate(input, output);
+                                Ok(())
+                            },
+                        )
+                        .unwrap();
+                        assert!((actual[0] - expected).abs() < 1e-12);
+                    }
+                }
+                let mut inactive =
+                    ParameterRowEvaluator::new(source, vec![1, 2, 3], rows[..2].to_vec())
+                        .unwrap()
+                        .map_coeff(&|value| value.re.to_f64());
+                inactive
+                    .evaluate(&[-1., 1.], &mut actual, Rational::to_f64)
+                    .unwrap();
+                assert_eq!(
+                    actual,
+                    [2.5],
+                    "the never-selected x+1 pole must not be evaluated"
+                );
             }
         }
     }

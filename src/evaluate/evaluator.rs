@@ -99,68 +99,111 @@ impl<T: Default + Clone> ExpressionEvaluator<T> {
         }
     }
 
-    /// Keep the selected output's data dependencies and the original lazy branch
-    /// structure. Constants become explicit function inputs, as in the native
-    /// retained-body builder; unused original arguments are dropped.
+    /// Keep one output and all live lazy branches, making used constants
+    /// explicit function inputs and dropping unused original arguments.
     pub(super) fn retain_output_component(&mut self, component: usize) -> Vec<usize> {
         self.result_indices = vec![self.result_indices[component]];
+        self.prune_output_dependencies(true)
+    }
+
+    /// Remove data and control instructions not needed by the current outputs.
+    /// A guarded value keeps its controlling predicate; a live phi keeps its
+    /// branch even when both selected values are original inputs or constants.
+    /// Staged programs retain their input ABI, while outlined functions compact it.
+    pub(super) fn prune_output_dependencies(&mut self, compact_inputs: bool) -> Vec<usize> {
         self.undo_stack_optimization();
-        // A native forwarding instruction does not require an outlined
-        // derivative body. Keep the original input/constant binding so its
-        // caller can use it directly after component pruning.
-        while self.result_indices[0] >= self.reserved_indices {
-            let output = self.result_indices[0];
-            match &self.instructions[output - self.reserved_indices].0 {
-                Instr::Add(_, inputs) | Instr::Mul(_, inputs) if inputs.len() == 1 => {
-                    self.result_indices[0] = inputs[0];
+        for result in &mut self.result_indices {
+            while *result >= self.reserved_indices {
+                match &self.instructions[*result - self.reserved_indices].0 {
+                    Instr::Add(_, inputs) | Instr::Mul(_, inputs) if inputs.len() == 1 => {
+                        *result = inputs[0];
+                    }
+                    _ => break,
                 }
-                _ => break,
             }
         }
-        let evaluator = self;
-        let mut used = HashSet::from_iter(evaluator.result_indices.iter().copied());
-        let mut keep = vec![false; evaluator.instructions.len()];
-        for (index, (instruction, _)) in evaluator.instructions.iter().enumerate().rev() {
-            let (output, inputs): (Option<usize>, &[usize]) = match instruction {
-                Instr::Add(output, inputs)
-                | Instr::Mul(output, inputs)
-                | Instr::ExternalFun(output, _, inputs) => (Some(*output), inputs),
-                Instr::Pow(output, input, _) | Instr::BuiltinFun(output, _, input) => {
-                    (Some(*output), std::slice::from_ref(input))
+
+        // Native branches close at a label and may be followed by several phi
+        // outputs. Keep ownership separate from the number of Join instructions.
+        let mut regions = Vec::<(usize, Option<usize>)>::new();
+        let mut open = Vec::<(usize, Option<Label>)>::new();
+        let mut last_exit = None;
+        let mut scopes = vec![None; self.instructions.len()];
+        let mut control = vec![None; self.instructions.len()];
+        let mut phis = vec![None; self.instructions.len()];
+        for (index, (instruction, _)) in self.instructions.iter().enumerate() {
+            if !matches!(instruction, Instr::Join(..)) {
+                last_exit = None;
+            }
+            scopes[index] = open.last().map(|(region, _)| *region);
+            match instruction {
+                Instr::IfElse(condition, _) => {
+                    let region = regions.len();
+                    regions.push((*condition, scopes[index]));
+                    control[index] = Some(region);
+                    open.push((region, None));
                 }
-                Instr::Powf(output, left, right) | Instr::Div(output, left, right) => {
-                    if used.contains(output) {
-                        keep[index] = true;
-                        used.extend([*left, *right]);
+                Instr::Goto(label) => {
+                    if let Some((region, exit)) = open.last_mut() {
+                        *exit = Some(*label);
+                        control[index] = Some(*region);
                     }
-                    continue;
                 }
-                Instr::Join(output, condition, left, right)
-                | Instr::Select(output, condition, left, right) => {
-                    if used.contains(output) {
-                        keep[index] = true;
-                        used.extend([*condition, *left, *right]);
+                Instr::Label(label) => {
+                    control[index] = scopes[index];
+                    if open.last().is_some_and(|(_, exit)| *exit == Some(*label)) {
+                        let (region, _) = open.pop().unwrap();
+                        last_exit = Some(region);
                     }
-                    continue;
                 }
-                Instr::IfElse(condition, _) => (None, std::slice::from_ref(condition)),
-                Instr::Goto(_) | Instr::Label(_) => (None, &[]),
-            };
-            if output.is_none_or(|output| used.contains(&output)) {
-                keep[index] = true;
-                used.extend(inputs);
+                Instr::Join(..) => {
+                    // Native phi outputs form one consecutive section after
+                    // this conditional's exit label, even with a reused predicate.
+                    phis[index] = last_exit;
+                }
+                _ => {}
             }
         }
-        let args = (0..evaluator.reserved_indices)
-            .filter(|input| used.contains(input))
+        let mut used = HashSet::default();
+        let mut live_regions = HashSet::default();
+        let mut pending = self.result_indices.clone();
+        while let Some(slot) = pending.pop() {
+            if !used.insert(slot) || slot < self.reserved_indices {
+                continue;
+            }
+            let index = slot - self.reserved_indices;
+            pending.extend(self.instructions[index].0.input_indices());
+            for mut scope in [scopes[index], phis[index]] {
+                while let Some(region) = scope {
+                    if !live_regions.insert(region) {
+                        break;
+                    }
+                    pending.push(regions[region].0);
+                    scope = regions[region].1;
+                }
+            }
+        }
+        let args = (0..self.reserved_indices)
+            .filter(|input| !compact_inputs || used.contains(input))
             .collect::<Vec<_>>();
-        let mut slots = vec![0; evaluator.stack.len()];
+        let reserved = if compact_inputs {
+            args.len()
+        } else {
+            self.reserved_indices
+        };
+        let mut slots = vec![0; self.stack.len()];
         for (new, old) in args.iter().enumerate() {
             slots[*old] = new;
         }
         let mut instructions = Vec::new();
-        for (index, (mut instruction, phase)) in evaluator.instructions.drain(..).enumerate() {
-            if !keep[index] {
+        for (index, (mut instruction, phase)) in self.instructions.drain(..).enumerate() {
+            let keep = match &instruction {
+                Instr::IfElse(..) | Instr::Goto(..) | Instr::Label(..) => {
+                    control[index].is_none_or(|region| live_regions.contains(&region))
+                }
+                _ => used.contains(&(index + self.reserved_indices)),
+            };
+            if !keep {
                 continue;
             }
             let output = match &mut instruction {
@@ -192,21 +235,28 @@ impl<T: Default + Clone> ExpressionEvaluator<T> {
                     *condition = slots[*condition];
                     None
                 }
-                Instr::Goto(_) | Instr::Label(_) => None,
+                Instr::Goto(..) | Instr::Label(..) => None,
             };
             if let Some(output) = output {
-                slots[*output] = args.len() + instructions.len();
+                slots[*output] = reserved + instructions.len();
                 *output = slots[*output];
             }
             instructions.push((instruction, phase));
         }
-        evaluator.result_indices[0] = slots[evaluator.result_indices[0]];
-        evaluator.param_count = args.len();
-        evaluator.reserved_indices = args.len();
-        evaluator.instructions = instructions;
-        evaluator.stack = vec![T::default(); args.len() + evaluator.instructions.len()];
-        evaluator.optimize_stack();
-        evaluator.fix_labels();
+        for output in &mut self.result_indices {
+            *output = slots[*output];
+        }
+        if compact_inputs {
+            self.param_count = args.len();
+            self.reserved_indices = args.len();
+            self.stack = vec![T::default(); args.len() + instructions.len()];
+        } else {
+            self.stack
+                .resize(self.reserved_indices + instructions.len(), T::default());
+        }
+        self.instructions = instructions;
+        self.optimize_stack();
+        self.fix_labels();
         args
     }
 }
@@ -2068,6 +2118,74 @@ mod cse_tests {
             optimized.evaluate(&[point], &mut after);
             assert_eq!(after, before);
             assert!(after.iter().all(|value| (value - expected).abs() < 1e-14));
+        }
+    }
+
+    #[test]
+    fn output_pruning_tracks_scope_exits_when_predicates_are_reused() {
+        let mut original = evaluator(
+            3,
+            vec![
+                Instr::IfElse(0, Label(0)),
+                Instr::IfElse(0, Label(1)),
+                Instr::Add(5, vec![2, 2]),
+                Instr::Goto(Label(2)),
+                Instr::Label(Label(1)),
+                Instr::Mul(8, vec![2, 2]),
+                Instr::Label(Label(2)),
+                Instr::Join(10, 0, 5, 8),
+                Instr::Join(11, 0, 5, 8),
+                Instr::Mul(12, vec![2, 2]),
+                Instr::Add(13, vec![10, 11, 12]),
+                Instr::Goto(Label(3)),
+                Instr::Label(Label(0)),
+                Instr::Mul(16, vec![2, 2]),
+                Instr::Label(Label(3)),
+                Instr::Join(18, 0, 13, 16),
+                Instr::IfElse(0, Label(4)),
+                Instr::Add(20, vec![2, 2]),
+                Instr::Goto(Label(5)),
+                Instr::Label(Label(4)),
+                Instr::Pow(23, 2, -1),
+                Instr::Label(Label(5)),
+                Instr::Join(25, 0, 20, 23),
+                // A dead sibling uses the same predicate and contains a pole. Its
+                // scope must not retain or steal ownership from either live sibling.
+                Instr::IfElse(0, Label(6)),
+                Instr::Pow(27, 2, -1),
+                Instr::Goto(Label(7)),
+                Instr::Label(Label(6)),
+                Instr::Add(30, vec![2, 2]),
+                Instr::Label(Label(7)),
+                Instr::Join(32, 0, 27, 30),
+            ],
+            vec![18, 25],
+        );
+        original.fix_labels();
+        for compact in [false, true] {
+            let mut pruned = original.clone();
+            let arguments = pruned.prune_output_dependencies(compact);
+            assert_eq!(arguments, if compact { vec![0, 2] } else { vec![0, 1, 2] });
+            assert_eq!(
+                pruned
+                    .instructions
+                    .iter()
+                    .filter(|(instruction, _)| matches!(instruction, Instr::IfElse(..)))
+                    .count(),
+                3
+            );
+            for (condition, x) in [(0., 2.), (1., 2.), (0., -2.), (1., 0.), (1., -2.)] {
+                let input = [condition, 7., x];
+                let mut expected = [0.; 2];
+                let mut actual = [0.; 2];
+                original.evaluate(&input, &mut expected);
+                let inputs = arguments
+                    .iter()
+                    .map(|index| input[*index])
+                    .collect::<Vec<_>>();
+                pruned.evaluate(&inputs, &mut actual);
+                assert_eq!(actual, expected);
+            }
         }
     }
 }
