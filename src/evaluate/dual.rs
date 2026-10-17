@@ -3,6 +3,9 @@ use super::*;
 mod norm;
 mod retained;
 
+#[cfg(test)]
+mod primal_tests;
+
 fn is_zero<T: DualNumberStructure>(
     a: &Slot,
     dualizer: &Dualizer<T>,
@@ -1065,8 +1068,11 @@ impl<T: DualNumberStructure> Vectorize<Complex<Rational>> for Dualizer<T> {
                 .map(|j| scalar_yield_add(&a.index(j), &b.index(j), self, instrs))
                 .collect(),
             VectorInstruction::Mul(a, b) => {
-                let mut current_index = vec![];
-                for j in 0..self.dual.get_len() {
+                // Zero derivative seeds may remove singular derivative terms,
+                // but the primal must retain the native product's domain,
+                // including 0*Inf and complex products with non-finite parts.
+                let mut current_index = vec![instrs.add(VectorInstruction::Mul(*a, *b))];
+                for j in 1..self.dual.get_len() {
                     current_index.push(scalar_mul(&a.index(j), b, self, instrs));
                 }
 
@@ -1335,7 +1341,11 @@ impl<T: DualNumberStructure> Vectorize<Complex<Rational>> for Dualizer<T> {
                     .map(|x| instrs.add(VectorInstruction::Assign(x)))
                     .collect();
                 let exp_in = VectorInstruction::BuiltinFun(Symbol::EXP, adjacent[0]);
-                self.map_instruction(&exp_in, instrs)
+                let mut result = self.map_instruction(&exp_in, instrs);
+                // The derivative recurrence uses exp(e*log(b)), while native
+                // powf has its own primal domain (for example, 0^0 is one).
+                result[0] = i.clone();
+                result
             }
             VectorInstruction::Select(c, a, b) => (0..self.dual.get_len())
                 .map(|j| VectorInstruction::Select(c.index(0), a.index(j), b.index(j)))
