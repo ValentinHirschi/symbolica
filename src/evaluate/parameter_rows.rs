@@ -824,7 +824,7 @@ impl RowAnalysis {
                 }
             }
             let mut reach = Some(true);
-            let mut branches = Vec::<(Option<bool>, Option<bool>)>::new();
+            let mut branches = Vec::<(Option<bool>, Option<bool>, Option<Label>)>::new();
             for (instruction, _) in &evaluator.instructions {
                 match instruction {
                     Instr::IfElse(condition, _) => {
@@ -833,16 +833,15 @@ impl RowAnalysis {
                             .conditions
                             .entry(*condition)
                             .or_insert_with(|| vec![None; row_count])[row_index] = selected;
-                        branches.push((reach, selected));
+                        branches.push((reach, selected, None));
                         reach = and(reach, selected);
                     }
-                    Instr::Goto(_) => {
-                        let (parent, selected) = branches.last().unwrap();
+                    Instr::Goto(label) => {
+                        let (parent, selected, exit) = branches.last_mut().unwrap();
+                        *exit = Some(*label);
                         reach = and(*parent, selected.map(|value| !value));
                     }
                     Instr::Join(target, condition, yes, no) => {
-                        let (parent, _) = branches.pop().unwrap();
-                        reach = parent;
                         let selected = known[*condition].as_ref().map(|value| !value.is_zero());
                         result
                             .conditions
@@ -856,7 +855,18 @@ impl RowAnalysis {
                                 result.safe[if yes_branch { *yes } else { *no }][row_index]
                             });
                     }
-                    Instr::Label(_) => {}
+                    Instr::Label(label) => {
+                        // One conditional may produce several phi values after
+                        // native vectorization. Restore its scope at the exit
+                        // label once, rather than popping it for every Join.
+                        if branches
+                            .last()
+                            .is_some_and(|(_, _, exit)| *exit == Some(*label))
+                        {
+                            let (parent, _, _) = branches.pop().unwrap();
+                            reach = parent;
+                        }
+                    }
                     _ => {
                         let target = output(instruction).unwrap();
                         let args = instruction.input_indices();
@@ -1941,6 +1951,89 @@ mod tests {
             )
             .unwrap();
             assert_eq!(output, [92.]);
+        }
+    }
+    #[test]
+    fn already_vectorized_branches_can_be_scheduled_over_exact_rows() {
+        let params = [
+            parse!("staged_existing_dual::x"),
+            parse!("staged_existing_dual::c"),
+        ];
+        let root = parse!(
+            "if(staged_existing_dual::c,staged_existing_dual::x^2,if(staged_existing_dual::x,1/staged_existing_dual::x,0))"
+        );
+        let program = root
+            .evaluator(&params)
+            .build()
+            .unwrap()
+            .vectorize(&Dualizer::new(
+                crate::domains::dual::HyperDual::<Complex<Rational>>::new(vec![
+                    vec![0],
+                    vec![1],
+                    vec![2],
+                ]),
+                vec![(1, 1), (1, 2)],
+            ))
+            .unwrap();
+        let staged = ParameterRowEvaluator::new(
+            program.clone(),
+            vec![3, 4, 5],
+            vec![
+                vec![0.into(), 0.into(), 0.into()],
+                vec![1.into(), 0.into(), 0.into()],
+            ],
+        )
+        .unwrap();
+        let mut numeric = staged.clone().map_coeff(&|value| value.re.to_f64());
+        let mut oracle = program.map_coeff(&|value| value.re.to_f64());
+        for (x, expected) in [
+            (2., [4.5, 3.75, 1.125]),
+            (-2., [3.5, -4.25, 0.875]),
+            (0., [0., 0., 1.]),
+        ] {
+            let mut original = [0.; 3];
+            let mut row = [0.; 3];
+            for c in [0., 1.] {
+                oracle.evaluate(&[x, 1., 0., c, 0., 0.], &mut row);
+                for (sum, value) in original.iter_mut().zip(row) {
+                    *sum += value;
+                }
+            }
+            assert_eq!(original, expected);
+            let mut actual = [0.; 3];
+            numeric
+                .evaluate(&[x, 1., 0.], &mut actual, Rational::to_f64)
+                .unwrap();
+            assert_eq!(actual, expected);
+            #[cfg(feature = "native_code_generation")]
+            for direct in [false, true] {
+                let (plan, prelude, body) = staged
+                    .clone()
+                    .map_coeff(&|value| value.re.to_f64())
+                    .into_parts();
+                let settings = JITCompilationSettings::new()
+                    .optimization_level(2)
+                    .direct_translation(direct);
+                let mut prelude = (prelude.get_output_len() != 0)
+                    .then(|| prelude.jit_compile(settings.clone()).unwrap());
+                let mut body = body.jit_compile(settings).unwrap();
+                plan.evaluate_with(
+                    &[x, 1., 0.],
+                    &mut actual,
+                    &mut ParameterRowWorkspace::default(),
+                    Rational::to_f64,
+                    |input, output| {
+                        prelude.as_mut().unwrap().evaluate(input, output);
+                        Ok(())
+                    },
+                    |input, output| {
+                        body.evaluate(input, output);
+                        Ok(())
+                    },
+                )
+                .unwrap();
+                assert_eq!(actual, expected);
+            }
         }
     }
 }

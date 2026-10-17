@@ -80,6 +80,7 @@ impl Splitter {
         self.variants.insert(key.clone(), None);
         let mut source =
             ExpressionEvaluator::from_retained_body(&original, &self.functions, &self.settings);
+        source.undo_stack_optimization();
         self.rewrite(&mut source, &varying)?;
         // New nested kernels use the same registry, while constants in every
         // retained scope continue to arrive through explicit captured inputs.
@@ -168,12 +169,12 @@ impl Splitter {
         Ok(Some(variant))
     }
 
+    // Both the root row program and newly opened retained bodies arrive in SSA.
     fn rewrite(
         &mut self,
         evaluator: &mut ExpressionEvaluator<Number>,
         varying: &[bool],
     ) -> Result<bool, EvaluationError> {
-        evaluator.undo_stack_optimization();
         let columns = varying
             .iter()
             .enumerate()
