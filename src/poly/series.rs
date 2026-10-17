@@ -1579,6 +1579,27 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    fn many_symbolic_terms_preserve_laurent_and_fractional_coefficients() {
+        let x = symbol!("series_sum_x");
+        let coefficients = (0..129)
+            .map(|i| crate::function!(symbol!("series_sum_c"), i))
+            .collect::<Vec<_>>();
+        let sum = Atom::add_many(&coefficients);
+        let kernel = parse!("series_sum_x^-2+sqrt(series_sum_x)-3*series_sum_x^2");
+        let expression = Atom::add_many(coefficients.iter().map(|c| c * &kernel));
+        let result = expression.series(x, 0, SeriesDepth::absolute(2)).unwrap();
+        assert_eq!(result.coefficient((-2).into()), Some(sum.clone()));
+        assert_eq!(result.coefficient((1, 2).into()), Some(sum.clone()));
+        assert_eq!(
+            result.coefficient(2.into()).unwrap().expand(),
+            (-&sum * Atom::num(3)).expand()
+        );
+        assert_eq!(result.coefficient(0.into()), Some(Atom::Zero));
+        assert_eq!(result.absolute_order(), Rational::from(3));
+        assert_eq!(result.coefficient(3.into()), None);
+    }
+
+    #[test]
     fn absolute_truncation_preserves_finite_zero_precision() {
         let x = symbol!("absolute_zero_precision_x");
         for known_order in [Rational::from(6), (3, 2).into()] {
