@@ -1582,24 +1582,28 @@ impl<'a> AtomView<'a> {
                     && den == 1
                     && num_i == 0
                 {
-                    let new_base = if num.unsigned_abs() > 1 {
+                    // A positive power can overflow while the requested
+                    // negative power is a representable subnormal. Invert the
+                    // original base first, before expanding repeated factors.
+                    let base = if num < 0 {
                         let temp = Slot::Temp(instr.len());
-                        instr.push(Instruction::Mul(
-                            temp,
-                            vec![b_eval; num.unsigned_abs() as usize],
-                            0,
-                        ));
+                        instr.push(Instruction::Pow(temp, b_eval, -1, false));
                         temp
                     } else {
                         b_eval
                     };
-
-                    let res = if num > 0 {
-                        new_base
-                    } else {
+                    let res = if num == 0 {
+                        context.constant_slot(Complex::new(Rational::one(), Rational::zero()))
+                    } else if num.unsigned_abs() > 1 {
                         let temp = Slot::Temp(instr.len());
-                        instr.push(Instruction::Pow(temp, new_base, -1, false));
+                        instr.push(Instruction::Mul(
+                            temp,
+                            vec![base; num.unsigned_abs() as usize],
+                            0,
+                        ));
                         temp
+                    } else {
+                        base
                     };
 
                     subexpressions.insert(*self, res);
@@ -2510,10 +2514,13 @@ impl EvalTree<Complex<Rational>> {
                 if p.1 > 1 {
                     instr.push((Instr::Mul(res, vec![b; p.1 as usize]), ComplexPhase::Any));
                 } else if p.1 < -1 {
-                    instr.push((Instr::Mul(res, vec![b; -p.1 as usize]), ComplexPhase::Any));
+                    instr.push((Instr::Pow(res, b, -1), ComplexPhase::Any));
                     stack.push(Complex::default());
                     res += 1;
-                    instr.push((Instr::Pow(res, res - 1, -1), ComplexPhase::Any));
+                    instr.push((
+                        Instr::Mul(res, vec![res - 1; p.1.unsigned_abs() as usize]),
+                        ComplexPhase::Any,
+                    ));
                 } else {
                     instr.push((Instr::Pow(res, b, p.1), ComplexPhase::Any));
                 }
@@ -3857,7 +3864,7 @@ impl<T: Real> EvalTree<T> {
                 } else if *e >= 0 {
                     b_eval.pow(*e as u64)
                 } else {
-                    b_eval.pow(e.unsigned_abs()).inv()
+                    b_eval.inv().pow(e.unsigned_abs())
                 }
             }
             Expression::Powf(_, p) => {
@@ -4566,7 +4573,7 @@ impl<'a> AtomView<'a> {
                         } else if num >= 0 {
                             return Ok(b_eval.pow(num as u64));
                         } else {
-                            return Ok(b_eval.pow(num.unsigned_abs()).inv());
+                            return Ok(b_eval.inv().pow(num.unsigned_abs()));
                         }
                     } else if den == 2 {
                         if num == -1 {
@@ -4574,7 +4581,7 @@ impl<'a> AtomView<'a> {
                         } else if num >= 0 {
                             return Ok(b_eval.sqrt().pow(num as u64));
                         } else {
-                            return Ok(b_eval.sqrt().pow(num.unsigned_abs()).inv());
+                            return Ok(b_eval.sqrt().inv().pow(num.unsigned_abs()));
                         }
                     }
                 }

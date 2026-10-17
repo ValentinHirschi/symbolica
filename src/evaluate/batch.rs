@@ -253,7 +253,7 @@ impl<T: Real> BatchExpressionEvaluator<T> {
                         } else if *exponent >= 0 {
                             value.pow(*exponent as u64)
                         } else {
-                            value.pow(exponent.unsigned_abs()).inv()
+                            value.inv().pow(exponent.unsigned_abs())
                         };
                         std::mem::swap(&mut stack[out * stride + lane], &mut temporary);
                     }

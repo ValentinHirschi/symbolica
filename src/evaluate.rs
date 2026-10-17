@@ -41,6 +41,8 @@ mod instruction;
 mod mapped_tests;
 mod optimize;
 mod parameter_rows;
+#[cfg(test)]
+mod power_tests;
 mod specialize;
 mod tree;
 

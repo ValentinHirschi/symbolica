@@ -654,7 +654,7 @@ fn translate_to_symjit(
                 .unwrap(),
             Instruction::Pow(lhs, arg, p, is_real) => translator
                 .append_pow(&slot(lhs), &slot(arg), p, is_real)
-                .unwrap(),
+                .map_err(|error| error.to_string())?,
             Instruction::Div(lhs, numerator, denominator, numerator_real, denominator_real) => {
                 translator
                     .append_div(
