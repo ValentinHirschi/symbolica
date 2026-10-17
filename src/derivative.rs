@@ -608,13 +608,25 @@ impl AtomView<'_> {
                 Ok(series)
             }
             AtomView::Add(args) => {
-                let mut iter = args.iter();
-                let mut series = iter.next().unwrap().series_impl(x, expansion_point, info)?;
-                for arg in iter {
-                    series = &series + &arg.series_impl(x, expansion_point, info)?;
+                let mut series = args
+                    .iter()
+                    .map(|arg| arg.series_impl(x, expansion_point, info))
+                    .collect::<Result<Vec<_>, _>>()?;
+                // Merge owned partial sums in pairs. A left fold repeatedly copies
+                // the growing symbolic coefficients and becomes quadratic.
+                while series.len() > 1 {
+                    let mut sums = Vec::with_capacity(series.len().div_ceil(2));
+                    let mut iter = series.into_iter();
+                    while let Some(left) = iter.next() {
+                        sums.push(match iter.next() {
+                            Some(right) => left + right,
+                            None => left,
+                        });
+                    }
+                    series = sums;
                 }
 
-                Ok(series)
+                Ok(series.pop().unwrap())
             }
         }
     }
