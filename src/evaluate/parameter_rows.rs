@@ -1018,10 +1018,38 @@ fn partition(
 > {
     let analysis = RowAnalysis::new(evaluator, columns, rows);
     let mut candidates = HashSet::default();
+    // Estimate polynomial work with the existing native operation-count model.
+    // A longest path avoids counting DAG forks twice; it is not a runtime cost
+    // bound (integer powers can use faster multiplication algorithms). Stop at
+    // an existing sharing candidate, whose work is already paid by the prelude.
+    let mut polynomial_work = vec![0usize; analysis.dependencies.len()];
+    // Many native nodes have the same dependency subset and branch activity.
+    // Count their exact bindings once, borrowing immutable analysis metadata.
+    let mut polynomial_bindings = HashMap::default();
     for (instruction, _) in &evaluator.instructions {
         let Some(target) = output(instruction) else {
             continue;
         };
+        let mut operations = OperationCount::default();
+        match instruction {
+            Instr::Add(_, inputs) => operations.additions = inputs.len().saturating_sub(1),
+            Instr::Mul(_, inputs) => operations.multiplications = inputs.len().saturating_sub(1),
+            Instr::Pow(_, _, exponent) if *exponent >= 0 => operations.add_integer_power(*exponent),
+            _ => {}
+        }
+        let own_work = operations
+            .additions
+            .saturating_add(operations.multiplications);
+        if own_work != 0 {
+            polynomial_work[target] = own_work.saturating_add(
+                instruction
+                    .input_indices()
+                    .iter()
+                    .map(|input| polynomial_work[*input])
+                    .max()
+                    .unwrap_or(0),
+            );
+        }
         if !analysis.active[target]
             .iter()
             .zip(&analysis.safe[target])
@@ -1042,6 +1070,7 @@ fn partition(
             && analysis.active[target].contains(&Some(true))
         {
             candidates.insert(target);
+            polynomial_work[target] = 0;
             continue;
         }
         if matches!(instruction, Instr::Join(..)) {
@@ -1055,24 +1084,52 @@ fn partition(
                 | Instr::Div(..)
                 | Instr::Pow(_, _, ..=-1)
         );
-        if !analysis.dependencies[target].is_empty() && !costly {
+        let polynomial = !analysis.dependencies[target].is_empty() && !costly;
+        if polynomial && (rows.len() < 2 || polynomial_work[target] <= 1) {
             continue;
         }
-        let mut bindings = HashSet::default();
-        if rows
-            .iter()
-            .zip(&analysis.active[target])
-            .any(|(row, active)| {
-                *active == Some(true)
-                    && !bindings.insert(
-                        analysis.dependencies[target]
-                            .iter()
-                            .map(|column| row[*column].clone())
-                            .collect::<Vec<_>>(),
-                    )
-            })
-        {
+        // Keep the established rule for expensive native operations. For
+        // polynomials, require enough repeated work to pay for a gather per
+        // active row and materializing each distinct binding. This is only a
+        // scheduling estimate; the original arithmetic and row sum stay intact.
+        let share = if polynomial {
+            let key = (
+                &analysis.dependencies[target],
+                analysis.active[target].as_slice(),
+            );
+            let (active_rows, distinct) = *polynomial_bindings.entry(key).or_insert_with(|| {
+                let mut bindings = HashSet::default();
+                let mut active_rows = 0usize;
+                for (row, active) in rows.iter().zip(key.1) {
+                    if *active == Some(true) {
+                        active_rows += 1;
+                        bindings
+                            .insert(key.0.iter().map(|column| &row[*column]).collect::<Vec<_>>());
+                    }
+                }
+                (active_rows, bindings.len())
+            });
+            let saved = active_rows
+                .saturating_sub(distinct)
+                .saturating_mul(polynomial_work[target]);
+            saved > active_rows.saturating_add(distinct)
+        } else {
+            let mut bindings = HashSet::default();
+            rows.iter()
+                .zip(&analysis.active[target])
+                .any(|(row, active)| {
+                    *active == Some(true)
+                        && !bindings.insert(
+                            analysis.dependencies[target]
+                                .iter()
+                                .map(|column| row[*column].clone())
+                                .collect::<Vec<_>>(),
+                        )
+                })
+        };
+        if share {
             candidates.insert(target);
+            polynomial_work[target] = 0;
         }
     }
     let mut used = HashSet::default();
