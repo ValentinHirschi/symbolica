@@ -17298,6 +17298,21 @@ mod test {
     }
 
     #[test]
+    fn galois_factorization_recombines_extension_conjugates() {
+        let field = Zp::new(5);
+        let variables = Some(Arc::new(
+            ["x", "y"].map(|name| symbol!(name).into()).to_vec(),
+        ));
+        // Every base-field y sample repeats x+y, forcing a field upgrade.
+        // The two extension-field factors are conjugate over GF(5), where 2
+        // is not a square, so their product must remain one irreducible factor.
+        let polynomial = parse!("(x+y)^2-2*(y^5-y)^2")
+            .expand()
+            .to_polynomial::<_, u16>(&field, variables);
+        assert_eq!(polynomial.factor(), vec![(polynomial, 1)]);
+    }
+
+    #[test]
     fn galois_multivariate_sampling_escapes_the_prime_subfield() {
         let field =
             AlgebraicExtension::galois_field(Z2, 4, crate::poly::PolyVariable::Temporary(0));
