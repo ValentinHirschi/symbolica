@@ -5657,6 +5657,18 @@ where
             .collect()
     }
 
+    fn try_downgrade_factors(
+        &self,
+        factors: Vec<MultivariatePolynomial<AlgebraicExtension<F::Base>, E, LexOrder>>,
+    ) -> Option<Vec<Self>> {
+        Some(
+            factors
+                .into_iter()
+                .map(|f| f.map_coeff(|c| self.ring().downgrade_element(c), self.ring().clone()))
+                .collect(),
+        )
+    }
+
     /// Compute the bivariate factorization of a square-free polynomial.
     #[inline(never)]
     fn bivariate_factorization(&self, main_var: usize, interpolation_var: usize) -> Vec<Self> {
@@ -5705,10 +5717,9 @@ where
 
                 let facs = s_l.bivariate_factorization(main_var, interpolation_var);
 
-                return facs
-                    .into_iter()
-                    .map(|f| f.map_coeff(|c| self.ring().downgrade_element(c), self.ring().clone()))
-                    .collect();
+                return self
+                    .try_downgrade_factors(facs)
+                    .expect("Galois factors do not descend to the original field");
             }
 
             // After zero, try a small constant before sampling the whole field.
@@ -6183,10 +6194,9 @@ where
                     max_bivariate_factors,
                 );
 
-                return facs
-                    .into_iter()
-                    .map(|f| f.map_coeff(|c| self.ring().downgrade_element(c), self.ring().clone()))
-                    .collect();
+                return self
+                    .try_downgrade_factors(facs)
+                    .expect("Galois factors do not descend to the original field");
             }
 
             // Constants are cheap, but retries must also reach points outside
@@ -17163,6 +17173,96 @@ mod test {
                 .lcoeff_precomputation(&bivariate_factors, &samples, &order)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn galois_factor_descent_preserves_scalar_units_and_multiplicities() {
+        let base = Zp::new(5);
+        let field = AlgebraicExtension::galois_field(
+            base.clone(),
+            2,
+            crate::poly::PolyVariable::Temporary(0),
+        );
+        let alpha = field.generator();
+        assert!(!alpha.poly().is_constant());
+        let variables = Some(Arc::new(
+            ["x", "y"].map(|name| symbol!(name).into()).to_vec(),
+        ));
+        let left = parse!("x+y+1").to_polynomial::<_, u16>(&base, variables.clone());
+        let right = parse!("x+2*y+3").to_polynomial::<_, u16>(&base, variables);
+
+        for scalar in [base.one(), base.nth(2.into())] {
+            for multiplicity in [1, 2] {
+                let mut expected = vec![left.clone(); multiplicity];
+                expected.push(right.clone());
+                let product = expected
+                    .iter()
+                    .fold(left.one(), |product, factor| product * factor)
+                    .mul_coeff(scalar);
+                let mut upgraded = expected
+                    .iter()
+                    .map(|factor| factor.map_coeff(|c| field.constant(*c), field.clone()))
+                    .collect::<Vec<_>>();
+                upgraded[0] = upgraded[0].clone().mul_coeff(alpha.clone());
+                let last = upgraded.last_mut().unwrap();
+                *last = last
+                    .clone()
+                    .mul_coeff(field.mul(&field.inv(&alpha), &field.constant(scalar)));
+                assert_eq!(
+                    upgraded
+                        .iter()
+                        .filter(|factor| !factor.lcoeff().poly().is_constant())
+                        .count(),
+                    2
+                );
+                assert_eq!(
+                    upgraded
+                        .iter()
+                        .fold(upgraded[0].one(), |product, factor| product * factor),
+                    product.map_coeff(|c| field.constant(*c), field.clone())
+                );
+
+                let actual = product.try_downgrade_factors(upgraded).unwrap();
+                assert_eq!(actual.len(), expected.len());
+                expected[0] = expected[0].clone().mul_coeff(scalar);
+                assert_eq!(actual, expected);
+                assert_eq!(
+                    actual
+                        .iter()
+                        .fold(product.one(), |product, factor| product * factor),
+                    product
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn galois_factor_descent_rejects_non_base_coefficients() {
+        let base = Zp::new(5);
+        let field = AlgebraicExtension::galois_field(
+            base.clone(),
+            2,
+            crate::poly::PolyVariable::Temporary(0),
+        );
+        let alpha = field.generator();
+        let x = parse!("x").to_polynomial::<_, u16>(&field, None);
+        let factors = vec![
+            &x - &x.constant(alpha.clone()),
+            &x - &x.constant(field.pow(&alpha, 5)),
+        ];
+        let upgraded_product = &factors[0] * &factors[1];
+        assert!(
+            upgraded_product
+                .coefficients
+                .iter()
+                .all(|coefficient| coefficient.poly().is_constant())
+        );
+        let product = upgraded_product.map_coeff(|c| c.poly().get_constant(), base);
+        assert_eq!(
+            product.map_coeff(|c| field.constant(*c), field.clone()),
+            upgraded_product
+        );
+        assert!(product.try_downgrade_factors(factors).is_none());
     }
 
     #[test]
