@@ -12569,7 +12569,7 @@ mod test {
         GLOBAL_SETTINGS,
         atom::AtomCore,
         domains::{
-            InternalOrdering, Ring, RingOps,
+            Field, InternalOrdering, Ring, RingOps,
             algebraic::AlgebraicExtension,
             finite_field::{
                 FiniteField, FiniteFieldCore, FiniteFieldElement, PrimeIteratorU64, ToFiniteField,
