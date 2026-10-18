@@ -1308,6 +1308,269 @@ mod tests {
     use crate::{parse, symbol};
 
     #[test]
+    fn polynomial_rows_share_repeated_subsets_without_changing_multiplicity() {
+        let params = [
+            parse!("polynomial_rows::x"),
+            parse!("polynomial_rows::c"),
+            parse!("polynomial_rows::s"),
+        ];
+        let numerator = symbol!("polynomial_rows::n");
+        let formal = symbol!("polynomial_rows::z");
+        let expression = numerator.call(&params[0] + &params[1])
+            * Symbol::IF.call_args([params[2].clone(), Atom::num(3), Atom::num(2)]);
+        for coefficients in [
+            vec![(0, 0), (0, 1), (1, 0), (1, 1)],
+            vec![(0, 0), (0, 1), (1, 0), (1, 1), (1, 1)],
+            vec![(0, 0), (1, 1), (2, 0), (3, 1)],
+            vec![(1, 0)],
+        ] {
+            let repeated = coefficients.len()
+                > coefficients
+                    .iter()
+                    .map(|(c, _)| c)
+                    .collect::<HashSet<_>>()
+                    .len();
+            let rows = coefficients
+                .iter()
+                .map(|&(c, s)| vec![Rational::from(c), Rational::from(s)])
+                .collect::<Vec<_>>();
+            for policy in [InliningPolicy::Always, InliningPolicy::Never] {
+                let staged = expression
+                    .evaluator(&params)
+                    .add_function_with_options(
+                        numerator,
+                        vec![formal],
+                        formal.to_atom().pow(16),
+                        FunctionRegistrationOptions::new().inlining(policy),
+                    )
+                    .unwrap()
+                    .build_parameter_rows(&params[1..], &rows)
+                    .unwrap();
+                if repeated {
+                    assert_eq!(staged.body.count_operations().multiplications, 1);
+                    assert_eq!(staged.body.count_operations().function_calls, 0);
+                } else if policy == InliningPolicy::Always {
+                    assert!(staged.body.count_operations().multiplications > 1);
+                }
+                let mut numerical = staged.map_coeff(&|value| value.re.to_f64());
+                // Integer inputs and results are exactly representable here.
+                // Reuse the workspace across changing physical inputs.
+                for x in [2.0_f64, 0.0, 1.0, 2.0] {
+                    let expected = coefficients
+                        .iter()
+                        .map(|&(c, s)| (x + f64::from(c)).powi(16) * if s == 0 { 2. } else { 3. })
+                        .sum::<f64>();
+                    let mut output = [0.];
+                    numerical
+                        .evaluate(&[x], &mut output, Rational::to_f64)
+                        .unwrap();
+                    assert_eq!(output[0], expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cartesian_polynomial_factors_reuse_their_own_bindings() {
+        let params = [
+            parse!("cartesian_polynomial::x"),
+            parse!("cartesian_polynomial::y"),
+            parse!("cartesian_polynomial::a"),
+            parse!("cartesian_polynomial::b"),
+        ];
+        let numerator = symbol!("cartesian_polynomial::n");
+        let formal = symbol!("cartesian_polynomial::z");
+        let expression =
+            numerator.call(&params[0] + &params[2]) * numerator.call(&params[1] + &params[3]);
+        let rows = vec![
+            vec![0.into(), 0.into()],
+            vec![0.into(), 1.into()],
+            vec![1.into(), 0.into()],
+            vec![1.into(), 1.into()],
+        ];
+        for policy in [InliningPolicy::Always, InliningPolicy::Never] {
+            let staged = expression
+                .evaluator(&params)
+                .add_function_with_options(
+                    numerator,
+                    vec![formal],
+                    formal.to_atom().pow(16),
+                    FunctionRegistrationOptions::new().inlining(policy),
+                )
+                .unwrap()
+                .build_parameter_rows(&params[2..], &rows)
+                .unwrap();
+            assert_eq!(staged.body.count_operations().multiplications, 1);
+            assert_eq!(staged.body.count_operations().function_calls, 0);
+            let mut numerical = staged.map_coeff(&|value| value.re.to_f64());
+            for (x, y) in [(2.0_f64, 1.0_f64), (1., 0.), (0., 2.), (2., 1.)] {
+                let expected = (x.powi(16) + (x + 1.).powi(16)) * (y.powi(16) + (y + 1.).powi(16));
+                let mut output = [0.];
+                numerical
+                    .evaluate(&[x, y], &mut output, Rational::to_f64)
+                    .unwrap();
+                assert_eq!(output[0], expected);
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_polynomial_products_share_add_and_mul_work() {
+        let params = [
+            parse!("polynomial_products::x"),
+            parse!("polynomial_products::c"),
+            parse!("polynomial_products::s"),
+        ];
+        let numerator = symbol!("polynomial_products::n");
+        let formal = symbol!("polynomial_products::z");
+        let z = formal.to_atom();
+        let polynomial = (&z + 1) * (&z + 2) * (&z + 3) * (&z + 4) + &z;
+        let expression = numerator.call(&params[0] + &params[1])
+            * Symbol::IF.call_args([params[2].clone(), Atom::num(3), Atom::num(2)]);
+        let rows = vec![
+            vec![0.into(), 0.into()],
+            vec![0.into(), 1.into()],
+            vec![1.into(), 0.into()],
+            vec![1.into(), 1.into()],
+        ];
+        for policy in [InliningPolicy::Always, InliningPolicy::Never] {
+            let source = expression
+                .evaluator(&params)
+                .add_function_with_options(
+                    numerator,
+                    vec![formal],
+                    polynomial.clone(),
+                    FunctionRegistrationOptions::new().inlining(policy),
+                )
+                .unwrap()
+                .build()
+                .unwrap();
+            if policy == InliningPolicy::Always {
+                assert!(source.instructions.iter().all(|(instruction, _)| {
+                    !matches!(
+                        instruction,
+                        Instr::Pow(..)
+                            | Instr::Powf(..)
+                            | Instr::Div(..)
+                            | Instr::BuiltinFun(..)
+                            | Instr::ExternalFun(..)
+                    )
+                }));
+            }
+            let staged = ParameterRowEvaluator::new(source, vec![1, 2], rows.clone()).unwrap();
+            assert_eq!(staged.body.count_operations().multiplications, 1);
+            let mut numerical = staged.map_coeff(&|value| value.re.to_f64());
+            for x in [2.0_f64, 0., 1., 2.] {
+                let p = |z| (z + 1.) * (z + 2.) * (z + 3.) * (z + 4.) + z;
+                let mut output = [0.];
+                numerical
+                    .evaluate(&[x], &mut output, Rational::to_f64)
+                    .unwrap();
+                assert_eq!(output[0], 5. * (p(x) + p(x + 1.)));
+            }
+        }
+    }
+
+    #[test]
+    fn polynomial_binding_counts_keep_branch_activity_separate() {
+        let params = [
+            parse!("polynomial_activity::x"),
+            parse!("polynomial_activity::c"),
+            parse!("polynomial_activity::s"),
+        ];
+        let base = &params[0] + &params[1];
+        let expression = Symbol::IF.call_args([params[2].clone(), base.pow(16), base.pow(32)]);
+        // Both branches depend on c, but only the second repeats its binding.
+        let rows = vec![
+            vec![0.into(), 0.into()],
+            vec![0.into(), 0.into()],
+            vec![1.into(), 1.into()],
+            vec![2.into(), 1.into()],
+        ];
+        let staged = expression
+            .evaluator(&params)
+            .build_parameter_rows(&params[1..], &rows)
+            .unwrap();
+        assert!(
+            staged
+                .body
+                .instructions
+                .iter()
+                .any(|(instruction, _)| { matches!(instruction, Instr::Pow(_, _, 16)) })
+        );
+        assert!(
+            staged
+                .body
+                .instructions
+                .iter()
+                .all(|(instruction, _)| { !matches!(instruction, Instr::Pow(_, _, 32)) })
+        );
+        let mut numerical = staged.map_coeff(&|value| value.re.to_f64());
+        for x in [0.0_f64, 2., 1., 0.] {
+            let mut output = [0.];
+            numerical
+                .evaluate(&[x], &mut output, Rational::to_f64)
+                .unwrap();
+            assert_eq!(
+                output[0],
+                2. * x.powi(32) + (x + 1.).powi(16) + (x + 2.).powi(16)
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_polynomial_rows_preserve_unknown_physical_guards() {
+        let params = [
+            parse!("guarded_polynomial::x"),
+            parse!("guarded_polynomial::gate"),
+            parse!("guarded_polynomial::c"),
+            parse!("guarded_polynomial::s"),
+        ];
+        let numerator = symbol!("guarded_polynomial::n");
+        let formal = symbol!("guarded_polynomial::z");
+        let expression = Symbol::IF.call_args([
+            params[1].clone(),
+            numerator.call(&params[0] + &params[2]) + params[0].pow(-1),
+            Atom::Zero,
+        ]) * Symbol::IF.call_args([params[3].clone(), Atom::num(3), Atom::num(2)]);
+        let rows = vec![
+            vec![0.into(), 0.into()],
+            vec![0.into(), 1.into()],
+            vec![1.into(), 0.into()],
+            vec![1.into(), 1.into()],
+        ];
+        for policy in [InliningPolicy::Always, InliningPolicy::Never] {
+            let staged = expression
+                .evaluator(&params)
+                .add_function_with_options(
+                    numerator,
+                    vec![formal],
+                    formal.to_atom().pow(16),
+                    FunctionRegistrationOptions::new().inlining(policy),
+                )
+                .unwrap()
+                .build_parameter_rows(&params[2..], &rows)
+                .unwrap();
+            assert_eq!(staged.prelude.count_operations().inversions, 0);
+            assert_eq!(staged.prelude.count_operations().function_calls, 0);
+            assert!(staged.body.count_operations().inversions > 0);
+            let mut numerical = staged.map_coeff(&|value| value.re.to_f64());
+            for (x, gate) in [(2.0_f64, 1.0), (0., 0.), (1., 1.), (0., 0.)] {
+                let expected = if gate == 0. {
+                    0.
+                } else {
+                    5. * (x.powi(16) + (x + 1.).powi(16)) + 10. / x
+                };
+                let mut output = [0.];
+                numerical
+                    .evaluate(&[x, gate], &mut output, Rational::to_f64)
+                    .unwrap();
+                assert_eq!(output[0], expected);
+            }
+        }
+    }
+
+    #[test]
     fn selected_scalar_leaves_share_factors_without_exposing_physical_poles() {
         let params = [
             parse!("selected_scalar::x"),
