@@ -17133,8 +17133,8 @@ mod test {
         let y = parse!("y").to_polynomial::<_, u16>(&field, variables.clone());
         let z = parse!("z").to_polynomial::<_, u16>(&field, variables);
         let factors = [
-            &x * (&y + &z) * (&y + &x.constant(alpha.clone())) + &x.one(),
-            &x + &y + &z,
+            &x * &(&y + &z) * &(&y + &x.constant(alpha.clone())) + x.one(),
+            &x + &y + z,
         ];
         let product = &factors[0] * &factors[1];
         let order = [0, 1, 2];
