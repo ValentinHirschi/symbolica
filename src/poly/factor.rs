@@ -17,7 +17,7 @@ use crate::{
     domains::{
         EuclideanDomain, Field, InternalOrdering, Ring, RingOps, SampleableRing, Set,
         UniformlySampleableRing,
-        algebraic::{AlgebraicExtension, GaloisField},
+        algebraic::{AlgebraicExtension, AlgebraicNumber, GaloisField},
         finite_field::{
             FiniteField, FiniteFieldCore, FiniteFieldElement, FiniteFieldSamplingPolicy,
             FiniteFieldWorkspace, PrimeIteratorU64, ToFiniteField, Zp,
@@ -5701,6 +5701,61 @@ where
         Some(descended)
     }
 
+    /// Recombine complete Frobenius orbits before descending their products.
+    fn try_recombine_galois_factors(
+        &self,
+        factors: Vec<MultivariatePolynomial<AlgebraicExtension<F::Base>, E, LexOrder>>,
+    ) -> Option<Vec<Self>>
+    where
+        AlgebraicExtension<F::Base>: Set<Element = AlgebraicNumber<F::Base>>,
+    {
+        let field = factors.first()?.ring().clone();
+        let q = self.ring().size()?;
+        let mut pending = Vec::with_capacity(factors.len());
+        for factor in factors {
+            if factor.is_zero() || factor.ring() != &field {
+                return None;
+            }
+            let unit = factor.lcoeff();
+            pending.push(Some((factor.make_monic(), unit)));
+        }
+
+        let mut grouped = Vec::new();
+        for index in 0..pending.len() {
+            let Some((first, unit)) = pending[index].take() else {
+                continue;
+            };
+            let mut product = first.clone().mul_coeff(unit);
+            let mut conjugate = first.clone();
+            loop {
+                conjugate = conjugate.map_coeff(
+                    |coefficient| {
+                        let mut modulus = field.poly().clone();
+                        field.element_from_polynomial(
+                            coefficient
+                                .poly()
+                                .exp_mod_univariate(q.clone(), &mut modulus),
+                        )
+                    },
+                    field.clone(),
+                );
+                if conjugate == first {
+                    break;
+                }
+                let matching = pending.iter_mut().find(|factor| {
+                    factor
+                        .as_ref()
+                        .is_some_and(|(factor, _)| factor == &conjugate)
+                })?;
+                let (factor, unit) = matching.take()?;
+                product = product * &factor.mul_coeff(unit);
+            }
+            grouped.push(product);
+        }
+
+        self.try_downgrade_factors(grouped)
+    }
+
     /// Compute the bivariate factorization of a square-free polynomial.
     #[inline(never)]
     fn bivariate_factorization(&self, main_var: usize, interpolation_var: usize) -> Vec<Self> {
@@ -5750,7 +5805,7 @@ where
                 let facs = s_l.bivariate_factorization(main_var, interpolation_var);
 
                 return self
-                    .try_downgrade_factors(facs)
+                    .try_recombine_galois_factors(facs)
                     .expect("Galois factors do not descend to the original field");
             }
 
@@ -6227,7 +6282,7 @@ where
                 );
 
                 return self
-                    .try_downgrade_factors(facs)
+                    .try_recombine_galois_factors(facs)
                     .expect("Galois factors do not descend to the original field");
             }
 
@@ -17295,6 +17350,125 @@ mod test {
             upgraded_product
         );
         assert!(product.try_downgrade_factors(factors).is_none());
+    }
+
+    #[test]
+    fn galois_conjugate_descent_preserves_orbits_units_and_multiplicities() {
+        let base = Zp::new(5);
+        let field = AlgebraicExtension::galois_field(
+            base.clone(),
+            2,
+            crate::poly::PolyVariable::Temporary(0),
+        );
+        let alpha = field.generator();
+        let conjugate = field.pow(&alpha, 5);
+        let x = parse!("x").to_polynomial::<_, u16>(&field, None);
+        let first_orbit = [
+            &x - &x.constant(alpha.clone()),
+            &x - &x.constant(conjugate.clone()),
+        ];
+        let second_orbit = [
+            &x - &x.constant(field.add(&alpha, &field.one())),
+            &x - &x.constant(field.add(&conjugate, &field.one())),
+        ];
+        let expected_orbits = [&first_orbit, &second_orbit]
+            .map(|orbit| &orbit[0] * &orbit[1])
+            .map(|product| {
+                assert!(
+                    product
+                        .coefficients
+                        .iter()
+                        .all(|coefficient| coefficient.poly().is_constant())
+                );
+                product.map_coeff(|c| c.poly().get_constant(), base.clone())
+            });
+
+        for distinct_orbits in [1, 2] {
+            for multiplicity in [1, 2] {
+                for scalar in [base.one(), base.nth(2.into())] {
+                    let mut expected = vec![expected_orbits[0].clone(); multiplicity];
+                    let mut upgraded = vec![first_orbit[0].clone(); multiplicity];
+                    if distinct_orbits == 2 {
+                        expected.push(expected_orbits[1].clone());
+                        upgraded.push(second_orbit[0].clone());
+                    }
+                    upgraded.extend(vec![first_orbit[1].clone(); multiplicity]);
+                    if distinct_orbits == 2 {
+                        upgraded.push(second_orbit[1].clone());
+                    }
+                    expected[0] = expected[0].clone().mul_coeff(scalar);
+                    let product = expected
+                        .iter()
+                        .fold(expected[0].one(), |product, factor| product * factor);
+                    upgraded[0] = upgraded[0].clone().mul_coeff(alpha.clone());
+                    let last = upgraded.last_mut().unwrap();
+                    *last = last
+                        .clone()
+                        .mul_coeff(field.mul(&field.inv(&alpha), &field.constant(scalar)));
+                    assert_eq!(
+                        upgraded
+                            .iter()
+                            .fold(upgraded[0].one(), |product, factor| product * factor),
+                        product.map_coeff(|c| field.constant(*c), field.clone())
+                    );
+
+                    let actual = product.try_recombine_galois_factors(upgraded).unwrap();
+                    assert_eq!(actual, expected);
+                    assert_eq!(
+                        actual
+                            .iter()
+                            .fold(product.one(), |product, factor| product * factor),
+                        product
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn galois_conjugate_descent_rejects_incomplete_or_inconsistent_orbits() {
+        let base = Zp::new(5);
+        let field = AlgebraicExtension::galois_field(
+            base.clone(),
+            2,
+            crate::poly::PolyVariable::Temporary(0),
+        );
+        let alpha = field.generator();
+        let x = parse!("x").to_polynomial::<_, u16>(&field, None);
+        let factors = vec![
+            &x - &x.constant(alpha.clone()),
+            &x - &x.constant(field.pow(&alpha, 5)),
+        ];
+        let upgraded_product = &factors[0] * &factors[1];
+        assert!(
+            upgraded_product
+                .coefficients
+                .iter()
+                .all(|coefficient| coefficient.poly().is_constant())
+        );
+        let product = upgraded_product.map_coeff(|c| c.poly().get_constant(), base.clone());
+        assert!(
+            product
+                .try_recombine_galois_factors(vec![factors[0].clone()])
+                .is_none()
+        );
+        assert!(
+            product
+                .try_recombine_galois_factors(vec![factors[0].clone(); 2])
+                .is_none()
+        );
+        assert!(
+            product
+                .clone()
+                .mul_coeff(base.nth(2.into()))
+                .try_recombine_galois_factors(factors.clone())
+                .is_none()
+        );
+        assert!(
+            (&product + &product.one())
+                .try_recombine_galois_factors(factors)
+                .is_none()
+        );
     }
 
     #[test]
