@@ -5657,16 +5657,47 @@ where
             .collect()
     }
 
+    /// Descend factors whose monic normalizations belong to the original field.
+    /// Preserve every factor occurrence and put their combined scalar on the first.
+    /// Reject coefficients outside the original field and certify the full product.
     fn try_downgrade_factors(
         &self,
         factors: Vec<MultivariatePolynomial<AlgebraicExtension<F::Base>, E, LexOrder>>,
     ) -> Option<Vec<Self>> {
-        Some(
-            factors
-                .into_iter()
-                .map(|f| f.map_coeff(|c| self.ring().downgrade_element(c), self.ring().clone()))
-                .collect(),
-        )
+        let field = factors.first()?.ring().clone();
+        let mut unit = field.one();
+        let mut descended = Vec::with_capacity(factors.len());
+        for factor in factors {
+            if factor.is_zero() || factor.ring() != &field {
+                return None;
+            }
+            unit = field.mul(&unit, &factor.lcoeff());
+            let factor = factor.make_monic();
+            let projected = factor.map_coeff(
+                |coefficient| self.ring().downgrade_element(coefficient),
+                self.ring().clone(),
+            );
+            if projected.map_coeff(
+                |coefficient| self.ring().upgrade_element(coefficient, &field),
+                field.clone(),
+            ) != factor
+            {
+                return None;
+            }
+            descended.push(projected);
+        }
+        let projected_unit = self.ring().downgrade_element(&unit);
+        if self.ring().upgrade_element(&projected_unit, &field) != unit {
+            return None;
+        }
+        descended[0] = descended[0].clone().mul_coeff(projected_unit);
+        let product = descended
+            .iter()
+            .fold(self.one(), |product, factor| product * factor);
+        if &product != self {
+            return None;
+        }
+        Some(descended)
     }
 
     /// Compute the bivariate factorization of a square-free polynomial.
