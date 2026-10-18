@@ -5932,8 +5932,13 @@ where
                     return Err(main_bivariate_factors.len());
                 }
 
-                let bivariate_factors: Vec<_> =
-                    poly_eval.factor().into_iter().map(|(f, _)| f).collect();
+                let bivariate_factors: Vec<_> = poly_eval
+                    .factor()
+                    .into_iter()
+                    .map(|(f, _)| f)
+                    // Scalar units do not count as bivariate polynomial factors.
+                    .filter(|f| !f.is_constant())
+                    .collect();
 
                 if bivariate_factors.len() != main_bivariate_factors.len() {
                     return Err(bivariate_factors.len().min(main_bivariate_factors.len()));
