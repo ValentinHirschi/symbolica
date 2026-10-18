@@ -5663,7 +5663,10 @@ where
     fn try_downgrade_factors(
         &self,
         factors: Vec<MultivariatePolynomial<AlgebraicExtension<F::Base>, E, LexOrder>>,
-    ) -> Option<Vec<Self>> {
+    ) -> Option<Vec<Self>>
+    where
+        AlgebraicExtension<F::Base>: Field,
+    {
         let field = factors.first()?.ring().clone();
         let mut unit = field.one();
         let mut descended = Vec::with_capacity(factors.len());
