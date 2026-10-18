@@ -7439,6 +7439,8 @@ mod test {
 
     #[test]
     fn optional_wildcards_preserve_required_minimum_in_either_order() {
+        use super::Pattern;
+
         let required = symbol!("x_");
         let optional = symbol!("o_");
         let target = parse!("x");
