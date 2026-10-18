@@ -1625,6 +1625,142 @@ mod tests {
     }
 
     #[test]
+    fn polynomial_subset_reuse_preserves_third_order_mixed_jets_at_1000_bits_and_jit() {
+        let params = [
+            parse!("polynomial_jets::x"),
+            parse!("polynomial_jets::y"),
+            parse!("polynomial_jets::a"),
+            parse!("polynomial_jets::b"),
+        ];
+        let numerator = symbol!("polynomial_jets::n");
+        let formal = symbol!("polynomial_jets::z");
+        let expression =
+            numerator.call(&params[0] + &params[2]) * numerator.call(&params[1] + &params[3]);
+        let rows = vec![
+            vec![0.into(), 0.into()],
+            vec![0.into(), 1.into()],
+            vec![1.into(), 0.into()],
+            vec![1.into(), 1.into()],
+        ];
+        let shape = vec![
+            vec![0, 0],
+            vec![1, 0],
+            vec![0, 1],
+            vec![2, 0],
+            vec![1, 1],
+            vec![0, 2],
+            vec![3, 0],
+            vec![2, 1],
+            vec![1, 2],
+            vec![0, 3],
+        ];
+        let points = [(0_i64, 1_i64), (1, 0), (1, 1), (0, 1)];
+        let input = |x, y| {
+            let mut values = vec![0_i64; 2 * shape.len()];
+            values[0] = x;
+            values[1] = 1;
+            values[shape.len()] = y;
+            values[shape.len() + 2] = 1;
+            values
+        };
+        // Independent binomial Taylor coefficients of
+        // (x^16+(x+1)^16)*(y^16+(y+1)^16). All values fit exactly in binary64;
+        // the 1000-bit comparison converts the integer oracle directly.
+        let expected = |x: i64, y: i64| {
+            let coefficient = |value: i64, degree: usize| {
+                [1_i64, 16, 120, 560][degree]
+                    * (value.pow(16 - degree as u32) + (value + 1).pow(16 - degree as u32))
+            };
+            shape
+                .iter()
+                .map(|powers| coefficient(x, powers[0]) * coefficient(y, powers[1]))
+                .collect::<Vec<_>>()
+        };
+        for policy in [InliningPolicy::Always, InliningPolicy::Never] {
+            let staged = expression
+                .evaluator(&params)
+                .add_function_with_options(
+                    numerator,
+                    vec![formal],
+                    formal.to_atom().pow(16),
+                    FunctionRegistrationOptions::new().inlining(policy),
+                )
+                .unwrap()
+                .build_parameter_rows(&params[2..], &rows)
+                .unwrap();
+            // The inlined case must hit polynomial sharing, rather than only
+            // testing AD on a program that retained its repeated numerator.
+            assert_eq!(staged.body.count_operations().multiplications, 1);
+            let vectorizer = Dualizer::new(
+                crate::domains::dual::HyperDual::<Complex<Rational>>::new(shape.clone()),
+                Vec::new(),
+            );
+            let staged = staged.vectorize(&vectorizer).unwrap();
+            assert_eq!(staged.plan().get_input_len(), 2 * shape.len());
+            let prototype = Float::new(1000);
+            let mut arbitrary = staged
+                .clone()
+                .map_coeff_with_prec(&|value| prototype.from_rational(&value.re), 1000);
+            for (x, y) in points {
+                let point = input(x, y)
+                    .into_iter()
+                    .map(|value| prototype.from_rational(&Rational::from(value)))
+                    .collect::<Vec<_>>();
+                let mut output = vec![prototype.zero(); shape.len()];
+                arbitrary
+                    .evaluate(&point, &mut output, |value| prototype.from_rational(value))
+                    .unwrap();
+                for (actual, reference) in output.iter().zip(expected(x, y)) {
+                    assert_eq!(*actual, prototype.from_rational(&Rational::from(reference)));
+                    assert_eq!(actual.prec(), 1000);
+                }
+            }
+            #[cfg(feature = "native_code_generation")]
+            for direct in [false, true] {
+                let (plan, prelude, body) = staged
+                    .clone()
+                    .map_coeff(&|value| value.re.to_f64())
+                    .into_parts();
+                let settings = JITCompilationSettings::new()
+                    .optimization_level(2)
+                    .direct_translation(direct);
+                let mut prelude = prelude.jit_compile(settings.clone()).unwrap();
+                let mut body = body.jit_compile(settings).unwrap();
+                let mut workspace = ParameterRowWorkspace::default();
+                for (x, y) in points {
+                    let point = input(x, y)
+                        .into_iter()
+                        .map(|value| value as f64)
+                        .collect::<Vec<_>>();
+                    let mut output = vec![0.; shape.len()];
+                    plan.evaluate_with(
+                        &point,
+                        &mut output,
+                        &mut workspace,
+                        Rational::to_f64,
+                        |input, output| {
+                            prelude.evaluate(input, output);
+                            Ok(())
+                        },
+                        |input, output| {
+                            body.evaluate(input, output);
+                            Ok(())
+                        },
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        output,
+                        expected(x, y)
+                            .into_iter()
+                            .map(|value| value as f64)
+                            .collect::<Vec<_>>()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn selected_scalar_leaves_share_factors_without_exposing_physical_poles() {
         let params = [
             parse!("selected_scalar::x"),
