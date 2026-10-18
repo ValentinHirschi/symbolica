@@ -5969,11 +5969,13 @@ impl<'a, 'b> SubSliceIterator<'a, 'b> {
 
                             range.0 = range.0.max(new_min);
                             range.1 = range.1.min(new_max);
+                        }
 
-                            if range.0 > range.1 {
-                                forward_pass = false;
-                                continue 'next_match;
-                            }
+                        // Partial matches may leave target entries unused, but
+                        // must still satisfy each wildcard's minimum length.
+                        if range.0 > range.1 {
+                            forward_pass = false;
+                            continue 'next_match;
                         }
 
                         let greedy = !match_stack.settings.non_greedy_wildcards.contains(name);
