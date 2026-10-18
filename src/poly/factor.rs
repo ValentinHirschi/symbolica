@@ -5663,18 +5663,15 @@ where
     fn try_downgrade_factors(
         &self,
         factors: Vec<MultivariatePolynomial<AlgebraicExtension<F::Base>, E, LexOrder>>,
-    ) -> Option<Vec<Self>>
-    where
-        AlgebraicExtension<F::Base>: Field,
-    {
+    ) -> Option<Vec<Self>> {
         let field = factors.first()?.ring().clone();
-        let mut unit = field.one();
+        let mut unit = factors[0].one();
         let mut descended = Vec::with_capacity(factors.len());
         for factor in factors {
             if factor.is_zero() || factor.ring() != &field {
                 return None;
             }
-            unit = field.mul(&unit, &factor.lcoeff());
+            unit = unit.mul_coeff(factor.lcoeff());
             let factor = factor.make_monic();
             let projected = factor.map_coeff(
                 |coefficient| self.ring().downgrade_element(coefficient),
@@ -5689,6 +5686,7 @@ where
             }
             descended.push(projected);
         }
+        let unit = unit.get_constant();
         let projected_unit = self.ring().downgrade_element(&unit);
         if self.ring().upgrade_element(&projected_unit, &field) != unit {
             return None;
