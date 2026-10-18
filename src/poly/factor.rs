@@ -17,7 +17,7 @@ use crate::{
     domains::{
         EuclideanDomain, Field, InternalOrdering, Ring, RingOps, SampleableRing, Set,
         UniformlySampleableRing,
-        algebraic::{AlgebraicExtension, AlgebraicNumber, GaloisField},
+        algebraic::{AlgebraicExtension, GaloisField},
         finite_field::{
             FiniteField, FiniteFieldCore, FiniteFieldElement, FiniteFieldSamplingPolicy,
             FiniteFieldWorkspace, PrimeIteratorU64, ToFiniteField, Zp,
@@ -5705,10 +5705,7 @@ where
     fn try_recombine_galois_factors(
         &self,
         factors: Vec<MultivariatePolynomial<AlgebraicExtension<F::Base>, E, LexOrder>>,
-    ) -> Option<Vec<Self>>
-    where
-        AlgebraicExtension<F::Base>: Set<Element = AlgebraicNumber<F::Base>>,
-    {
+    ) -> Option<Vec<Self>> {
         let field = factors.first()?.ring().clone();
         let q = self.ring().size()?;
         let mut pending = Vec::with_capacity(factors.len());
@@ -5730,12 +5727,20 @@ where
             loop {
                 conjugate = conjugate.map_coeff(
                     |coefficient| {
-                        let mut modulus = field.poly().clone();
-                        field.element_from_polynomial(
-                            coefficient
-                                .poly()
-                                .exp_mod_univariate(q.clone(), &mut modulus),
-                        )
+                        // Binary powering also supports field sizes larger than u64.
+                        let mut exponent = q.clone();
+                        let mut value = conjugate.constant(coefficient.clone());
+                        let mut result = value.one();
+                        while !exponent.is_zero() {
+                            if (&exponent % &Integer::from(2)).is_one() {
+                                result = result * &value;
+                            }
+                            exponent /= 2;
+                            if !exponent.is_zero() {
+                                value = &value * &value;
+                            }
+                        }
+                        result.get_constant()
                     },
                     field.clone(),
                 );
