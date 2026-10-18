@@ -5906,7 +5906,9 @@ where
                     poly_eval = poly_eval.replace(*v, p);
                 }
             }
-            let sqf = poly_eval.square_free_factorization();
+            let mut sqf = poly_eval.square_free_factorization();
+            // Scalar units do not affect whether the nonconstant image is square-free.
+            sqf.retain(|(factor, _)| !factor.is_constant());
             if sqf.len() != 1 || sqf[0].1 != 1 {
                 debug!("Polynomial is not square free: {}", poly_eval);
                 return Err(main_bivariate_factors.len());
