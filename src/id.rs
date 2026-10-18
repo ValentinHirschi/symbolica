@@ -7438,6 +7438,38 @@ mod test {
     }
 
     #[test]
+    fn optional_wildcards_preserve_required_minimum_in_either_order() {
+        let required = symbol!("x_");
+        let optional = symbol!("o_");
+        let target = parse!("x");
+        let rhs = parse!("f(x_,o_)").to_pattern();
+
+        for sum in [true, false] {
+            for optional_first in [false, true] {
+                for partial in [false, true] {
+                    let mut arguments = vec![
+                        Pattern::Wildcard(required, false),
+                        Pattern::Wildcard(optional, true),
+                    ];
+                    if optional_first {
+                        arguments.reverse();
+                    }
+                    let (pattern, expected) = if sum {
+                        (Pattern::Add(arguments), parse!("f(x,0)"))
+                    } else {
+                        (Pattern::Mul(arguments), parse!("f(x,1)"))
+                    };
+                    assert_eq!(
+                        target.replace(&pattern).partial(partial).with(&rhs),
+                        expected,
+                        "sum={sum}, optional_first={optional_first}, partial={partial}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn optional() {
         let pat = parse!("(a_+b_*x)^p_")
             .to_pattern()
