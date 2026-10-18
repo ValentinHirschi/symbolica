@@ -17016,6 +17016,149 @@ mod test {
     }
 
     #[test]
+    fn galois_lcoeff_precomputation_accepts_scalar_units() {
+        // The GF(32) sample is the actual failed leading-coefficient boundary
+        // from a factorization retry chain; GF(8) is a smaller independent case.
+        for degree in [5, 3] {
+            let field = AlgebraicExtension::galois_field(
+                Z2,
+                degree,
+                crate::poly::PolyVariable::Temporary(0),
+            );
+            let alpha = field.generator();
+            let (sample_y, sample_z) = if degree == 5 {
+                assert_eq!(field.poly().exponents, [0, 2, 5]);
+                (
+                    field.add(
+                        &field.one(),
+                        &field.add(&field.pow(&alpha, 2), &field.pow(&alpha, 4)),
+                    ),
+                    field.add(&alpha, &field.pow(&alpha, 3)),
+                )
+            } else {
+                (alpha.clone(), alpha)
+            };
+            let mut factors = [
+                parse!("x*(y^2+y)*(z^2+z)+1").to_polynomial::<_, u16>(&field, None),
+                parse!("x+y+z").to_polynomial::<_, u16>(&field, None),
+            ];
+            MultivariatePolynomial::unify_variables_list(&mut factors);
+            let product = &factors[0] * &factors[1];
+            let order = ["x", "y", "z"].map(|name| {
+                product
+                    .variables()
+                    .iter()
+                    .position(|v| v == &symbol!(name))
+                    .unwrap()
+            });
+            let samples = vec![(order[1], sample_y.clone()), (order[2], sample_z.clone())];
+            let bivariate_factors = factors
+                .iter()
+                .map(|factor| factor.replace(order[2], &sample_z))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                &bivariate_factors[0] * &bivariate_factors[1],
+                product.replace(order[2], &sample_z)
+            );
+            let univariate = product
+                .replace(order[1], &sample_y)
+                .replace(order[2], &sample_z);
+            assert_eq!(univariate.degree(order[0]), product.degree(order[0]));
+            assert!(
+                univariate
+                    .gcd(&univariate.derivative(order[0]))
+                    .is_constant()
+            );
+
+            // A scalar unit different from one changes the factor list,
+            // but not square-freeness of y^2+y.
+            let unit = field.add(&field.pow(&sample_z, 2), &sample_z);
+            assert!(!field.is_zero(&unit) && !field.is_one(&unit));
+            let image = product
+                .univariate_lcoeff(order[0])
+                .replace(order[2], &sample_z);
+            let square_free = image.square_free_factorization();
+            assert_eq!(square_free.len(), 2);
+            assert_eq!(
+                square_free
+                    .iter()
+                    .filter(|(factor, _)| factor.is_constant())
+                    .count(),
+                1
+            );
+            assert!(square_free.iter().all(|(_, power)| *power == 1));
+
+            let prepared = product.lcoeff_precomputation(&bivariate_factors, &samples, &order);
+            assert!(
+                prepared.is_ok(),
+                "GF(2^{degree}) rejected an exact square-free sample: {:?}",
+                prepared.as_ref().err()
+            );
+            let (sorted, leading) = prepared.unwrap();
+            assert_eq!(
+                leading
+                    .iter()
+                    .fold(product.one(), |value, factor| &value * factor),
+                product.univariate_lcoeff(order[0])
+            );
+            let sorted =
+                product.impose_true_lcoeffs_on_factors(&sorted, &leading, &samples, &order, 2);
+            let (mut univariate, delta) =
+                MultivariatePolynomial::univariate_diophantine_field(&sorted, &order, &samples);
+            let reconstructed = product
+                .multivariate_hensel_lifting(
+                    &sorted,
+                    &mut univariate,
+                    &delta,
+                    &samples,
+                    Some(&leading),
+                    &order,
+                    super::MultivariateHenselContext::new(2),
+                )
+                .unwrap();
+            assert_eq!(reconstructed.len(), 2);
+            assert_eq!(&reconstructed[0] * &reconstructed[1], product);
+        }
+    }
+
+    #[test]
+    fn galois_lcoeff_precomputation_rejects_repeated_images() {
+        let field =
+            AlgebraicExtension::galois_field(Z2, 3, crate::poly::PolyVariable::Temporary(0));
+        let alpha = field.generator();
+        let variables = Some(Arc::new(
+            ["x", "y", "z"].map(|name| symbol!(name).into()).to_vec(),
+        ));
+        let x = parse!("x").to_polynomial::<_, u16>(&field, variables.clone());
+        let y = parse!("y").to_polynomial::<_, u16>(&field, variables.clone());
+        let z = parse!("z").to_polynomial::<_, u16>(&field, variables);
+        let factors = [
+            &x * (&y + &z) * (&y + &x.constant(alpha.clone())) + &x.one(),
+            &x + &y + &z,
+        ];
+        let product = &factors[0] * &factors[1];
+        let order = [0, 1, 2];
+        let samples = vec![(1, field.zero()), (2, alpha.clone())];
+        let bivariate_factors = factors
+            .iter()
+            .map(|factor| factor.replace(2, &alpha))
+            .collect::<Vec<_>>();
+        // Distinct factors y+z and y+alpha coincide after specializing z.
+        let image = product.univariate_lcoeff(0).replace(2, &alpha);
+        assert!(
+            image
+                .square_free_factorization()
+                .iter()
+                .any(|(factor, power)| !factor.is_constant() && *power > 1)
+        );
+        assert!(
+            product
+                .lcoeff_precomputation(&bivariate_factors, &samples, &order)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn galois_multivariate_sampling_escapes_the_prime_subfield() {
         let field =
             AlgebraicExtension::galois_field(Z2, 4, crate::poly::PolyVariable::Temporary(0));
