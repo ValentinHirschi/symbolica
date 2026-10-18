@@ -1020,8 +1020,9 @@ fn partition(
     let mut candidates = HashSet::default();
     // Estimate polynomial work with the existing native operation-count model.
     // A longest path avoids counting DAG forks twice; it is not a runtime cost
-    // bound (integer powers can use faster multiplication algorithms). Stop at
-    // an existing sharing candidate, whose work is already paid by the prelude.
+    // bound (integer powers can use faster multiplication algorithms). Existing
+    // shared scalars stop a path. Polynomial candidates keep their full work
+    // until the port frontier selects the outermost useful result.
     let mut polynomial_work = vec![0usize; analysis.dependencies.len()];
     // Many native nodes have the same dependency subset and branch activity.
     // Count their exact bindings once, borrowing immutable analysis metadata.
@@ -1129,7 +1130,9 @@ fn partition(
         };
         if share {
             candidates.insert(target);
-            polynomial_work[target] = 0;
+            if !polynomial {
+                polynomial_work[target] = 0;
+            }
         }
     }
     let mut used = HashSet::default();
@@ -1548,20 +1551,14 @@ mod tests {
             .evaluator(&params)
             .build_parameter_rows(&params[1..], &rows)
             .unwrap();
-        assert!(
-            staged
-                .body
-                .instructions
-                .iter()
-                .any(|(instruction, _)| { matches!(instruction, Instr::Pow(_, _, 16)) })
+        // Integer powers may lower to square chains. Compare actual native
+        // work with the unique branch, rather than requiring a Pow opcode.
+        let unique = base.pow(16).evaluator(&params[..2]).build().unwrap();
+        assert_eq!(
+            staged.body.count_operations().multiplications,
+            unique.count_operations().multiplications
         );
-        assert!(
-            staged
-                .body
-                .instructions
-                .iter()
-                .all(|(instruction, _)| { !matches!(instruction, Instr::Pow(_, _, 32)) })
-        );
+        assert!(staged.prelude.count_operations().multiplications > 0);
         let mut numerical = staged.map_coeff(&|value| value.re.to_f64());
         for x in [0.0_f64, 2., 1., 0.] {
             let mut output = [0.];
