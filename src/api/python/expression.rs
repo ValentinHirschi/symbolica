@@ -4446,14 +4446,14 @@ impl PythonExpression {
     /// Prefer native MathML, with live zoom and pagination.
     #[pyo3(signature = (include=None, exclude=None))]
     pub fn _repr_mimebundle_(
-        &self,
+        slf: Py<Self>,
         py: Python<'_>,
         include: Option<Vec<String>>,
         exclude: Option<Vec<String>>,
     ) -> PyResult<Py<PyAny>> {
         display::formatted(
             py,
-            &self.expr,
+            slf,
             display::default_options(),
             crate::printer::mathml::DEFAULT_PAGE_SIZE,
         )?
@@ -4461,10 +4461,10 @@ impl PythonExpression {
     }
 
     /// Return native MathML or a live pager in marimo notebooks.
-    pub fn _display_(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+    pub fn _display_(slf: Py<Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
         display::formatted(
             py,
-            &self.expr,
+            slf,
             display::default_options(),
             crate::printer::mathml::DEFAULT_PAGE_SIZE,
         )?
@@ -4733,7 +4733,7 @@ impl PythonExpression {
         custom_print_mode=None, *, mathml=True, page_size=25)"
     )]
     pub fn formatted(
-        &self,
+        slf: Py<Self>,
         py: Python<'_>,
         max_terms: Option<usize>,
         mode: PythonPrintMode,
@@ -4765,7 +4765,7 @@ impl PythonExpression {
         {
             return display::formatted(
                 py,
-                &self.expr,
+                slf,
                 PrintOptions {
                     max_line_length,
                     indentation,
@@ -4800,7 +4800,8 @@ impl PythonExpression {
             );
         }
 
-        let text = self.format_with_color_mode(
+        let expression = slf.get();
+        let text = expression.format_with_color_mode(
             mode,
             max_line_length,
             indentation,
@@ -4826,7 +4827,7 @@ impl PythonExpression {
             ColorMode::Never,
         );
 
-        let formatted = self.format_with_color_mode(
+        let formatted = expression.format_with_color_mode(
             mode,
             max_line_length,
             indentation,
@@ -4851,7 +4852,7 @@ impl PythonExpression {
             custom_print_mode.clone(),
             ColorMode::Always,
         );
-        let latex = self.format_latex_with_options(
+        let latex = expression.format_latex_with_options(
             max_line_length,
             max_terms,
             precision,

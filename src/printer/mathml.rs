@@ -69,7 +69,7 @@ impl MathMlPage {
 struct Renderer<'a> {
     opts: &'a PrintOptions,
     state: PrintState,
-    cursors: Option<&'a MathMlCursorCache>,
+    cursors: Option<&'a MathMlCursorCache<'a>>,
     nodes: usize,
     bytes: usize,
     budget_exhausted: bool,
@@ -1018,7 +1018,7 @@ impl<'a> AtomView<'a> {
         limit: usize,
         layout: usize,
         expansions: &[(Vec<usize>, usize)],
-        cursors: &MathMlCursorCache,
+        cursors: &MathMlCursorCache<'_>,
     ) -> MathMlPage {
         self.render_mathml_layout_with_state(
             options,
@@ -1039,7 +1039,7 @@ impl<'a> AtomView<'a> {
         layout: usize,
         expansions: &[(Vec<usize>, usize)],
         state: PrintState,
-        cursors: Option<&MathMlCursorCache>,
+        cursors: Option<&MathMlCursorCache<'_>>,
     ) -> MathMlPage {
         let atom = self;
         let (nested_limit, depth_limit) = LAYOUTS[layout];

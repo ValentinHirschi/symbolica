@@ -1,4 +1,4 @@
-//! Bounded bookmarks into storage owned by this cache. Locations are captured
+//! Bounded bookmarks into borrowed immutable storage. Locations are captured
 //! only from valid views/iterators, never from frontend-provided byte offsets.
 use super::*;
 use crate::atom::ListIterator;
@@ -21,13 +21,13 @@ struct Bookmarks {
     cursors: VecDeque<Cursor>,
 }
 
-pub(crate) struct MathMlCursorCache {
-    expression: Atom,
+pub(crate) struct MathMlCursorCache<'a> {
+    expression: AtomView<'a>,
     bookmarks: Mutex<Bookmarks>,
 }
 
-impl MathMlCursorCache {
-    pub(crate) fn new(expression: Atom) -> Self {
+impl<'a> MathMlCursorCache<'a> {
+    pub(crate) fn new(expression: AtomView<'a>) -> Self {
         Self {
             expression,
             bookmarks: Mutex::default(),
@@ -35,7 +35,7 @@ impl MathMlCursorCache {
     }
 
     fn data(&self) -> &[u8] {
-        self.expression.as_view().get_data()
+        self.expression.get_data()
     }
 
     fn range(&self, data: &[u8]) -> Option<Range<usize>> {
@@ -64,7 +64,7 @@ impl MathMlCursorCache {
         };
         let (mut view, prefix_len) = match prefix {
             Some((len, range)) => (AtomView::from(&self.data()[range]), len),
-            None => (self.expression.as_view(), 0),
+            None => (self.expression, 0),
         };
         for (depth, index) in path.iter().enumerate().skip(prefix_len) {
             if view.mathml_child_count() == 0 {
@@ -85,12 +85,12 @@ impl MathMlCursorCache {
         Some(view)
     }
 
-    fn resume<'a>(
+    fn resume<'b>(
         &self,
-        node: AtomView<'a>,
-        iter: ListIterator<'a>,
+        node: AtomView<'b>,
+        iter: ListIterator<'b>,
         start: usize,
-    ) -> (ListIterator<'a>, usize) {
+    ) -> (ListIterator<'b>, usize) {
         let Some(node_range) = self.range(node.get_data()) else {
             return (iter, 0);
         };
@@ -115,9 +115,9 @@ impl MathMlCursorCache {
         let tail = &node.get_data()
             [cursor.tail.start - node_range.start..cursor.tail.end - node_range.start];
         // SAFETY: `remember` captured this exact iterator suffix and remaining
-        // count for this node. The cache owns its immutable backing Atom, so
-        // neither the bytes nor their address can change or be reused. Foreign
-        // views are rejected by `range`; no cache lock spans renderer callbacks.
+        // count for this node. The cache borrows its immutable backing Atom, so
+        // its owner cannot mutate or release the bytes while they are borrowed.
+        // Foreign views are rejected by `range`; no cache lock spans callbacks.
         (
             unsafe { iter.resume_at(tail, cursor.remaining) },
             cursor.index,
@@ -159,14 +159,14 @@ pub(super) struct MathMlChildren<'a> {
     node: AtomView<'a>,
     iter: ListIterator<'a>,
     index: usize,
-    cache: Option<&'a MathMlCursorCache>,
+    cache: Option<&'a MathMlCursorCache<'a>>,
 }
 
 impl<'a> MathMlChildren<'a> {
     pub(super) fn new(
         node: AtomView<'a>,
         start: usize,
-        cache: Option<&'a MathMlCursorCache>,
+        cache: Option<&'a MathMlCursorCache<'a>>,
     ) -> Self {
         let iter = node.mathml_children();
         let (mut iter, mut index) = match cache {

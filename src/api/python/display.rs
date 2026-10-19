@@ -1,6 +1,6 @@
 //! Lazy notebook paging shared by Expression and FormattedOutput.
 use super::*;
-use crate::printer::mathml::{self, MathMlPage};
+use crate::printer::mathml::{self, MathMlCursorCache, MathMlPage};
 
 mod provider;
 pub use provider::{MathMLMarker, MathMLPage};
@@ -49,9 +49,19 @@ pub(super) fn with_math(format: impl FnOnce(&dyn Fn(&Atom) -> String) -> String)
     html
 }
 
+// The Python expression is frozen. Retain its original owner and borrow the
+// storage for the cache's lifetime, without cloning the Atom or its byte buffer.
+self_cell!(
+    struct CachedExpression {
+        owner: Py<PythonExpression>,
+        #[covariant]
+        dependent: MathMlCursorCache,
+    }
+);
+
 #[pyclass]
 struct PageSource {
-    cursors: mathml::MathMlCursorCache,
+    cursors: CachedExpression,
     options: PrintOptions,
 }
 
@@ -75,8 +85,8 @@ impl PageSource {
         if layout >= mathml::LAYOUTS.len() {
             return Err(exceptions::PyValueError::new_err("Unknown layout"));
         }
-        let atom = self
-            .cursors
+        let cursors = self.cursors.borrow_dependent();
+        let atom = cursors
             .locate(&path)
             .ok_or_else(|| exceptions::PyValueError::new_err("Unknown subexpression"))?;
         let expansions = expansions.unwrap_or_default();
@@ -94,7 +104,7 @@ impl PageSource {
             size,
             layout,
             &expansions,
-            &self.cursors,
+            cursors,
         );
         let result = PyDict::new(py);
         result.set_item("html", &page.html)?;
@@ -135,7 +145,7 @@ impl PageSource {
 
 pub(super) fn viewer(
     py: Python<'_>,
-    expression: &Atom,
+    expression: Py<PythonExpression>,
     options: PrintOptions,
     size: usize,
 ) -> PyResult<Py<PyAny>> {
@@ -149,7 +159,9 @@ pub(super) fn viewer(
         Py::new(
             py,
             PageSource {
-                cursors: mathml::MathMlCursorCache::new(expression.clone()),
+                cursors: CachedExpression::new(expression, |owner| {
+                    MathMlCursorCache::new(owner.get().expr.as_view())
+                }),
                 options,
             },
         )?
@@ -175,8 +187,8 @@ pub(super) fn preview(page: &MathMlPage) -> String {
 }
 
 pub(super) fn formatted(
-    _py: Python<'_>,
-    expression: &Atom,
+    py: Python<'_>,
+    expression: Py<PythonExpression>,
     options: PrintOptions,
     size: usize,
 ) -> PyResult<PythonFormattedOutput> {
@@ -185,13 +197,13 @@ pub(super) fn formatted(
             "page_size must be between 1 and 500",
         ));
     }
-    let expression = expression.clone();
-    let notebook_expression = expression.clone();
+    let notebook_expression = expression.clone_ref(py);
     let notebook_options = options.clone();
     Ok(PythonFormattedOutput::lazy(move |_, backend| {
         if backend == FormattedOutputBackend::Latex {
             return Ok(None);
         }
+        let expression = &expression.get().expr;
         let page = expression.as_view().render_mathml_page(&options, 0, size);
         Ok(Some(match backend {
             FormattedOutputBackend::Html => preview(&page),
@@ -212,7 +224,9 @@ pub(super) fn formatted(
     })
     // Static output never constructs the live provider. Small expressions also
     // use the shared viewer when displayed in a notebook, for keyboard zoom.
-    .with_notebook(move |py| viewer(py, &notebook_expression, notebook_options.clone(), size)))
+    .with_notebook(move |py| {
+        viewer(py, notebook_expression.clone_ref(py), notebook_options.clone(), size)
+    }))
 }
 
 fn paging_module(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
