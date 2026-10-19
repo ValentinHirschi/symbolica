@@ -36,24 +36,12 @@ fn formatted_atom_with_color(atom: &Atom, color: ColorMode) -> String {
     )
 }
 
-pub(super) fn formatted_atom(atom: &Atom) -> String {
-    formatted_atom_with_color(atom, ColorMode::Always)
-}
-
 fn pretty_atom(atom: &Atom) -> String {
     formatted_atom_with_color(atom, ColorMode::Never)
 }
 
 fn condition_text(condition: &SolutionCondition, atom: &impl Fn(&Atom) -> String) -> String {
     condition.format_with(atom)
-}
-
-pub(super) fn inline_html(formatted: &str) -> String {
-    let html = crate::printer::AnsiHtmlFormatter::new(formatted).to_string();
-    html.strip_prefix("<div style=\"white-space: pre-wrap; margin: 0;\">")
-        .and_then(|s| s.strip_suffix("</div>"))
-        .unwrap_or(&html)
-        .to_owned()
 }
 
 fn guard_text(guard: &[Atom], atom: &impl Fn(&Atom) -> String) -> String {
@@ -64,7 +52,7 @@ fn guard_text(guard: &[Atom], atom: &impl Fn(&Atom) -> String) -> String {
         .join(" & ")
 }
 fn guard_html(guard: &[Atom]) -> String {
-    inline_html(&guard_text(guard, &formatted_atom))
+    display::with_math(|atom| guard_text(guard, &|a| atom(a)))
 }
 fn guard_condition(guard: &[Atom]) -> crate::id::Condition<crate::id::Relation> {
     guard
@@ -92,7 +80,7 @@ fn relation_condition(
 }
 
 fn condition_html(condition: &SolutionCondition) -> String {
-    inline_html(&condition_text(condition, &formatted_atom))
+    display::with_math(|atom| condition_text(condition, &|a| atom(a)))
 }
 
 /// Keep equations aligned without relying on notebook table styles.
