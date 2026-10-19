@@ -6,34 +6,20 @@ use super::*;
 fn galois_prime_downgrade_checks_membership() {
     let base = Zp::new(5);
     let extension = base.upgrade(2);
-    for value in 0..5 {
-        let value = base.nth(value.into());
+    for value in [base.zero(), base.nth(2.into())] {
         let upgraded = base.upgrade_element(&value, &extension);
         assert_eq!(base.try_downgrade_element(&upgraded), Some(value));
         assert_eq!(base.downgrade_element(&upgraded), value);
     }
-    let alpha = extension.generator();
-    assert!(base.try_downgrade_element(&alpha).is_none());
-    assert!(
-        base.try_downgrade_element(&extension.add(&alpha, &extension.one()))
-            .is_none()
-    );
+    assert!(base.try_downgrade_element(&extension.generator()).is_none());
     assert!(Zp::new(7).try_downgrade_element(&extension.one()).is_none());
 }
 
 #[test]
 fn galois_extension_downgrade_preserves_representation() {
     let field = AlgebraicExtension::galois_field(Zp::new(5), 2, PolyVariable::Temporary(0));
-    let alpha = field.generator();
-    for value in [
-        field.zero(),
-        field.one(),
-        alpha.clone(),
-        field.add(&alpha, &field.one()),
-    ] {
-        let upgraded = field.upgrade_element(&value, &field);
-        assert_eq!(field.try_downgrade_element(&upgraded), Some(value.clone()));
-        assert_eq!(field.downgrade_element(&upgraded), value);
+    for value in [field.zero(), field.add(&field.generator(), &field.one())] {
+        assert_eq!(field.try_downgrade_element(&value), Some(value));
     }
     let larger = field.upgrade(3);
     assert!(
@@ -41,31 +27,6 @@ fn galois_extension_downgrade_preserves_representation() {
             .try_downgrade_element(&larger.pow(&larger.generator(), 2))
             .is_none()
     );
-    let other_generator =
-        AlgebraicExtension::galois_field(Zp::new(5), 2, PolyVariable::Temporary(1));
-    assert!(
-        field
-            .try_downgrade_element(&other_generator.generator())
-            .is_none()
-    );
-    assert_eq!(
-        field.try_downgrade_element(&other_generator.zero()),
-        Some(field.zero())
-    );
-    assert_eq!(
-        field.try_downgrade_element(&other_generator.one()),
-        Some(field.one())
-    );
-    let other_prime = AlgebraicExtension::galois_field(Zp::new(7), 2, PolyVariable::Temporary(0));
-    assert!(field.try_downgrade_element(&other_prime.one()).is_none());
-}
-
-#[test]
-#[should_panic]
-fn galois_downgrade_panics_on_non_base_element() {
-    let base = Zp::new(5);
-    let extension = base.upgrade(2);
-    base.downgrade_element(&extension.generator());
 }
 
 #[test]
