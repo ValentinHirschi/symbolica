@@ -2748,11 +2748,10 @@ impl PythonCondition {
 
     /// Render algebraic expressions in the condition using native HTML formatting.
     pub fn _repr_html_(&self) -> String {
-        if let Some(text) = format_algebraic_condition(&self.condition, &solution::formatted_atom) {
-            solution::inline_html(&text)
-        } else {
-            crate::printer::AnsiHtmlFormatter::escape_html(&self.__str__())
-        }
+        display::with_math(|atom| {
+            format_algebraic_condition(&self.condition, &|a| atom(a))
+                .unwrap_or_else(|| self.__str__())
+        })
     }
 
     /// Evaluate the condition, returning None when its truth is undecidable.
@@ -4435,23 +4434,56 @@ impl PythonExpression {
         ))
     }
 
-    /// Convert the expression into an HTML representation.
+    /// Convert the expression into a bounded native MathML representation.
     pub fn _repr_html_(&self) -> PyResult<String> {
-        let formatted = self.expr.format_string(
-            &PrintOptions::new()
-                .max_line_length(Some(80))
-                .multiplication_operator('·')
-                .num_exp_as_superscript(true)
-                .max_terms(Some(100))
-                .color_mode(ColorMode::Always),
-            PrintState::new(),
-        );
+        Ok(display::preview(&crate::printer::mathml::render_page(
+            self.expr.as_view(),
+            &display::default_options(),
+            0,
+            crate::printer::mathml::DEFAULT_PAGE_SIZE,
+        )))
+    }
 
-        Ok(crate::printer::AnsiHtmlFormatter::new(&formatted).to_string())
+    /// Prefer native MathML, with live zoom and pagination.
+    #[pyo3(signature = (include=None, exclude=None))]
+    pub fn _repr_mimebundle_(
+        &self,
+        py: Python<'_>,
+        include: Option<Vec<String>>,
+        exclude: Option<Vec<String>>,
+    ) -> PyResult<Py<PyAny>> {
+        display::formatted(
+            py,
+            &self.expr,
+            display::default_options(),
+            crate::printer::mathml::DEFAULT_PAGE_SIZE,
+        )?
+        ._repr_mimebundle_(py, include, exclude)
+    }
+
+    /// Return native MathML or a live pager in marimo notebooks.
+    pub fn _display_(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        display::formatted(
+            py,
+            &self.expr,
+            display::default_options(),
+            crate::printer::mathml::DEFAULT_PAGE_SIZE,
+        )?
+        ._display_(py)
     }
 
     /// Convert the expression into a LaTeX representation.
     pub fn _repr_latex_(&self) -> PyResult<String> {
+        if crate::printer::mathml::render_page(
+            self.expr.as_view(),
+            &display::default_options(),
+            0,
+            crate::printer::mathml::DEFAULT_PAGE_SIZE,
+        )
+        .is_partial()
+        {
+            return Ok(r"$$\text{Large expression: use the MathML viewer}$$".to_owned());
+        }
         self.to_latex(Some(80))
     }
 
@@ -4580,6 +4612,18 @@ impl PythonExpression {
             include_attributes = false,
             custom_print_mode = None)
         )]
+    // inspect.signature tokenizes extension signatures as ASCII. Escape the
+    // middle-dot default so notebook completion can read all parameters.
+    #[pyo3(
+        text_signature = "($self, max_terms=100, mode=..., max_line_length=80, \
+        indentation=4, fill_indented_lines=True, terms_on_new_line=False, \
+        color_top_level_sum=True, color_builtin_symbols=True, bracket_level_colors=..., \
+        print_ring=True, symmetric_representation_for_finite_field=False, \
+        explicit_rational_polynomial=False, number_thousands_separator=None, \
+        multiplication_operator='\\u00b7', double_star_for_exponentiation=False, \
+        function_brackets=('(', ')'), num_exp_as_superscript=True, precision=None, \
+        show_namespaces=False, hide_namespace=None, include_attributes=False, custom_print_mode=None)"
+    )]
     pub fn format(
         &self,
         max_terms: Option<usize>,
@@ -4634,8 +4678,14 @@ impl PythonExpression {
 
     /// Convert the expression into a rich display object, with tunable settings.
     ///
-    /// In notebooks, the returned object displays as highlighted HTML while
-    /// `str(...)` returns the plain formatted text.
+    /// In notebooks, the returned object displays as native MathML. Large expressions
+    /// use a bounded, live pager (`symbolica[notebook]`). `page_size` controls the
+    /// number of items per page (1–500). Paged output uses a short text summary;
+    /// `max_terms` controls text in the legacy view and for complete small expressions.
+    /// Set `mathml=False` to restore the highlighted text view. Non-Symbolica
+    /// print modes also retain their original text notation. Text-layout options
+    /// apply to the text view; MathML uses native fractions, powers and fences.
+    /// Custom function printers are supported by the text view (`mathml=False`).
     #[pyo3(signature =
         (max_terms = Some(100),
             mode = PythonPrintMode::Symbolica,
@@ -4660,10 +4710,22 @@ impl PythonExpression {
             show_namespaces = false,
             hide_namespace = None,
             include_attributes = false,
-            custom_print_mode = None)
+            custom_print_mode = None, *, mathml = true, page_size = 25)
         )]
+    #[pyo3(
+        text_signature = "($self, max_terms=100, mode=..., max_line_length=80, \
+        indentation=4, fill_indented_lines=True, terms_on_new_line=False, \
+        color_top_level_sum=True, color_builtin_symbols=True, bracket_level_colors=..., \
+        print_ring=True, symmetric_representation_for_finite_field=False, \
+        explicit_rational_polynomial=False, number_thousands_separator=None, \
+        multiplication_operator='\\u00b7', double_star_for_exponentiation=False, \
+        function_brackets=('(', ')'), num_exp_as_superscript=True, precision=None, \
+        show_namespaces=False, hide_namespace=None, include_attributes=False, \
+        custom_print_mode=None, *, mathml=True, page_size=25)"
+    )]
     pub fn formatted(
         &self,
+        py: Python<'_>,
         max_terms: Option<usize>,
         mode: PythonPrintMode,
         max_line_length: Option<usize>,
@@ -4686,7 +4748,47 @@ impl PythonExpression {
         hide_namespace: Option<&str>,
         include_attributes: bool,
         custom_print_mode: Option<HashMap<String, PythonPrintUserData>>,
+        mathml: bool,
+        page_size: usize,
     ) -> PyResult<PythonFormattedOutput> {
+        if mathml && matches!(mode, PythonPrintMode::Symbolica) {
+            return display::formatted(
+                py,
+                &self.expr,
+                PrintOptions {
+                    max_line_length,
+                    indentation,
+                    fill_indented_lines,
+                    terms_on_new_line,
+                    color_top_level_sum,
+                    color_builtin_symbols,
+                    bracket_level_colors,
+                    print_ring,
+                    symmetric_representation_for_finite_field,
+                    explicit_rational_polynomial,
+                    number_thousands_separator,
+                    multiplication_operator,
+                    double_star_for_exponentiation,
+                    function_brackets,
+                    num_exp_as_superscript,
+                    precision,
+                    hide_all_namespaces: !show_namespaces,
+                    hide_namespace: if show_namespaces {
+                        hide_namespace.map(|s| std::borrow::Cow::Owned(s.to_owned()))
+                    } else {
+                        None
+                    },
+                    include_attributes,
+                    max_terms,
+                    custom_print_mode: custom_print_mode
+                        .map(|m| m.into_iter().map(|(k, v)| (k, v.0)).collect())
+                        .unwrap_or_default(),
+                    ..PrintOptions::new()
+                },
+                page_size,
+            );
+        }
+
         let text = self.format_with_color_mode(
             mode,
             max_line_length,

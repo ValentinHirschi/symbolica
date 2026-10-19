@@ -136,3 +136,155 @@ Finally, plug in measured values:
 ## Development
 
 Follow the development of Symbolica and the open-source spin-off projects [numerica](https://github.com/symbolica-dev/numerica), [graphica](https://github.com/symbolica-dev/graphica), and [symbolica-integrate](https://github.com/symbolica-dev/symbolica-integrate) on [Zulip](https://zulip.symbolica.io)!
+
+### Notebook math display
+
+Python `Expression` objects display as native MathML in notebooks. Large expressions
+show a bounded preview and, with `pip install 'symbolica[notebook]'`, a live widget
+that pages through terms, factors, or arguments and opens omitted subexpressions.
+Math uses STIX Two Math at 21px. The widget uses a locally installed copy when
+available, otherwise loading the full font from a pinned CDN URL.
+Click or Tab into an expression to zoom with `+` / `=` and `-`; press `0` to reset.
+Zoom ranges from 25–3200%, runs locally in the browser, and persists while navigating
+the expression. Small expressions have no permanent toolbar; a brief percentage
+indicator appears when zooming. Browser shortcuts such as Ctrl/Cmd+Plus are unaffected.
+Nested detail adapts to the available width, preserving the enclosing structure;
+clicking a marker opens a popup with its own page size and Previous/Next controls. Large function arguments appear
+on separate lines. Abbreviated calls retain their actual names, as `F([1])` or
+`F(x, [1])`. Omission markers
+use `+ [1]` for sums and `· [2]` for products: click to browse the popup, or hover to preview the next
+few omitted items. Show more here reveals another batch inside the original expression,
+without changing its other parts. The popup’s Inspect button opens the subexpression in the main view;
+Back to parent returns. Popup pagination is independent of the parent and other markers.
+Popups also fit their detail to the available width and retain clickable nested
+markers. Clicking one opens that part in the same box; its Back button restores
+the previous popup and page.
+Long product pages and expanded products use multiple MathML rows, with explicit
+multiplication operators on continuation lines. Expansion shares the rendering budget
+across factors; large sums inside them remain independently inspectable.
+Previews are fetched lazily without changing the current page.
+The complete expression stays in the kernel; only bounded layouts for the current page and requested hover
+previews are sent to the browser. Resizing selects a layout locally, without kernel messages.
+
+```python
+from symbolica import E
+
+expr = E('(x + y + 1)^100').expand()
+expr                              # automatic MathML and pagination
+expr.formatted(page_size=100)      # 1–500 items per page, with formatting options
+expr.formatted(mathml=False)       # previous highlighted text display
+```
+
+Plain string formatting and explicit LaTeX output remain available through `format()`
+and `to_latex()`. Text-layout options and custom function printers use the text view.
+Static notebook exports contain the current preview; navigation needs a live kernel.
+
+### Reusing the notebook viewer
+
+`MathMLViewer`, `MathMLPage`, `MathMLMarker`, and `MathMLPageSource` are public Python
+exports. Community types can supply a page renderer and reuse the same JavaScript,
+font loading, zoom, hover, popup pagination, inspection, and notebook integration:
+
+```python
+from symbolica import MathMLViewer, MathMLPage, MathMLMarker
+
+class MyPages:
+    def page(self, path, start, size, layout=0, expansions=()):
+        total = 1_000_000
+        end = min(start + size, total)
+        rows = "".join(f"<mtr><mtd><mn>{i}</mn></mtd></mtr>"
+                       for i in range(start, end))
+        markers = [MathMLMarker([], "Inspect entries [1]", end)] if end < total else []
+        tail = MathMLMarker.marker(0) if markers else ""
+        html = f"<math><mtable>{rows}</mtable>{tail}</math>"
+        return MathMLPage(html, start, end, total, markers=markers)
+
+viewer = MathMLViewer(MyPages(), page_size=25)
+# Display viewer in Jupyter, or return it from a marimo cell.
+```
+
+The provider contract is:
+
+- `path` is an absolute list of nonnegative integers; `[]` denotes the root.
+  It may identify child indices or provider-owned handles. Expressions and cursor
+  tables remain in the provider, never in widget state.
+- A page returns MathML and the half-open item range `[start, end)`, its `total`,
+  and optional `markers`. A `MathMLMarker(path, label, start=0)` records a target and
+  the first omitted item. Insert `MathMLMarker.marker(i)` at its position in the
+  MathML, where `i` is its index in `page.markers`.
+- `layout_count=1` is the default: one render per uncached page. Providers with
+  cheaper responsive layouts can supply 1–8 alternatives, from most detailed to
+  most compact, selected locally by the browser. Optionally mark corresponding
+  nested MathML subtrees with `data-symbolica-path="stable-key"` (unique,
+  nonempty keys identifying the same occurrence across layouts). The browser
+  can then reveal more detailed subtrees wherever they fit, using only the
+  supplied pages. Markers retain their source layout for navigation. Local
+  fitting is limited to 64 replacement attempts and 10,000 DOM elements.
+- `supports_expansion=False` is the default. Enable it only when the renderer
+  honors `(relative_path, visible_item_count)` entries in `expansions`, preserving
+  those branches in compact layouts. This enables Show more here. Tree paths are
+  required for expansion; opaque handles can still use pagination and inspection.
+- Providers must bound traversal and rendering. The viewer also rejects HTML
+  above 256 KiB and page metadata above a combined 512 KiB per layout. It retains
+  at most three pages, fetches popups on demand, and serializes only documented
+  fields. `viewer.close()` releases the source and cached pages.
+
+A native PyO3 provider may return a dictionary with `html`, `start`, `end`, `total`,
+`kind`, `unit`, and optional `markers` (pairs of absolute path and label), `marker_ids`
+(marker indices), and `marker_starts` (first omitted offsets). The latter arrays
+align with `markers`; omitted ids default to consecutive indices and offsets to zero.
+Rust community modules using the `python_export` feature can construct all three
+objects directly. `MathMLMarker::new` and `MathMLPage::new` create ordinary Rust
+values; their `into_python(py)` methods construct the corresponding public Python
+objects. A `MathMLViewer` wraps a native `MathMLPageSource` without requiring a
+custom PyO3 class or hand-built dictionaries:
+
+```rust,ignore
+use pyo3::prelude::*;
+use symbolica::api::python::{
+    MathMLMarker, MathMLPage, MathMLPageRequest, MathMLPageSource, MathMLViewer,
+};
+
+struct TensorPages { /* Arc<TensorExpression>, compiler, cursor cache, ... */ }
+
+impl MathMLPageSource for TensorPages {
+    fn page(&mut self, py: Python<'_>, request: MathMLPageRequest<'_>)
+        -> PyResult<MathMLPage>
+    {
+        // Render a bounded page, using request.path/start/size. The GIL token
+        // is available for adapters calling a Python-based Typst compiler.
+        // Return MathMLPage::new(html, start, end, total), with optional
+        // page.markers.push(MathMLMarker::new(target_path, label, offset)).
+        todo!("call the tensor renderer")
+    }
+}
+
+fn viewer(py: Python<'_>, source: TensorPages) -> PyResult<Py<PyAny>> {
+    MathMLViewer::new(source).page_size(25).into_python(py)
+}
+```
+
+The source is mutable and `Send + 'static`; native expression ownership can stay
+in an `Arc`. Rendering and optional notebook imports remain lazy. Layouts and
+inline expansion are opt-in through `.layout_count(n)` and
+`.supports_expansion(true)`. The viewer owns the source until `close()` or
+collection. [The Rust integration test](tests/mathml_viewer_rust.rs) exercises
+construction, focus handles, paging, caching and source release.
+
+Existing Python/PyO3 sources can still use
+`symbolica::api::python::mathml_viewer(py, source, page_size, layout_count, supports_expansion)`.
+No JavaScript, marimo, or Jupyter code is needed in the provider.
+
+[The custom provider example](examples/mathml_custom_viewer.py) exposes a virtual
+100-million-component tensor and evaluates only requested components. For
+TensorExpression, an adapter can retain its existing bounded Typst compiler,
+map absolute paths to its native focus handles, and map item offsets to its
+native continuation cursors. It then returns the compiled MathML and omission
+metadata through this contract. Start with one layout and expansion disabled;
+additional layout/expansion support can be added in its renderer independently.
+The adapter must also replace Typst's rendered omission labels with
+`MathMLMarker::marker(i)` (or its Python equivalent), preserving the matching
+marker metadata. An opaque native cursor is not an item offset: cache cursors
+by focus and offset, and retain enough information to serve hover offsets and
+changed page sizes. This keeps cursor handling and Typst compilation inside
+spenso rather than coupling the shared frontend to either implementation.

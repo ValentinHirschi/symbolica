@@ -154,6 +154,7 @@ mod array;
 mod atom;
 mod citation;
 mod condition;
+mod display;
 mod evaluator;
 mod expression;
 mod graph;
@@ -169,6 +170,10 @@ mod symbolic_integration;
 use array::EvaluationInput;
 pub use atom::*;
 pub use citation::Citation;
+#[cfg(feature = "python_export")]
+pub use display::{
+    MathMLMarker, MathMLPage, MathMLPageRequest, MathMLPageSource, MathMLViewer, mathml_viewer,
+};
 pub use evaluator::*;
 pub use expression::*;
 pub use graph::*;
@@ -583,7 +588,13 @@ impl PythonFormattedOutput {
             let kwargs = PyDict::new(py);
             kwargs.set_item("include", include)?;
             kwargs.set_item("exclude", exclude)?;
-            return value.call_method(py, "_repr_mimebundle_", (), Some(&kwargs));
+            let bundle = value.call_method(py, "_repr_mimebundle_", (), Some(&kwargs))?;
+            if let Ok(data) = bundle.bind(py).cast::<PyDict>()
+                && data.contains("text/plain")?
+            {
+                data.set_item("text/plain", self.format_plain(py)?)?;
+            }
+            return Ok(bundle);
         }
         let bundle = PyDict::new(py);
         for (mime, backend) in [
@@ -638,6 +649,7 @@ pub fn create_symbolica_module<'a, 'b>(
     register_python_floats(m)?;
     m.add_class::<Citation>()?;
     m.add_class::<PythonFormattedOutput>()?;
+    display::register(m)?;
     m.add_class::<PythonSymbol>()?;
     m.add_class::<PythonExpression>()?;
     m.add_class::<PythonIntegrationStep>()?;

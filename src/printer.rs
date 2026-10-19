@@ -19,6 +19,9 @@ use crate::{
 
 pub use numerica::printer::*;
 
+#[cfg(any(feature = "python_api", feature = "python_export"))]
+pub(crate) mod mathml;
+
 /// Track if Symbolica should colorize output, based on the `SYMBOLICA_COLOR` environment variable or if stdout is a terminal.
 static SHOULD_COLORIZE: LazyLock<bool> = LazyLock::new(|| {
     std::env::var("SYMBOLICA_COLOR")
