@@ -5240,7 +5240,11 @@ where
                 order.sort_by_key(|o| Reverse(o.1));
                 let order: Vec<_> = order.into_iter().map(|(v, _)| v).collect();
 
-                f.bivariate_factorization(order[0], order[1]).len() == 1
+                f.bivariate_factorization(order[0], order[1])
+                    .iter()
+                    .filter(|factor| !factor.is_constant())
+                    .count()
+                    == 1
             }
             _ => {
                 // TODO: find better order
@@ -5253,7 +5257,11 @@ where
 
                 let mut order: Vec<_> = order.into_iter().map(|(v, _)| v).collect();
 
-                f.multivariate_factorization(&mut order, 10, None).len() == 1
+                f.multivariate_factorization(&mut order, 10, None)
+                    .iter()
+                    .filter(|factor| !factor.is_constant())
+                    .count()
+                    == 1
             }
         }
     }
@@ -5657,41 +5665,37 @@ where
             .collect()
     }
 
-    /// Descend factors whose monic normalizations belong to the original field.
-    /// Preserve every factor occurrence and put their combined scalar on the first.
+    /// Descend factors whose coefficients belong to the original field.
     /// Reject coefficients outside the original field and certify the full product.
     fn try_downgrade_factors(
         &self,
         factors: Vec<MultivariatePolynomial<AlgebraicExtension<F::Base>, E, LexOrder>>,
     ) -> Option<Vec<Self>> {
         let field = factors.first()?.ring().clone();
-        let mut unit = factors[0].one();
-        let mut descended = Vec::with_capacity(factors.len());
-        for factor in factors {
-            if factor.is_zero() || factor.ring() != &field {
-                return None;
-            }
-            unit = unit.mul_coeff(factor.lcoeff());
-            let factor = factor.make_monic();
-            let projected = factor.map_coeff(
-                |coefficient| self.ring().downgrade_element(coefficient),
-                self.ring().clone(),
-            );
+        if factors
+            .iter()
+            .any(|factor| factor.is_zero() || factor.ring() != &field)
+        {
+            return None;
+        }
+        let descended: Vec<_> = factors
+            .iter()
+            .map(|factor| {
+                factor.map_coeff(
+                    |coefficient| self.ring().downgrade_element(coefficient),
+                    self.ring().clone(),
+                )
+            })
+            .collect();
+        for (factor, projected) in factors.iter().zip(&descended) {
             if projected.map_coeff(
                 |coefficient| self.ring().upgrade_element(coefficient, &field),
                 field.clone(),
-            ) != factor
+            ) != *factor
             {
                 return None;
             }
-            descended.push(projected);
         }
-        let unit = unit.get_constant();
-        let projected_unit = self.ring().downgrade_element(&unit);
-        if self.ring().upgrade_element(&projected_unit, &field) != unit {
-            return None;
-        }
-        descended[0] = descended[0].clone().mul_coeff(projected_unit);
         let product = descended
             .iter()
             .fold(self.one(), |product, factor| product * factor);
@@ -5701,28 +5705,32 @@ where
         Some(descended)
     }
 
-    /// Recombine complete Frobenius orbits before descending their products.
+    /// Recombine complete monic Frobenius orbits and descend their products.
+    /// Return the combined scalar unit separately, as in `factor`.
     fn try_recombine_galois_factors(
         &self,
         factors: Vec<MultivariatePolynomial<AlgebraicExtension<F::Base>, E, LexOrder>>,
     ) -> Option<Vec<Self>> {
         let field = factors.first()?.ring().clone();
         let q = self.ring().size()?;
+        let mut unit = factors[0].one();
         let mut pending = Vec::with_capacity(factors.len());
         for factor in factors {
             if factor.is_zero() || factor.ring() != &field {
                 return None;
             }
-            let unit = factor.lcoeff();
-            pending.push(Some((factor.make_monic(), unit)));
+            unit = unit.mul_coeff(factor.lcoeff());
+            if !factor.is_constant() {
+                pending.push(Some(factor.make_monic()));
+            }
         }
 
         let mut grouped = Vec::new();
         for index in 0..pending.len() {
-            let Some((first, unit)) = pending[index].take() else {
+            let Some(first) = pending[index].take() else {
                 continue;
             };
-            let mut product = first.clone().mul_coeff(unit);
+            let mut product = first.clone();
             let mut conjugate = first.clone();
             loop {
                 conjugate = conjugate.map_coeff(
@@ -5747,17 +5755,17 @@ where
                 if conjugate == first {
                     break;
                 }
-                let matching = pending.iter_mut().find(|factor| {
-                    factor
-                        .as_ref()
-                        .is_some_and(|(factor, _)| factor == &conjugate)
-                })?;
-                let (factor, unit) = matching.take()?;
-                product = product * &factor.mul_coeff(unit);
+                let matching = pending
+                    .iter_mut()
+                    .find(|factor| factor.as_ref().is_some_and(|factor| factor == &conjugate))?;
+                product = product * &matching.take()?;
             }
             grouped.push(product);
         }
 
+        if !unit.is_one() || grouped.is_empty() {
+            grouped.push(unit);
+        }
         self.try_downgrade_factors(grouped)
     }
 
@@ -6363,7 +6371,11 @@ where
             debug!("Sample point {}={}", v, self.ring().printer(s));
         }
 
-        let bivariate_factors = biv_f.bivariate_factorization(order[0], order[1]);
+        let bivariate_factors: Vec<_> = biv_f
+            .bivariate_factorization(order[0], order[1])
+            .into_iter()
+            .filter(|factor| !factor.is_constant())
+            .collect();
 
         if bivariate_factors.len() == 1 {
             // the polynomial is irreducible
@@ -17314,10 +17326,17 @@ mod test {
                     product.map_coeff(|c| field.constant(*c), field.clone())
                 );
 
-                let actual = product.try_downgrade_factors(upgraded).unwrap();
+                let actual = product.try_recombine_galois_factors(upgraded).unwrap();
+                if !base.is_one(&scalar) {
+                    expected.push(product.constant(scalar));
+                }
                 assert_eq!(actual.len(), expected.len());
-                expected[0] = expected[0].clone().mul_coeff(scalar);
                 assert_eq!(actual, expected);
+                assert!(
+                    actual
+                        .iter()
+                        .all(|factor| factor.is_constant() || base.is_one(&factor.lcoeff()))
+                );
                 assert_eq!(
                     actual
                         .iter()
@@ -17401,10 +17420,13 @@ mod test {
                     if distinct_orbits == 2 {
                         upgraded.push(second_orbit[1].clone());
                     }
-                    expected[0] = expected[0].clone().mul_coeff(scalar);
                     let product = expected
                         .iter()
-                        .fold(expected[0].one(), |product, factor| product * factor);
+                        .fold(expected[0].one(), |product, factor| product * factor)
+                        .mul_coeff(scalar);
+                    if !base.is_one(&scalar) {
+                        expected.push(product.constant(scalar));
+                    }
                     upgraded[0] = upgraded[0].clone().mul_coeff(alpha.clone());
                     let last = upgraded.last_mut().unwrap();
                     *last = last
@@ -17419,6 +17441,11 @@ mod test {
 
                     let actual = product.try_recombine_galois_factors(upgraded).unwrap();
                     assert_eq!(actual, expected);
+                    assert!(
+                        actual
+                            .iter()
+                            .all(|factor| factor.is_constant() || base.is_one(&factor.lcoeff()))
+                    );
                     assert_eq!(
                         actual
                             .iter()
@@ -17488,7 +17515,12 @@ mod test {
         let polynomial = parse!("(x+y)^2-2*(y^5-y)^2")
             .expand()
             .to_polynomial::<_, u16>(&field, variables);
-        assert_eq!(polynomial.factor(), vec![(polynomial, 1)]);
+        assert_eq!(polynomial.factor(), vec![(polynomial.clone(), 1)]);
+        let scaled = polynomial.clone().mul_coeff(field.nth(2.into()));
+        assert_eq!(
+            scaled.factor(),
+            vec![(polynomial, 1), (scaled.constant(field.nth(2.into())), 1)]
+        );
     }
 
     #[test]
