@@ -89,8 +89,15 @@ class MathMLDisplayTests(unittest.TestCase):
                     self.assertIn(parameter, signature.parameters)
                 self.assertNotIn('self', signature.parameters)
                 self.assertEqual(signature.parameters['max_terms'].default, 100)
+                self.assertEqual(signature.parameters['mode'].default, PrintMode.Symbolica)
+                self.assertEqual(signature.parameters['bracket_level_colors'].default,
+                                 [244, 25, 97, 36, 38, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58, 60])
+                self.assertNotIn('Ellipsis', str(signature))
+                self.assertNotIn('...', method.__text_signature__)
                 self.assertEqual(signature.parameters['multiplication_operator'].default, '·')
                 self.assertEqual(signature.parameters['function_brackets'].default, ('(', ')'))
+                defaults = {p.name: p.default for p in signature.parameters.values()}
+                self.assertEqual(str(method(**defaults)), str(method()))
         signature = inspect.signature(expr.formatted)
         self.assertEqual(signature.parameters['page_size'].default, 25)
         self.assertIs(signature.parameters['mathml'].default, True)
@@ -105,6 +112,8 @@ class MathMLDisplayTests(unittest.TestCase):
         expr = E('x')
         interpreter = jedi.Interpreter('expr.formatted(', [{'expr': expr}])
         signature, = interpreter.get_signatures()
+        self.assertIn('mode=PrintMode.Symbolica', signature.to_string())
+        self.assertNotIn('Ellipsis', signature.to_string())
         names = {parameter.name for parameter in signature.params}
         self.assertTrue({'show_namespaces', 'mathml', 'page_size', 'precision'} <= names)
         interpreter = jedi.Interpreter('expr.formatted(show_', [{'expr': expr}])

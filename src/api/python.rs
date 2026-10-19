@@ -736,6 +736,17 @@ pub fn create_symbolica_module<'a, 'b>(
 
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
 
+    // CPython's native signature parser only supports literal defaults, not enums.
+    let signatures = PyModule::from_code(
+        m.py(),
+        &std::ffi::CString::new(include_str!("python/signatures.py")).unwrap(),
+        c"symbolica_signatures.py",
+        c"_symbolica_signatures",
+    )?;
+    signatures
+        .getattr("install")?
+        .call1((m.getattr("Expression")?, PythonPrintMode::Symbolica))?;
+
     Ok(m)
 }
 

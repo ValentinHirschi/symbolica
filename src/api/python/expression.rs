@@ -4617,7 +4617,8 @@ impl PythonExpression {
     #[pyo3(
         text_signature = "($self, max_terms=100, mode=..., max_line_length=80, \
         indentation=4, fill_indented_lines=True, terms_on_new_line=False, \
-        color_top_level_sum=True, color_builtin_symbols=True, bracket_level_colors=..., \
+        color_top_level_sum=True, color_builtin_symbols=True, \
+        bracket_level_colors=[244, 25, 97, 36, 38, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58, 60], \
         print_ring=True, symmetric_representation_for_finite_field=False, \
         explicit_rational_polynomial=False, number_thousands_separator=None, \
         multiplication_operator='\\u00b7', double_star_for_exponentiation=False, \
@@ -4715,7 +4716,8 @@ impl PythonExpression {
     #[pyo3(
         text_signature = "($self, max_terms=100, mode=..., max_line_length=80, \
         indentation=4, fill_indented_lines=True, terms_on_new_line=False, \
-        color_top_level_sum=True, color_builtin_symbols=True, bracket_level_colors=..., \
+        color_top_level_sum=True, color_builtin_symbols=True, \
+        bracket_level_colors=[244, 25, 97, 36, 38, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58, 60], \
         print_ring=True, symmetric_representation_for_finite_field=False, \
         explicit_rational_polynomial=False, number_thousands_separator=None, \
         multiplication_operator='\\u00b7', double_star_for_exponentiation=False, \
