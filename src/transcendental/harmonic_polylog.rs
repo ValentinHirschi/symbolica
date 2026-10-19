@@ -312,6 +312,9 @@ impl SixthRootHplEvaluator {
         }
         let mut regular = BTreeMap::new();
         for word in regular_words {
+            // G(a1,...,an;1) = sum_j (-1)^j
+            // G(1-aj,...,1-a1;1/2) G(a(j+1),...,an;1/2).
+            // The right word has no trailing zero; every left pole is nonzero.
             let poles = word.iter().map(|&i| Pole::original(i)).collect::<Vec<_>>();
             let hpl_sign = if word.iter().filter(|&&i| i == 1).count() % 2 == 0 {
                 1
@@ -345,8 +348,9 @@ impl SixthRootHplEvaluator {
     ///
     /// Series truncation and fixed-point rounding errors are enclosed before
     /// Hölder products and trailing-zero shuffles are combined. Guard precision
-    /// is increased when cancellation prevents the requested accuracy. Very
-    /// small components have an absolute error bound of 2^(-bits-32).
+    /// is increased when cancellation prevents the requested accuracy. Before
+    /// final rounding, very small components have an absolute error bound of
+    /// 2^(-bits-32); the returned floats are then rounded to `bits` precision.
     pub fn evaluate(&self, sign: i8, bits: u32) -> Result<Vec<Complex<Float>>, String> {
         validate_sign(sign)?;
         if !(2..=MAX_BITS).contains(&bits) {
@@ -407,6 +411,9 @@ impl SixthRootHplEvaluator {
         for n in 1..=n_terms {
             for (offset, node) in self.nodes.iter().enumerate() {
                 let index = offset + 1;
+                // b_w(n) = [t^n] G(w;t) / 2^n. For a nonzero first pole a,
+                // n*b_w(n) = (1/(2*a))*((n-1)*b_w(n-1)-b_suffix(n-1)).
+                // A zero first pole instead divides b_suffix(n) by n.
                 current[index] = if node.pole == Pole::Zero {
                     current[node.suffix].div(i64::from(n))
                 } else {
