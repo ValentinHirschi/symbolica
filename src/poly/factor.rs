@@ -5665,46 +5665,6 @@ where
             .collect()
     }
 
-    /// Descend factors whose coefficients belong to the original field.
-    /// Reject coefficients outside the original field and certify the full product.
-    fn try_downgrade_factors(
-        &self,
-        factors: Vec<MultivariatePolynomial<AlgebraicExtension<F::Base>, E, LexOrder>>,
-    ) -> Option<Vec<Self>> {
-        let field = factors.first()?.ring().clone();
-        if factors
-            .iter()
-            .any(|factor| factor.is_zero() || factor.ring() != &field)
-        {
-            return None;
-        }
-        let descended: Vec<_> = factors
-            .iter()
-            .map(|factor| {
-                factor.map_coeff(
-                    |coefficient| self.ring().downgrade_element(coefficient),
-                    self.ring().clone(),
-                )
-            })
-            .collect();
-        for (factor, projected) in factors.iter().zip(&descended) {
-            if projected.map_coeff(
-                |coefficient| self.ring().upgrade_element(coefficient, &field),
-                field.clone(),
-            ) != *factor
-            {
-                return None;
-            }
-        }
-        let product = descended
-            .iter()
-            .fold(self.one(), |product, factor| product * factor);
-        if &product != self {
-            return None;
-        }
-        Some(descended)
-    }
-
     /// Recombine complete monic Frobenius orbits and descend their products.
     /// Return the combined scalar unit separately, as in `factor`.
     fn try_recombine_galois_factors(
@@ -5766,7 +5726,27 @@ where
         if !unit.is_one() || grouped.is_empty() {
             grouped.push(unit);
         }
-        self.try_downgrade_factors(grouped)
+        let descended: Vec<_> = grouped
+            .into_iter()
+            .map(|factor| {
+                let variables = factor.variables().clone();
+                let coefficients = factor
+                    .coefficients
+                    .iter()
+                    .map(|coefficient| self.ring().try_downgrade_element(coefficient))
+                    .collect::<Option<Vec<_>>>()?;
+                Some(Self::from_parts(
+                    coefficients,
+                    factor.exponents,
+                    self.ring().clone(),
+                    variables,
+                ))
+            })
+            .collect::<Option<_>>()?;
+        let product = descended
+            .iter()
+            .fold(self.one(), |product, factor| product * factor);
+        (product == *self).then_some(descended)
     }
 
     /// Compute the bivariate factorization of a square-free polynomial.
@@ -12674,7 +12654,7 @@ mod test {
         atom::AtomCore,
         domains::{
             Field, InternalOrdering, Ring, RingOps,
-            algebraic::AlgebraicExtension,
+            algebraic::{AlgebraicExtension, GaloisField},
             finite_field::{
                 FiniteField, FiniteFieldCore, FiniteFieldElement, PrimeIteratorU64, ToFiniteField,
                 Z2, Zp,
@@ -17373,7 +17353,14 @@ mod test {
             product.map_coeff(|c| field.constant(*c), field.clone()),
             upgraded_product
         );
-        assert!(product.try_downgrade_factors(factors).is_none());
+        for factor in factors {
+            assert!(
+                factor
+                    .coefficients
+                    .iter()
+                    .any(|coefficient| product.ring().try_downgrade_element(coefficient).is_none())
+            );
+        }
     }
 
     #[test]
