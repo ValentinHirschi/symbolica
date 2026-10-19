@@ -2,7 +2,7 @@
 use super::{MathMLMarker, MathMLPage};
 use pyo3::{
     PyTraverseError, PyVisit,
-    exceptions::{PyRuntimeError, PyTypeError, PyValueError},
+    exceptions::{PyImportError, PyRuntimeError, PyTypeError, PyValueError},
     prelude::*,
     types::{PyAnyMethods, PyBool, PyDict, PyDictMethods, PyInt, PyList, PyTuple},
 };
@@ -262,8 +262,8 @@ struct CacheKey {
     expanded: BTreeMap<Vec<usize>, usize>,
 }
 
-/// Native state; the Python subclass only owns the notebook widget adapter.
-#[pyclass(subclass, name = "_MathMLViewer", module = "_symbolica_paging")]
+/// Paging and notebook integration share one native owner.
+#[pyclass(subclass, name = "MathMLViewer", module = "symbolica")]
 pub(super) struct PythonMathMLViewer {
     source: Option<Py<PyAny>>,
     layout_count: usize,
@@ -274,6 +274,7 @@ pub(super) struct PythonMathMLViewer {
     serial: u64,
     views: HashSet<String>,
     last_page: Option<Py<PyDict>>,
+    widget: Option<Py<PyAny>>,
 }
 
 impl PythonMathMLViewer {
@@ -540,6 +541,51 @@ impl PythonMathMLViewer {
         self.popups.clear();
         self.last_page = None;
     }
+
+    fn widget_type(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
+        let base = py.import("anywidget")?.getattr("AnyWidget")?;
+        let traits = py.import("traitlets")?;
+        let module = super::paging_module(py)?;
+        if let Ok(class) = module.getattr("_MathPages") {
+            return Ok(class);
+        }
+        // Use the widget's Python metaclass through PyO3; no Python source is evaluated.
+        let attributes = PyDict::new(py);
+        attributes.set_item("__module__", "_symbolica_paging")?;
+        attributes.set_item("_esm", include_str!("paging.js"))?;
+        let metadata = PyDict::new(py);
+        metadata.set_item("sync", true)?;
+        for name in ["page", "preview"] {
+            let field = traits
+                .getattr("Dict")?
+                .call0()?
+                .call_method("tag", (), Some(&metadata))?;
+            attributes.set_item(name, field)?;
+        }
+        let class =
+            py.import("builtins")?
+                .getattr("type")?
+                .call1(("MathPages", (base,), attributes))?;
+        module.setattr("_MathPages", &class)?;
+        Ok(class)
+    }
+
+    fn close_widget(slf: &Py<Self>, py: Python<'_>) -> PyResult<()> {
+        let widget = slf.borrow_mut(py).widget.take();
+        if let Some(widget) = widget {
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("remove", true)?;
+            // Release the Rust borrow before calling framework code or callbacks.
+            widget.call_method(
+                py,
+                "on_msg",
+                (slf.getattr(py, "_on_message")?,),
+                Some(&kwargs),
+            )?;
+            widget.call_method0(py, "close")?;
+        }
+        Ok(())
+    }
 }
 
 #[pymethods]
@@ -586,7 +632,124 @@ impl PythonMathMLViewer {
             serial: 0,
             views: HashSet::new(),
             last_page: None,
+            widget: None,
         })
+    }
+
+    #[getter]
+    fn _widget(&self, py: Python<'_>) -> Option<Py<PyAny>> {
+        self.widget.as_ref().map(|widget| widget.clone_ref(py))
+    }
+
+    fn _get_widget(slf: Py<Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        if let Some(widget) = &slf.borrow(py).widget {
+            return Ok(widget.clone_ref(py));
+        }
+        let class = Self::widget_type(py)?;
+        let page = slf.borrow_mut(py)._page(py)?;
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("page", page)?;
+        let widget = class.call((), Some(&kwargs))?.unbind();
+        widget.call_method1(py, "on_msg", (slf.getattr(py, "_on_message")?,))?;
+        slf.borrow_mut(py).widget = Some(widget.clone_ref(py));
+        Ok(widget)
+    }
+
+    fn _on_message(
+        slf: Py<Self>,
+        py: Python<'_>,
+        widget: &Bound<'_, PyAny>,
+        content: &Bound<'_, PyDict>,
+        _buffers: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let response = slf.borrow_mut(py)._message(py, content)?;
+        if let Some((field, value)) = response {
+            if field.is_empty() {
+                Self::close_widget(&slf, py)?;
+            } else {
+                widget.setattr(field, value)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Release the retained source, widget and bounded caches.
+    fn close(slf: Py<Self>, py: Python<'_>) -> PyResult<()> {
+        Self::close_widget(&slf, py)?;
+        slf.borrow_mut(py)._close();
+        Ok(())
+    }
+
+    #[pyo3(signature = (include=None, exclude=None))]
+    fn _repr_mimebundle_(
+        slf: Py<Self>,
+        py: Python<'_>,
+        include: Option<Vec<String>>,
+        exclude: Option<Vec<String>>,
+    ) -> PyResult<Py<PyDict>> {
+        let wanted = |mime: &str| {
+            include.as_ref().is_none_or(|v| v.iter().any(|s| s == mime))
+                && !exclude
+                    .as_ref()
+                    .is_some_and(|v| v.iter().any(|s| s == mime))
+        };
+        let result = PyDict::new(py);
+        if wanted("text/plain") {
+            result.set_item("text/plain", slf.borrow(py).__repr__())?;
+        }
+        if wanted("text/html") {
+            result.set_item("text/html", slf.borrow_mut(py)._repr_html_(py)?)?;
+        }
+        if wanted("application/vnd.jupyter.widget-view+json") {
+            let bundle = (|| -> PyResult<Py<PyAny>> {
+                let widget = Self::_get_widget(slf.clone_ref(py), py)?;
+                let kwargs = PyDict::new(py);
+                kwargs.set_item("include", &include)?;
+                kwargs.set_item("exclude", &exclude)?;
+                widget.call_method(py, "_repr_mimebundle_", (), Some(&kwargs))
+            })();
+            match bundle {
+                Ok(bundle) if !bundle.is_none(py) => {
+                    let value = bundle.bind(py);
+                    let data = if value.is_instance_of::<PyTuple>() {
+                        value.get_item(0)?
+                    } else {
+                        value.clone()
+                    };
+                    for (key, value) in data.cast::<PyDict>()?.iter() {
+                        if wanted(&key.extract::<String>()?) {
+                            result.set_item(key, value)?;
+                        }
+                    }
+                    if wanted("text/plain") {
+                        result.set_item("text/plain", slf.borrow(py).__repr__())?;
+                    }
+                }
+                Ok(_) => {}
+                Err(error) if error.is_instance_of::<PyImportError>(py) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(result.unbind())
+    }
+
+    fn _display_(slf: Py<Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let marimo = py.import("marimo")?;
+        let result = (|| -> PyResult<Py<PyAny>> {
+            let widget = Self::_get_widget(slf.clone_ref(py), py)?;
+            Ok(marimo
+                .getattr("ui")?
+                .getattr("anywidget")?
+                .call1((widget,))?
+                .unbind())
+        })();
+        match result {
+            Err(error) if error.is_instance_of::<PyImportError>(py) => {
+                let html = slf.borrow_mut(py)._repr_html_(py)?;
+                Ok(marimo.getattr("Html")?.call1((html,))?.unbind())
+            }
+            other => other,
+        }
     }
 
     fn _page(&mut self, py: Python<'_>) -> PyResult<Py<PyDict>> {
@@ -750,9 +913,13 @@ impl PythonMathMLViewer {
         if let Some(page) = &self.last_page {
             visit.call(page)?;
         }
+        if let Some(widget) = &self.widget {
+            visit.call(widget)?;
+        }
         Ok(())
     }
     fn __clear__(&mut self) {
+        self.widget = None;
         self._close();
     }
 }

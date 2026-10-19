@@ -1,7 +1,6 @@
 //! Lazy notebook paging shared by Expression and FormattedOutput.
 use super::*;
 use crate::printer::mathml::{self, MathMlPage};
-use std::ffi::CString;
 
 mod provider;
 pub use provider::{MathMLMarker, MathMLPage};
@@ -215,13 +214,30 @@ fn paging_module(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
     let module = if let Ok(module) = modules.get_item(name) {
         module.cast_into::<PyModule>()?
     } else {
-        let code = CString::new(include_str!("display/paging.py")).unwrap();
         let module = PyModule::new(py, name)?;
         module.add_class::<MathMLMarker>()?;
         module.add_class::<MathMLPage>()?;
         module.add_class::<paging::PythonMathMLViewer>()?;
-        module.setattr("WIDGET_ESM", include_str!("display/paging.js"))?;
-        py.run(&code, Some(&module.dict()), None)?;
+        // Runtime structural protocol; the full provider signature lives in the stub.
+        let typing = py.import("typing")?;
+        let base = typing
+            .getattr("Protocol")
+            .or_else(|_| py.import("builtins")?.getattr("object"))?;
+        let attributes = PyDict::new(py);
+        attributes.set_item("__module__", name)?;
+        attributes.set_item(
+            "__doc__",
+            "A provider implementing page(path, start, size, layout, expansions).",
+        )?;
+        let annotations = PyDict::new(py);
+        annotations.set_item("page", typing.getattr("Callable")?)?;
+        attributes.set_item("__annotations__", annotations)?;
+        let protocol = py.import("builtins")?.getattr("type")?.call1((
+            "MathMLPageSource",
+            (base,),
+            attributes,
+        ))?;
+        module.add("MathMLPageSource", protocol)?;
         modules.set_item(name, &module)?;
         module
     };
