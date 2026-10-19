@@ -10,6 +10,7 @@ mod paging;
 
 pub(super) fn default_options() -> PrintOptions {
     PrintOptions::new()
+        .mode(PrintMode::MathML)
         .multiplication_operator('·')
         .num_exp_as_superscript(true)
         .max_terms(Some(100))
@@ -21,8 +22,7 @@ pub(super) fn with_math(format: impl FnOnce(&dyn Fn(&Atom) -> String) -> String)
     let text = format(&|atom| {
         let mut fragments = fragments.borrow_mut();
         let marker = format!("\u{e000}{}\u{e001}", fragments.len());
-        fragments.push(preview(&mathml::render_page(
-            atom.as_view(),
+        fragments.push(preview(&atom.as_view().render_mathml_page(
             &default_options(),
             0,
             mathml::DEFAULT_PAGE_SIZE,
@@ -51,7 +51,7 @@ pub(super) fn with_math(format: impl FnOnce(&dyn Fn(&Atom) -> String) -> String)
 
 #[pyclass]
 struct PageSource {
-    expression: Atom,
+    cursors: mathml::MathMlCursorCache,
     options: PrintOptions,
 }
 
@@ -75,12 +75,10 @@ impl PageSource {
         if layout >= mathml::LAYOUTS.len() {
             return Err(exceptions::PyValueError::new_err("Unknown layout"));
         }
-        let mut atom = self.expression.as_view();
-        for index in &path {
-            atom = mathml::children(atom)
-                .and_then(|mut c| c.nth(*index))
-                .ok_or_else(|| exceptions::PyValueError::new_err("Unknown subexpression"))?;
-        }
+        let atom = self
+            .cursors
+            .locate(&path)
+            .ok_or_else(|| exceptions::PyValueError::new_err("Unknown subexpression"))?;
         let expansions = expansions.unwrap_or_default();
         if expansions
             .iter()
@@ -90,7 +88,14 @@ impl PageSource {
                 "Invalid expansion budget",
             ));
         }
-        let page = mathml::render_layout(atom, &self.options, start, size, layout, &expansions);
+        let page = atom.render_mathml_layout_cached(
+            &self.options,
+            start,
+            size,
+            layout,
+            &expansions,
+            &self.cursors,
+        );
         let result = PyDict::new(py);
         result.set_item("html", &page.html)?;
         result.set_item("start", page.start)?;
@@ -98,6 +103,7 @@ impl PageSource {
         result.set_item("total", page.total)?;
         result.set_item("next", (page.end < page.total).then_some(page.end))?;
         let (kind, unit) = match atom {
+            AtomView::Fun(_) if page.custom => ("Function", "expressions"),
             AtomView::Add(_) => ("Sum", "terms"),
             AtomView::Mul(_) => ("Product", "factors"),
             AtomView::Fun(_) => ("Function", "arguments"),
@@ -143,7 +149,7 @@ pub(super) fn viewer(
         Py::new(
             py,
             PageSource {
-                expression: expression.clone(),
+                cursors: mathml::MathMlCursorCache::new(expression.clone()),
                 options,
             },
         )?
@@ -186,7 +192,7 @@ pub(super) fn formatted(
         if backend == FormattedOutputBackend::Latex {
             return Ok(None);
         }
-        let page = mathml::render_page(expression.as_view(), &options, 0, size);
+        let page = expression.as_view().render_mathml_page(&options, 0, size);
         Ok(Some(match backend {
             FormattedOutputBackend::Html => preview(&page),
             FormattedOutputBackend::Text if page.is_partial() => format!(
@@ -195,6 +201,7 @@ pub(super) fn formatted(
             ),
             FormattedOutputBackend::Text => expression.format_string(
                 &PrintOptions {
+                    mode: PrintMode::Symbolica,
                     color_mode: ColorMode::Never,
                     ..options.clone()
                 },

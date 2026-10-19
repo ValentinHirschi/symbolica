@@ -4436,8 +4436,7 @@ impl PythonExpression {
 
     /// Convert the expression into a bounded native MathML representation.
     pub fn _repr_html_(&self) -> PyResult<String> {
-        Ok(display::preview(&crate::printer::mathml::render_page(
-            self.expr.as_view(),
+        Ok(display::preview(&self.expr.as_view().render_mathml_page(
             &display::default_options(),
             0,
             crate::printer::mathml::DEFAULT_PAGE_SIZE,
@@ -4474,13 +4473,15 @@ impl PythonExpression {
 
     /// Convert the expression into a LaTeX representation.
     pub fn _repr_latex_(&self) -> PyResult<String> {
-        if crate::printer::mathml::render_page(
-            self.expr.as_view(),
-            &display::default_options(),
-            0,
-            crate::printer::mathml::DEFAULT_PAGE_SIZE,
-        )
-        .is_partial()
+        if self
+            .expr
+            .as_view()
+            .render_mathml_page(
+                &display::default_options(),
+                0,
+                crate::printer::mathml::DEFAULT_PAGE_SIZE,
+            )
+            .is_partial()
         {
             return Ok(r"$$\text{Large expression: use the MathML viewer}$$".to_owned());
         }
@@ -4539,6 +4540,9 @@ impl PythonExpression {
     /// >>> print(E('x^2 + f(x)').format(PrintMode.Mathematica))
     ///
     /// yields `x^2 + f[x]`
+    ///
+    /// `mode=PrintMode.MathML` returns a bounded MathML fragment for embedding
+    /// inside `<math>`. Use `formatted(mode=PrintMode.MathML)` for notebook display.
     ///
     /// Parameters
     /// ----------
@@ -4684,9 +4688,12 @@ impl PythonExpression {
     /// number of items per page (1–500). Paged output uses a short text summary;
     /// `max_terms` controls text in the legacy view and for complete small expressions.
     /// Set `mathml=False` to restore the highlighted text view. Non-Symbolica
-    /// print modes also retain their original text notation. Text-layout options
+    /// print modes retain their original text notation; `mode=PrintMode.MathML`
+    /// explicitly selects MathML. Text-layout options
     /// apply to the text view; MathML uses native fractions, powers and fences.
-    /// Custom function printers are supported by the text view (`mathml=False`).
+    /// Custom printers receive `PrintMode.MathML` and return MathML fragments,
+    /// or `None` for the default rendering. Their output must fit the rendering
+    /// budget; callback implementations are responsible for bounding their work.
     #[pyo3(signature =
         (max_terms = Some(100),
             mode = PythonPrintMode::Symbolica,
@@ -4753,7 +4760,9 @@ impl PythonExpression {
         mathml: bool,
         page_size: usize,
     ) -> PyResult<PythonFormattedOutput> {
-        if mathml && matches!(mode, PythonPrintMode::Symbolica) {
+        if matches!(mode, PythonPrintMode::MathML)
+            || (mathml && matches!(mode, PythonPrintMode::Symbolica))
+        {
             return display::formatted(
                 py,
                 &self.expr,

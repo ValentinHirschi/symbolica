@@ -342,6 +342,8 @@ pub enum PythonPrintMode {
     Sympy,
     /// Print using Typst notation.
     Typst,
+    /// Print a native MathML fragment.
+    MathML,
 }
 
 #[cfg_attr(feature = "python_stubgen", gen_stub_pymethods)]
@@ -361,6 +363,7 @@ impl From<PrintMode> for PythonPrintMode {
             PrintMode::Mathematica => PythonPrintMode::Mathematica,
             PrintMode::Sympy => PythonPrintMode::Sympy,
             PrintMode::Typst => PythonPrintMode::Typst,
+            PrintMode::MathML => PythonPrintMode::MathML,
             _ => {
                 error!("Unsupported PrintMode: {:?}", mode);
                 PythonPrintMode::Symbolica
@@ -377,6 +380,7 @@ impl From<PythonPrintMode> for PrintMode {
             PythonPrintMode::Mathematica => PrintMode::Mathematica,
             PythonPrintMode::Sympy => PrintMode::Sympy,
             PythonPrintMode::Typst => PrintMode::Typst,
+            PythonPrintMode::MathML => PrintMode::MathML,
         }
     }
 }
@@ -788,6 +792,17 @@ fn print_options_to_dict<'py>(
     dict.set_item("level", state.level)?;
     dict.set_item("bracket_level", state.bracket_level)?;
     dict.set_item("indentation_level", state.indentation_level)?;
+    for (name, value) in [
+        ("in_sum", state.in_sum),
+        ("in_product", state.in_product),
+        ("suppress_one", state.suppress_one),
+        ("in_exp", state.in_exp),
+        ("in_exp_base", state.in_exp_base),
+        ("top_level_add_child", state.top_level_add_child),
+        ("superscript", state.superscript),
+    ] {
+        dict.set_item(name, value)?;
+    }
 
     Ok(dict)
 }
@@ -1537,9 +1552,10 @@ impl PythonPrintDefinition {
                         "mathematica" => PythonPrintMode::Mathematica,
                         "sympy" => PythonPrintMode::Sympy,
                         "typst" => PythonPrintMode::Typst,
+                        "mathml" => PythonPrintMode::MathML,
                         _ => {
                             return Err(exceptions::PyValueError::new_err(format!(
-                                "Unknown print mode {name:?}; expected symbolica, latex, mathematica, sympy, or typst"
+                                "Unknown print mode {name:?}; expected symbolica, latex, mathematica, sympy, typst, or mathml"
                             )));
                         }
                     }

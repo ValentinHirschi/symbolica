@@ -2106,6 +2106,8 @@ class PrintMode(Enum):
     """Print using Sympy notation."""
     Typst = 5
     """Print using Typst notation."""
+    MathML = 6
+    """Print a bounded MathML fragment; custom printers return MathML fragments."""
 
 class RootLocation(Enum):
     """Proven location of an isolated root relative to the coordinate axes."""
@@ -3015,6 +3017,9 @@ class Expression:
 
         yields `x^2 + f[x]`
 
+        mode=PrintMode.MathML returns a bounded fragment for embedding inside
+        <math>. Use formatted(mode=PrintMode.MathML) for notebook display.
+
         Parameters
         ----------
         max_terms: int | None
@@ -3114,7 +3119,10 @@ class Expression:
         page_size (1–500) sets the initial preview and popup page size. Nested detail adapts
         to the available width. Paged output uses a short text
         summary; max_terms controls the legacy text view and small expressions.
-        Custom function printers and text-layout options apply to the text view.
+        Custom printers receive PrintMode.MathML and return bounded MathML fragments,
+        or None for the standard renderer. Fragments are atomic for paging;
+        callback implementations must bound their own work. Text-layout options
+        apply to the text view. Explicit mode=PrintMode.MathML also selects MathML.
 
         Parameters
         ----------

@@ -19,7 +19,6 @@ use crate::{
 
 pub use numerica::printer::*;
 
-#[cfg(any(feature = "python_api", feature = "python_export"))]
 pub(crate) mod mathml;
 
 /// Track if Symbolica should colorize output, based on the `SYMBOLICA_COLOR` environment variable or if stdout is a terminal.
@@ -593,6 +592,9 @@ impl AtomView<'_> {
         opts: &PrintOptions,
         print_state: PrintState,
     ) -> Result<bool, Error> {
+        if opts.mode.is_mathml() {
+            return self.format_mathml(fmt, opts, print_state);
+        }
         match self {
             AtomView::Num(n) => n.fmt_output(fmt, opts, print_state),
             AtomView::Var(v) => v.fmt_output(fmt, opts, print_state),
