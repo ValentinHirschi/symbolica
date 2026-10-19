@@ -1,10 +1,12 @@
 //! Typed Rust adapters for the shared notebook viewer.
-use pyo3::{exceptions::PyRuntimeError, prelude::*};
-use std::sync::Mutex;
+use pyo3::prelude::*;
+#[cfg(feature = "python_export")]
+use {pyo3::exceptions::PyRuntimeError, std::sync::Mutex};
 
 /// A numbered link to an omitted part of the source. Paths may contain native
 /// focus handles; only providers enabling inline expansion need tree paths.
-#[derive(Clone, Debug)]
+#[pyclass(frozen, get_all, from_py_object, eq, module = "symbolica")]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MathMLMarker {
     pub path: Vec<usize>,
     pub label: String,
@@ -32,16 +34,34 @@ impl MathMLMarker {
 
     /// Construct the corresponding public Python object.
     pub fn into_python(self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        super::paging_module(py)?
-            .getattr("MathMLMarker")?
-            .call1((self.path, self.label, self.start))
-            .map(Bound::unbind)
+        Py::new(py, self).map(Py::into_any)
+    }
+}
+
+#[pymethods]
+impl MathMLMarker {
+    #[new]
+    #[pyo3(signature = (path, label, start=0))]
+    fn py_new(
+        #[pyo3(from_py_with = super::paging::path)] path: Vec<usize>,
+        label: String,
+        #[pyo3(from_py_with = super::paging::index)] start: usize,
+    ) -> Self {
+        Self::new(path, label, start)
+    }
+
+    #[staticmethod]
+    #[pyo3(name = "marker")]
+    fn py_marker(index: &Bound<'_, PyAny>) -> PyResult<String> {
+        super::paging::integer(index, "marker index must be a nonnegative integer")
+            .map(Self::marker)
     }
 }
 
 /// A bounded MathML page. The range is half-open, and may be shorter than the
 /// requested size when a rendering budget is reached. HTML must come from the
 /// trusted renderer; no complete hidden expression should be serialized here.
+#[pyclass(frozen, get_all, from_py_object, module = "symbolica")]
 #[derive(Clone, Debug)]
 pub struct MathMLPage {
     pub html: String,
@@ -69,23 +89,39 @@ impl MathMLPage {
     /// Construct the public Python page. The shared viewer validates page ranges,
     /// marker metadata and transfer limits when it consumes this object.
     pub fn into_python(self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let markers = self
-            .markers
-            .into_iter()
-            .map(|m| m.into_python(py))
-            .collect::<PyResult<Vec<_>>>()?;
-        super::paging_module(py)?
-            .getattr("MathMLPage")?
-            .call1((
-                self.html, self.start, self.end, self.total, self.kind, self.unit, markers,
-            ))
-            .map(Bound::unbind)
+        Py::new(py, self).map(Py::into_any)
+    }
+}
+
+#[pymethods]
+impl MathMLPage {
+    #[new]
+    #[pyo3(signature = (html, start, end, total, kind="Expression", unit="items", markers=None))]
+    fn py_new(
+        html: String,
+        #[pyo3(from_py_with = super::paging::index)] start: usize,
+        #[pyo3(from_py_with = super::paging::index)] end: usize,
+        #[pyo3(from_py_with = super::paging::index)] total: usize,
+        kind: &str,
+        unit: &str,
+        markers: Option<Vec<MathMLMarker>>,
+    ) -> Self {
+        Self {
+            html,
+            start,
+            end,
+            total,
+            kind: kind.into(),
+            unit: unit.into(),
+            markers: markers.unwrap_or_default(),
+        }
     }
 }
 
 /// One requested page. `path` is absolute; expansion paths are relative to it.
 /// `start` is an item offset, not a native continuation token. Cursor-based
 /// sources should retain their offset-to-cursor mapping in the source.
+#[cfg(feature = "python_export")]
 pub struct MathMLPageRequest<'a> {
     pub path: &'a [usize],
     pub start: usize,
@@ -97,15 +133,18 @@ pub struct MathMLPageRequest<'a> {
 /// A native source owns its expression, handles, compiler and cursor cache.
 /// It renders only requested bounded pages. Python is available for renderers
 /// that call a Python compiler; purely native renderers can ignore it.
+#[cfg(feature = "python_export")]
 pub trait MathMLPageSource: Send {
     fn page(&mut self, py: Python<'_>, request: MathMLPageRequest<'_>) -> PyResult<MathMLPage>;
 }
 
+#[cfg(feature = "python_export")]
 #[pyclass]
 struct NativePageSource {
     source: Mutex<Box<dyn MathMLPageSource>>,
 }
 
+#[cfg(feature = "python_export")]
 #[pymethods]
 impl NativePageSource {
     #[pyo3(signature = (path, start, size, layout=0, expansions=None))]
@@ -141,6 +180,7 @@ impl NativePageSource {
 /// Construct a notebook viewer directly from a Rust page source. Construction
 /// is lazy: no pages or optional notebook dependencies are loaded until display.
 /// The resulting Python viewer owns the source until `close()` or collection.
+#[cfg(feature = "python_export")]
 pub struct MathMLViewer {
     source: Box<dyn MathMLPageSource>,
     page_size: usize,
@@ -148,6 +188,7 @@ pub struct MathMLViewer {
     supports_expansion: bool,
 }
 
+#[cfg(feature = "python_export")]
 impl MathMLViewer {
     pub fn new(source: impl MathMLPageSource + 'static) -> Self {
         Self {

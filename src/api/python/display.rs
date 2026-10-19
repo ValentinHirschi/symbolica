@@ -3,10 +3,11 @@ use super::*;
 use crate::printer::mathml::{self, MathMlPage};
 use std::ffi::CString;
 
-#[cfg(feature = "python_export")]
 mod provider;
+pub use provider::{MathMLMarker, MathMLPage};
 #[cfg(feature = "python_export")]
-pub use provider::{MathMLMarker, MathMLPage, MathMLPageRequest, MathMLPageSource, MathMLViewer};
+pub use provider::{MathMLPageRequest, MathMLPageSource, MathMLViewer};
+mod paging;
 
 pub(super) fn default_options() -> PrintOptions {
     PrintOptions::new()
@@ -215,8 +216,12 @@ fn paging_module(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
         module.cast_into::<PyModule>()?
     } else {
         let code = CString::new(include_str!("display/paging.py")).unwrap();
-        let module = PyModule::from_code(py, &code, c"symbolica_paging.py", c"_symbolica_paging")?;
+        let module = PyModule::new(py, name)?;
+        module.add_class::<MathMLMarker>()?;
+        module.add_class::<MathMLPage>()?;
+        module.add_class::<paging::PythonMathMLViewer>()?;
         module.setattr("WIDGET_ESM", include_str!("display/paging.js"))?;
+        py.run(&code, Some(&module.dict()), None)?;
         modules.set_item(name, &module)?;
         module
     };

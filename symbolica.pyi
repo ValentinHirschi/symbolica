@@ -2197,7 +2197,7 @@ class MathMLPage:
     markers: Sequence[MathMLMarker]
     def __init__(self, html: str, start: int, end: int, total: int,
                  kind: str = "Expression", unit: str = "items",
-                 markers: Sequence[MathMLMarker] = ()) -> None: ...
+                 markers: Sequence[MathMLMarker] | None = None) -> None: ...
 
 class MathMLPageSource(Protocol):
     def page(self, path: list[int], start: int, size: int, layout: int = 0,
