@@ -247,6 +247,11 @@ function render({ model, el }) {
   function updatePreview() {
     displayPreview(model.get('preview'));
   }
+  function setWrapWidth(container, width) {
+    const style = getComputedStyle(container);
+    const padding = parseFloat(style.paddingLeft) + parseFloat(style.paddingRight);
+    container.style.setProperty('--symbolica-wrap-width', `${Math.max(0, width - padding)}px`);
+  }
   function displayPreview(value) {
     if (!activePreview || value.request !== activePreview.request) return;
     activePreview.lastValue = value;
@@ -261,6 +266,7 @@ function render({ model, el }) {
       for (const candidate of layouts) {
         previewMath.innerHTML = candidate.html;
         decorateMarkers(candidate, previewMath, value.context);
+        setWrapWidth(previewMath, previewMath.clientWidth);
         const width = Math.max(previewMath.scrollWidth - 4, previewMath.firstElementChild?.getBoundingClientRect().width || 0);
         if (width < smallest) { selected = candidate; smallest = width; }
         // Rendering a tall candidate may introduce a vertical scrollbar and
@@ -269,6 +275,7 @@ function render({ model, el }) {
       }
       previewMath.innerHTML = selected.html;
       decorateMarkers(selected, previewMath, value.context);
+      setWrapWidth(previewMath, previewMath.clientWidth);
       revealFittingParts(layouts, previewMath.clientWidth - 4, previewMath, value.context);
       numberMarkers(previewMath);
       activePreview.page = selected;
@@ -424,17 +431,19 @@ function render({ model, el }) {
     for (const candidate of layouts) {
       content.innerHTML = candidate.html;
       decorateMarkers(candidate);
-      const width = Math.max(content.scrollWidth, content.getBoundingClientRect().width);
       // A taller candidate can give an enclosing notebook cell a scrollbar.
       // Keep the narrowest width observed during this pass, including changes
       // caused by trial layouts, so compacting cannot reopen a wider layout.
       available = Math.min(available, math.clientWidth);
+      setWrapWidth(content, available);
+      const width = Math.max(content.scrollWidth, content.getBoundingClientRect().width);
       if (width < smallestWidth) { page = candidate; smallestWidth = width; }
       if (width <= available + 1) { page = candidate; break; }
     }
     currentLayout = page.layout || 0;
     content.dataset.layout = currentLayout;
     content.innerHTML = page.html;
+    setWrapWidth(content, available);
     math.scrollLeft = 0;
     status.textContent = page.error || `Items ${page.total ? page.start + 1 : 0}–${page.end} of ${page.total} (${page.unit})${page.markers.length ? ' · Detail fitted to width; open a marker for more' : ''}`;
     previous.disabled = !page.previous;
