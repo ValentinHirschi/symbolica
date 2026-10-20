@@ -1,9 +1,12 @@
 """Static MathML embeds remain usable in constrained notebook layouts."""
 
 from html.parser import HTMLParser
+import builtins
+import json
 import unittest
+from unittest.mock import patch
 
-from symbolica import E, PrintMode
+from symbolica import E, FormattedOutput, MathMLViewer, PrintMode
 
 
 class MathDisplay(HTMLParser):
@@ -27,6 +30,58 @@ class MathDisplay(HTMLParser):
 
 
 class MathMLDisplayTests(unittest.TestCase):
+    def test_standalone_viewer_never_imports_notebook_packages(self):
+        expression = E("(1+x)^100").expand()
+        original_import = builtins.__import__
+
+        def checked_import(name, *args, **kwargs):
+            if name.split(".")[0] in {"anywidget", "ipywidgets", "traitlets", "marimo", "IPython"}:
+                raise AssertionError(f"Unexpected notebook dependency: {name}")
+            return original_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", checked_import):
+            viewer = expression.mathml_viewer()
+            self.assertIsInstance(viewer, MathMLViewer)
+            page = json.loads(json.dumps(viewer.page()))
+            self.assertEqual((page["start"], page["end"], page["total"]), (0, 25, 101))
+            self.assertLess(len(page["html"].encode()), 256 * 1024)
+            self.assertTrue(page["markers"])
+            self.assertIsInstance(MathMLViewer.javascript(), str)
+            formatted = expression.formatted(page_size=7)
+            other = formatted.mathml_viewer()
+            self.assertIs(other, formatted.mathml_viewer())
+            self.assertEqual(other.page()["end"], 7)
+            self.assertIsNone(FormattedOutput("plain").mathml_viewer())
+            viewer.close()
+            other.close()
+            with self.assertRaises(RuntimeError):
+                viewer.page()
+
+    def test_worker_messages_page_forward_and_back_without_changing_expression(self):
+        expression = E("(1+x)^100").expand()
+        before = expression.format()
+        viewer = expression.mathml_viewer(page_size=10)
+        field, first = viewer.handle_message({"action": "attach", "view": "worker"})
+        self.assertEqual(field, "page")
+        ranges = [(first["start"], first["end"])]
+        while first["next"] is not None:
+            field, first = json.loads(json.dumps(viewer.handle_message({"action": "next"})))
+            self.assertEqual(field, "page")
+            ranges.append((first["start"], first["end"]))
+        self.assertEqual(ranges[-1][1], 101)
+        self.assertTrue(all(a[1] == b[0] for a, b in zip(ranges, ranges[1:])))
+        for start, end in reversed(ranges[:-1]):
+            field, page = viewer.handle_message({"action": "previous"})
+            self.assertEqual((page["start"], page["end"]), (start, end))
+        self.assertEqual(expression.format(), before)
+        self.assertEqual(viewer.handle_message({"action": "dispose", "view": "worker"})[0], "")
+        viewer.close()
+
+    def test_standalone_page_size_is_bounded(self):
+        for size in (0, 501):
+            with self.assertRaises(ValueError):
+                E("x").mathml_viewer(page_size=size)
+
     def test_static_output_scrolls_html_ancestors_instead_of_math(self):
         for expression in [E("sin(1/x)"), E("sqrt(1+x^2)"), E("x+y+z")]:
             for html in [expression._repr_html_(), expression.formatted()._repr_html_()]:

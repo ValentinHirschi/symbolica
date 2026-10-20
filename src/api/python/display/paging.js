@@ -561,4 +561,57 @@ function render({ model, el }) {
     root.replaceChildren();
   };
 }
+/** Mount the shared pager without a notebook or widget library.
+ * `send(message)` returns the viewer's handle_message() response, synchronously
+ * or as a Promise. Messages and responses contain only JSON-compatible data.
+ * Await close() before releasing the corresponding viewer in the Python worker.
+ */
+export function mount({ el, page, send }) {
+  if (typeof send !== 'function') throw new TypeError('send must be a function');
+  const state = { page, preview: {} };
+  const listeners = new Map();
+  let closed = false;
+  let pending = Promise.resolve();
+  const publish = response => {
+    if (closed || response == null) return;
+    const [field, value] = response;
+    if (field === '') return;
+    if (field !== 'page' && field !== 'preview') throw new Error('Unknown pager response');
+    state[field] = value;
+    for (const callback of listeners.get(`change:${field}`) || []) callback();
+  };
+  const model = {
+    get: name => state[name],
+    on(name, callback) {
+      if (!listeners.has(name)) listeners.set(name, new Set());
+      listeners.get(name).add(callback);
+    },
+    off(name, callback) { listeners.get(name)?.delete(callback); },
+    send(message) {
+      const disposing = message.action === 'dispose';
+      if (closed && !disposing) return;
+      pending = pending.then(async () => {
+        if (closed && !disposing) return;
+        try {
+          publish(await send(message));
+        } catch (error) {
+          publish(['page', { ...state.page, error: String(error).slice(0, 1024) }]);
+        }
+      });
+    },
+  };
+  const cleanup = render({ model, el });
+  return {
+    // Also supports transports that deliver responses through an event listener.
+    update: publish,
+    close() {
+      if (!closed) {
+        closed = true;
+        cleanup();
+        listeners.clear();
+      }
+      return pending;
+    },
+  };
+}
 export default { render };

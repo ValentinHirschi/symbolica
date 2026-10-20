@@ -172,6 +172,10 @@ pub(super) fn viewer(
     )
 }
 
+pub(super) fn is_mathml_viewer(value: &Bound<'_, PyAny>) -> bool {
+    value.is_instance_of::<paging::PythonMathMLViewer>()
+}
+
 pub(super) fn scrollable_html(html: &str) -> String {
     // Keep the MathML root unconstrained. The inner HTML box includes room for
     // glyph ink outside its line box; only the outer box handles scrolling.
