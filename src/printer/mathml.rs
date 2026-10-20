@@ -22,7 +22,9 @@ const MAX_DEPTH: usize = 32;
 const MAX_LEAF_BYTES: usize = 4_096;
 const MAX_TEXT_BYTES: usize = 16_384;
 const PRODUCT_ROW_COST: usize = 48;
-const MATH_OPEN: &str = "<math xmlns=\"http://www.w3.org/1998/Math/MathML\" style=\"max-width:100%;overflow-x:auto;font-family:'STIX Two Math',math;font-size:21px;font-synthesis:none\">";
+// Scroll HTML containers, not the MathML root: a scrollport on inline math can
+// clip glyph ink and create miniature scrollbars in grid layouts.
+const MATH_OPEN: &str = "<math xmlns=\"http://www.w3.org/1998/Math/MathML\" style=\"font-family:'STIX Two Math',math;font-size:21px;font-synthesis:none\">";
 const MATH_CLOSE: &str = "</math>";
 
 pub(crate) struct MathMlPage {

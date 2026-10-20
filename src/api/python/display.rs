@@ -172,17 +172,26 @@ pub(super) fn viewer(
     )
 }
 
+pub(super) fn scrollable_html(html: &str) -> String {
+    // Keep the MathML root unconstrained. The inner HTML box includes room for
+    // glyph ink outside its line box; only the outer box handles scrolling.
+    format!(
+        "<span style=\"display:inline-block;max-width:100%;min-width:0;overflow-x:auto;vertical-align:middle\"><span style=\"display:block;width:max-content;padding:.3em .1em;font-size:21px\">{html}</span></span>"
+    )
+}
+
 pub(super) fn preview(page: &MathMlPage) -> String {
+    let html = scrollable_html(&page.html);
     if page.is_partial() {
         format!(
             "<div>{}<p>Expression preview · items {}–{} of {}. Omitted subexpressions are marked ⋯. Use .formatted(page_size=25) in a live notebook with symbolica[notebook] to navigate.</p></div>",
-            page.html,
+            html,
             page.start + 1,
             page.end,
             page.total
         )
     } else {
-        page.html.clone()
+        html
     }
 }
 
