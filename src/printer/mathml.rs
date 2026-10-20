@@ -770,7 +770,7 @@ impl Renderer<'_> {
         }
         let body = if wrap {
             format!(
-                "<mrow style=\"display:inline-flex;flex-wrap:wrap;align-items:baseline;max-width:min(650px,80vw);row-gap:.5em\">{body}</mrow>"
+                "<mrow style=\"display:inline-flex;flex-wrap:wrap;align-items:baseline;max-width:var(--symbolica-wrap-width,min(650px,80vw));row-gap:.5em\">{body}</mrow>"
             )
         } else {
             Self::row(body)
