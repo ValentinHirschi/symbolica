@@ -8825,9 +8825,9 @@ impl PythonExpression {
     /// functions: Sequence[FunctionDefinition] = []
     ///     Function definitions available to the evaluator.
     /// iterations: int, optional
-    ///     The number of optimization iterations to perform.
+    ///     The number of Horner schemes to try.
     /// cpe_iterations: Optional[int], optional
-    ///     The number of common subexpression elimination iterations to perform.
+    ///     The maximum number of common-pair elimination iterations. If `None`, continue until no more pairs are eliminated.
     /// n_cores: int, optional
     ///     The number of cores to use for the optimization.
     /// verbose: bool, optional
@@ -8848,6 +8848,10 @@ impl PythonExpression {
     ///     The maximum number of entries in the common pair cache.
     /// max_common_pair_distance: int, optional
     ///     The maximum distance between common pairs. Used when clearing cache entries.
+    /// horner_use_cpe: bool, optional
+    ///     If `False` (the default), rank Horner candidates using common-subexpression elimination only.
+    ///     If `True`, also run common-pair elimination for each candidate; this can improve the selected scheme but is more expensive.
+    ///     The selected scheme receives final common-pair elimination in either mode, controlled by `cpe_iterations`.
     #[pyo3(signature =
         (
         params,
@@ -8863,7 +8867,8 @@ impl PythonExpression {
         jit_options = HashMap::default(),
         max_horner_scheme_variables = 500,
         max_common_pair_cache_entries = 1_000_000,
-        max_common_pair_distance = 100),
+        max_common_pair_distance = 100,
+        horner_use_cpe = false),
         )]
     pub fn evaluator(
         &self,
@@ -8881,6 +8886,7 @@ impl PythonExpression {
         max_horner_scheme_variables: usize,
         max_common_pair_cache_entries: usize,
         max_common_pair_distance: usize,
+        horner_use_cpe: bool,
         py: Python,
     ) -> PyResult<PythonExpressionEvaluator> {
         #[cfg(not(feature = "native_code_generation"))]
@@ -8914,6 +8920,7 @@ impl PythonExpression {
 
         let settings = OptimizationSettings {
             horner_iterations: iterations,
+            horner_use_cpe,
             cpe_iterations,
             n_cores,
             verbose: verbose.into(),
@@ -8988,9 +8995,9 @@ impl PythonExpression {
     /// functions: Sequence[FunctionDefinition]
     ///     Function definitions available to the evaluator.
     /// iterations: int
-    ///     The number of optimization passes to run.
+    ///     The number of Horner schemes to try.
     /// cpe_iterations: int | None
-    ///     The number of common subexpression elimination iterations to perform.
+    ///     The maximum number of common-pair elimination iterations. If `None`, continue until no more pairs are eliminated.
     /// n_cores: int
     ///     The number of CPU cores used for parallel optimization.
     /// verbose: bool
@@ -9011,6 +9018,10 @@ impl PythonExpression {
     ///     The maximum number of common-subexpression pairs to cache.
     /// max_common_pair_distance: int
     ///     The maximum distance between factors when searching for common pairs.
+    /// horner_use_cpe: bool
+    ///     If `False` (the default), rank Horner candidates using common-subexpression elimination only.
+    ///     If `True`, also run common-pair elimination for each candidate; this can improve the selected scheme but is more expensive.
+    ///     The selected scheme receives final common-pair elimination in either mode, controlled by `cpe_iterations`.
     #[classmethod]
     #[pyo3(signature =
         (exprs,
@@ -9027,7 +9038,8 @@ impl PythonExpression {
         jit_options = HashMap::default(),
         max_horner_scheme_variables = 500,
         max_common_pair_cache_entries = 1_000_000,
-        max_common_pair_distance = 100)
+        max_common_pair_distance = 100,
+        horner_use_cpe = false)
     )]
     pub fn evaluator_multiple(
         _cls: &Bound<'_, PyType>,
@@ -9046,6 +9058,7 @@ impl PythonExpression {
         max_horner_scheme_variables: usize,
         max_common_pair_cache_entries: usize,
         max_common_pair_distance: usize,
+        horner_use_cpe: bool,
         py: Python,
     ) -> PyResult<PythonExpressionEvaluator> {
         #[cfg(not(feature = "native_code_generation"))]
@@ -9079,6 +9092,7 @@ impl PythonExpression {
 
         let settings = OptimizationSettings {
             horner_iterations: iterations,
+            horner_use_cpe,
             cpe_iterations,
             n_cores,
             verbose: verbose.into(),
