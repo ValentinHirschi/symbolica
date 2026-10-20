@@ -120,15 +120,35 @@ impl Renderer<'_> {
     }
 
     // A bounded estimate for grouping already-rendered factors into native MathML
-    // rows. Count visible text, treating entities as one glyph and ignoring tags.
+    // rows. Ignore XML indentation, but retain whitespace inside text tokens.
     fn visible_cost(fragment: &str) -> usize {
         let mut cost = 0;
         let mut tag = false;
+        let mut tag_start = 0;
+        let mut token_depth = 0usize;
         let mut entity = false;
-        for c in fragment.chars() {
+        for (position, c) in fragment.char_indices() {
             match c {
-                '<' => tag = true,
-                '>' => tag = false,
+                '<' => {
+                    tag = true;
+                    tag_start = position + 1;
+                }
+                '>' => {
+                    let markup = &fragment[tag_start..position];
+                    let name = markup
+                        .trim_start_matches('/')
+                        .split(|c: char| c.is_ascii_whitespace() || c == '/')
+                        .next()
+                        .unwrap_or_default();
+                    if matches!(name, "mi" | "mn" | "mo" | "mtext" | "ms") {
+                        if markup.starts_with('/') {
+                            token_depth = token_depth.saturating_sub(1);
+                        } else if !markup.trim_end().ends_with('/') {
+                            token_depth += 1;
+                        }
+                    }
+                    tag = false;
+                }
                 _ if tag => (),
                 '&' => entity = true,
                 ';' if entity => {
@@ -136,6 +156,7 @@ impl Renderer<'_> {
                     cost += 1;
                 }
                 _ if entity => (),
+                _ if token_depth == 0 && c.is_ascii_whitespace() => (),
                 _ => cost += 1,
             }
             if cost > PRODUCT_ROW_COST {
@@ -143,6 +164,40 @@ impl Renderer<'_> {
             }
         }
         cost
+    }
+
+    fn real_number(&self, text: &str, parts: &mut Option<FractionParts>) -> String {
+        let (sign, value) = text
+            .strip_prefix('-')
+            .map_or(("", text), |v| ("<mo>−</mo>", v));
+        let body = if let Some((n, d)) = value.split_once('/')
+            && n.chars()
+                .all(|c| c.is_ascii_digit() || Some(c) == self.opts.number_thousands_separator)
+            && d.chars()
+                .all(|c| c.is_ascii_digit() || Some(c) == self.opts.number_thousands_separator)
+        {
+            *parts = Some(FractionParts {
+                numerator: Self::row(format!("{sign}{}", Self::token("mn", n))),
+                denominator: ProductFactor {
+                    html: Self::token("mn", d),
+                    needs_fence: false,
+                },
+            });
+            format!(
+                "<mfrac>{}{}</mfrac>",
+                Self::token("mn", n),
+                Self::token("mn", d)
+            )
+        } else if value
+            .chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, '.' | 'e' | 'E' | '+' | '-'))
+        {
+            Self::token("mn", value)
+        } else {
+            // Exotic coefficient domains retain the existing exact notation.
+            Self::token("mtext", value)
+        };
+        Self::row(format!("{sign}{body}"))
     }
 
     fn fraction(
@@ -163,8 +218,7 @@ impl Renderer<'_> {
     fn leading_minus(atom: AtomView<'_>, fragment: &str) -> Option<usize> {
         // A sum's first term can be negative without negating the whole sum.
         // Only our number and product renderers emit a sign for the whole atom.
-        if !matches!(atom, AtomView::Num(_) | AtomView::Mul(_))
-            || atom.mathml_complex_coefficient()
+        if !matches!(atom, AtomView::Num(_) | AtomView::Mul(_)) || atom.mathml_complex_coefficient()
         {
             return None;
         }
@@ -432,38 +486,62 @@ impl Renderer<'_> {
                     return self.hole(atom, path);
                 }
                 self.bytes = self.bytes.saturating_sub(text.len());
-                let (sign, value) = text
-                    .strip_prefix('-')
-                    .map_or(("", text.as_str()), |v| ("<mo>−</mo>", v));
-                let body = if let Some((n, d)) = value.split_once('/')
-                    && n.chars().all(|c| {
-                        c.is_ascii_digit() || Some(c) == self.opts.number_thousands_separator
-                    })
-                    && d.chars().all(|c| {
-                        c.is_ascii_digit() || Some(c) == self.opts.number_thousands_separator
-                    }) {
-                    *parts = Some(FractionParts {
-                        numerator: Self::row(format!("{sign}{}", Self::token("mn", n))),
-                        denominator: ProductFactor {
-                            html: Self::token("mn", d),
-                            needs_fence: false,
-                        },
-                    });
-                    format!(
-                        "<mfrac>{}{}</mfrac>",
-                        Self::token("mn", n),
-                        Self::token("mn", d)
-                    )
-                } else if value
-                    .chars()
-                    .all(|c| c.is_ascii_digit() || matches!(c, '.' | 'e' | 'E' | '+' | '-'))
-                {
-                    Self::token("mn", value)
-                } else {
-                    // Exotic coefficient domains retain the existing exact notation.
-                    Self::token("mtext", value)
+                // Render the components separately: a leading real minus must
+                // never negate the imaginary part, and signs need MathML spacing.
+                let components = match atom {
+                    AtomView::Num(n) => match n.get_coeff_view() {
+                        CoefficientView::Natural(r, d, i, di) if i != 0 => Some((
+                            Rational::from_int_unchecked(r, d).into(),
+                            Rational::from_int_unchecked(i, di).into(),
+                        )),
+                        CoefficientView::Large(r, i) if !i.is_zero() => {
+                            Some((r.to_rat().into(), i.to_rat().into()))
+                        }
+                        CoefficientView::Float(r, i) if !i.is_zero() => {
+                            Some((r.to_float().into(), i.to_float().into()))
+                        }
+                        _ => None,
+                    },
+                    _ => unreachable!(),
                 };
-                Self::row(format!("{sign}{body}"))
+                if let Some((real, imag)) = components {
+                    let real: crate::coefficient::Coefficient = real;
+                    let imag: crate::coefficient::Coefficient = imag;
+                    let real_zero = real.is_zero();
+                    let negative = imag.is_negative();
+                    let imag = if negative { -imag } else { imag };
+                    let scalar = |coefficient| {
+                        let scalar = Atom::num(coefficient);
+                        let text = scalar
+                            .as_view()
+                            .printer(PrintOptions {
+                                mode: PrintMode::Symbolica,
+                                ..self.opts.clone()
+                            })
+                            .to_string();
+                        self.real_number(&text, &mut None)
+                    };
+                    let unit = "<mi>𝑖</mi>";
+                    let imaginary = if imag.is_one() {
+                        unit.to_owned()
+                    } else {
+                        Self::row(format!("{}<mo>&#x2062;</mo>{unit}", scalar(imag)))
+                    };
+                    let real = if real_zero {
+                        String::new()
+                    } else {
+                        scalar(real)
+                    };
+                    let sign = if negative {
+                        "<mo>−</mo>"
+                    } else if !real_zero {
+                        "<mo>+</mo>"
+                    } else {
+                        ""
+                    };
+                    return Self::row(format!("{real}{sign}{imaginary}"));
+                }
+                self.real_number(&text, parts)
             }
             AtomView::Var(v) => self.name(v.get_symbol()),
             AtomView::Pow(p) => {
@@ -951,7 +1029,14 @@ impl Renderer<'_> {
         let mut body = if denominator.is_empty() {
             n
         } else {
-            format!("<mfrac>{n}{}</mfrac>", join(denominator, None))
+            let denominator = join(denominator, None);
+            if multiline {
+                // WebKit mislays fractions with direct table arguments. Group
+                // each table without changing the numerator or denominator.
+                format!("<mfrac>{}{}</mfrac>", Self::row(n), Self::row(denominator))
+            } else {
+                format!("<mfrac>{n}{denominator}</mfrac>")
+            }
         };
         if negative {
             body.insert_str(0, "<mo>−</mo>");
@@ -1164,6 +1249,90 @@ mod tests {
             .as_view()
             .render_mathml_page(&PrintOptions::new(), 0, 25)
             .html
+    }
+
+    #[test]
+    fn complex_components_keep_their_own_signs() {
+        for (input, real, sign, imag) in [
+            ("-2-3i", "<mo>−</mo><mn>2</mn>", "−", "3"),
+            ("-2+3i", "<mo>−</mo><mn>2</mn>", "+", "3"),
+            ("2-3i", "<mn>2</mn>", "−", "3"),
+            ("2+3i", "<mn>2</mn>", "+", "3"),
+        ] {
+            let html = page(input);
+            assert!(
+                html.contains(&format!("<mrow>{real}</mrow><mo>{sign}</mo>")),
+                "{html}"
+            );
+            assert!(html.contains(&format!("<mn>{imag}</mn>")), "{html}");
+            assert!(html.contains("<mi>𝑖</mi>"), "{html}");
+            assert!(!html.contains("<mtext>"), "{html}");
+        }
+        let pure_imaginary = page("-81i/64");
+        assert!(pure_imaginary.contains("<mo>−</mo>"), "{pure_imaginary}");
+        assert!(
+            pure_imaginary.contains("<mfrac><mn>81</mn><mn>64</mn></mfrac>"),
+            "{pure_imaginary}"
+        );
+        assert!(pure_imaginary.contains("<mi>𝑖</mi>"), "{pure_imaginary}");
+    }
+
+    #[test]
+    fn visible_cost_ignores_indentation_but_preserves_token_spaces() {
+        let compact = "<msubsup><mi>k</mi><mn>0</mn><mi>μ</mi></msubsup>";
+        let pretty = "<msubsup>\n    <mi>k</mi>\n    <mn>0</mn>\n    <mi>μ</mi>\n</msubsup>\n";
+        assert_eq!(Renderer::visible_cost(compact), 3);
+        assert_eq!(Renderer::visible_cost(pretty), 3);
+        assert_eq!(Renderer::visible_cost("<mtext>a b</mtext>"), 3);
+        assert_eq!(Renderer::visible_cost("<mtext>a\u{a0}b</mtext>"), 3);
+        assert_eq!(
+            Renderer::visible_cost("<mrow>\n<mi>x</mi>\n<mo>&#x2062;</mo>\n</mrow>"),
+            2
+        );
+    }
+
+    #[test]
+    fn pretty_custom_leaves_pack_the_same_product_rows() {
+        let _ = crate::symbol!(
+            "mathml_row_cost::compact",
+            print = |_, options, _| {
+                options
+                    .mode
+                    .is_mathml()
+                    .then(|| "<msubsup><mi>k</mi><mn>0</mn><mi>μ</mi></msubsup>".into())
+            }
+        );
+        let _ = crate::symbol!(
+            "mathml_row_cost::pretty",
+            print = |_, options, _| {
+                options.mode.is_mathml().then(|| {
+                    "<msubsup>\n    <mi>k</mi>\n    <mn>0</mn>\n    <mi>μ</mi>\n</msubsup>\n".into()
+                })
+            }
+        );
+        for head in ["mathml_row_cost::compact", "mathml_row_cost::pretty"] {
+            let product = (0..10)
+                .map(|i| format!("{head}({i})"))
+                .collect::<Vec<_>>()
+                .join("*");
+            let html = page(&format!("({product})/8"));
+            // Ten short factors share one numerator row; the denominator has
+            // its own row. Pretty XML must not turn this into eleven rows.
+            assert_eq!(html.matches("<mtr>").count(), 2, "{html}");
+            assert!(!html.contains("data-symbolica-marker"), "{html}");
+        }
+    }
+
+    #[test]
+    fn multiline_fraction_tables_are_grouped_for_webkit() {
+        let product = (0..10)
+            .map(|i| format!("x{i}"))
+            .collect::<Vec<_>>()
+            .join("*");
+        let html = page(&format!("({product})/8"));
+        assert!(html.contains("<mfrac><mrow><mtable"), "{html}");
+        assert!(html.contains("</mtable></mrow><mrow><mtable"), "{html}");
+        assert!(html.contains("</mtable></mrow></mfrac>"), "{html}");
     }
 
     #[test]
