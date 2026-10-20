@@ -80,12 +80,38 @@ struct Renderer<'a> {
     markers: Vec<MathMlMarker>,
 }
 
+struct ProductFactor {
+    html: String,
+    needs_fence: bool,
+}
+
+struct FractionParts {
+    numerator: String,
+    denominator: ProductFactor,
+}
+
 impl Renderer<'_> {
     fn row(body: String) -> String {
         format!("<mrow>{body}</mrow>")
     }
     fn fence(body: String) -> String {
-        Self::row(format!("<mo>(</mo>{body}<mo>)</mo>"))
+        // Natural-size parentheses avoid the extra advance reserved for
+        // stretchy operators in browsers. Keep stretching for tall content.
+        let tall = [
+            "<mfrac",
+            "<msqrt",
+            "<mroot",
+            "<msup",
+            "<msub",
+            "<munder",
+            "<mover",
+            "<mtable",
+            "<mmultiscripts",
+        ]
+        .iter()
+        .any(|tag| body.contains(tag));
+        let size = if tall { "" } else { " stretchy=\"false\"" };
+        Self::row(format!("<mo{size}>(</mo>{body}<mo{size}>)</mo>"))
     }
     fn token(tag: &str, text: &str) -> String {
         format!("<{tag}>{}</{tag}>", AnsiHtmlFormatter::escape_html(text))
@@ -120,9 +146,15 @@ impl Renderer<'_> {
     fn fraction(
         numerator: String,
         denominator: String,
-        parts: &mut Option<(String, String)>,
+        parts: &mut Option<FractionParts>,
     ) -> String {
-        *parts = Some((numerator.clone(), denominator.clone()));
+        *parts = Some(FractionParts {
+            numerator: numerator.clone(),
+            denominator: ProductFactor {
+                html: denominator.clone(),
+                needs_fence: false,
+            },
+        });
         format!("<mfrac>{numerator}{denominator}</mfrac>")
     }
 
@@ -339,7 +371,7 @@ impl Renderer<'_> {
         atom: AtomView<'_>,
         path: &mut Vec<usize>,
         depth: usize,
-        parts: &mut Option<(String, String)>,
+        parts: &mut Option<FractionParts>,
         state: PrintState,
     ) -> String {
         // Explicit expansion reveals a little more depth along this branch.
@@ -401,10 +433,13 @@ impl Renderer<'_> {
                     && d.chars().all(|c| {
                         c.is_ascii_digit() || Some(c) == self.opts.number_thousands_separator
                     }) {
-                    *parts = Some((
-                        Self::row(format!("{sign}{}", Self::token("mn", n))),
-                        Self::token("mn", d),
-                    ));
+                    *parts = Some(FractionParts {
+                        numerator: Self::row(format!("{sign}{}", Self::token("mn", n))),
+                        denominator: ProductFactor {
+                            html: Self::token("mn", d),
+                            needs_fence: false,
+                        },
+                    });
                     format!(
                         "<mfrac>{}{}</mfrac>",
                         Self::token("mn", n),
@@ -441,10 +476,9 @@ impl Renderer<'_> {
                         return format!("<msqrt>{b}</msqrt>");
                     }
                     if let CoefficientView::Natural(-1, 1, 0, 1) = n.get_coeff_view() {
-                        let html = Self::fraction("<mn>1</mn>".to_owned(), b.clone(), parts);
-                        if matches!(base, AtomView::Add(_)) {
-                            *parts = Some(("<mn>1</mn>".to_owned(), Self::fence(b)));
-                        }
+                        let html = Self::fraction("<mn>1</mn>".to_owned(), b, parts);
+                        parts.as_mut().unwrap().denominator.needs_fence =
+                            matches!(base, AtomView::Add(_));
                         return html;
                     }
                     if let CoefficientView::Natural(-1, 2, 0, 1) = n.get_coeff_view() {
@@ -804,35 +838,48 @@ impl Renderer<'_> {
                 self.nodes = 0;
             }
             path.pop();
-            if let Some((n, d)) = parts {
-                let n = Self::product_sign(n, &mut negative);
+            if let Some(parts) = parts {
+                let n = Self::product_sign(parts.numerator, &mut negative);
                 if n != "<mn>1</mn>" && n != "<mrow><mn>1</mn></mrow>" {
-                    numerator.push(n);
+                    numerator.push(ProductFactor {
+                        html: n,
+                        needs_fence: false,
+                    });
                 }
-                denominator.push(d);
+                denominator.push(parts.denominator);
             } else {
                 if !child.mathml_complex_coefficient() {
                     html = Self::product_sign(html, &mut negative);
                 }
-                if matches!(child, AtomView::Add(_)) || child.mathml_complex_coefficient() {
-                    html = Self::fence(html);
-                }
                 if html != "<mrow><mn>1</mn></mrow>" {
-                    numerator.push(html);
+                    numerator.push(ProductFactor {
+                        html,
+                        needs_fence: matches!(child, AtomView::Add(_))
+                            || child.mathml_complex_coefficient(),
+                    });
                 }
             }
             end = i + 1;
         }
         self.nested_limit = previous_nested_limit;
         let mut omission = (end < atom.mathml_child_count()).then(|| self.hole_at(atom, path, end));
-        let join = |factors: Vec<String>, tail: Option<String>| {
+        let fraction = !denominator.is_empty();
+        let join = |factors: Vec<ProductFactor>, tail: Option<String>| {
             let mut result = String::new();
             let mut rows = Vec::new();
             let mut row_cost = 0;
             let mut previous_numeric = false;
-            for (i, factor) in factors.iter().enumerate() {
+            // A fraction bar already groups its numerator and denominator.
+            // Fence a sum only when it is multiplied by another factor.
+            let multiple = !fraction || factors.len() > 1 || tail.is_some();
+            for (i, factor) in factors.into_iter().enumerate() {
+                let factor = if multiple && factor.needs_fence {
+                    Self::fence(factor.html)
+                } else {
+                    factor.html
+                };
                 if multiline {
-                    let cost = Self::visible_cost(factor) + usize::from(i > 0);
+                    let cost = Self::visible_cost(&factor) + usize::from(i > 0);
                     if !result.is_empty() && row_cost + cost > PRODUCT_ROW_COST {
                         rows.push(std::mem::take(&mut result));
                         row_cost = 0;
@@ -861,7 +908,7 @@ impl Renderer<'_> {
                         ));
                     }
                 }
-                result.push_str(factor);
+                result.push_str(&factor);
                 if multiline {
                     result.push_str("</mrow>");
                 }
@@ -1097,6 +1144,74 @@ impl<'a> AtomView<'a> {
             total,
             markers: renderer.markers,
             custom: has_custom,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn page(input: &str) -> String {
+        crate::parse!(input)
+            .as_view()
+            .render_mathml_page(&PrintOptions::new(), 0, 25)
+            .html
+    }
+
+    #[test]
+    fn fraction_bars_group_single_sums_without_parentheses() {
+        for input in ["x/(1+z^2)", "(a+b)/(c+d)", "1/(a+b)"] {
+            let html = page(input);
+            assert!(html.contains("<mfrac>"), "{input}: {html}");
+            assert!(!html.contains(">(</mo>"), "{input}: {html}");
+        }
+    }
+
+    #[test]
+    fn products_and_power_bases_keep_required_parentheses() {
+        for (input, pairs) in [
+            ("x/((a+b)*(c+d))", 2),
+            ("x/((a+b)*z)", 1),
+            ("(a+b)*x/(c+d)", 1),
+            ("(a+b)*(c+d)", 2),
+            ("(a+b)^2/(c+d)", 1),
+            ("(a+b)/(c+d)^2", 1),
+        ] {
+            let html = page(input);
+            assert_eq!(html.matches(">(</mo>").count(), pairs, "{input}: {html}");
+            assert_eq!(html.matches(">)</mo>").count(), pairs, "{input}: {html}");
+        }
+        let partial =
+            crate::parse!("(a+b)*(c+d)")
+                .as_view()
+                .render_mathml_page(&PrintOptions::new(), 0, 1);
+        assert_eq!(
+            partial.html.matches(">(</mo>").count(),
+            1,
+            "{}",
+            partial.html
+        );
+        assert!(!partial.markers.is_empty());
+    }
+
+    #[test]
+    fn function_delimiters_use_natural_glyphs_for_flat_arguments() {
+        for input in ["sin(alpha)^2", "f(x+y,2)"] {
+            let html = page(input);
+            assert!(
+                html.contains("<mo stretchy=\"false\">(</mo>"),
+                "{input}: {html}"
+            );
+            assert!(
+                html.contains("<mo stretchy=\"false\">)</mo>"),
+                "{input}: {html}"
+            );
+        }
+        for input in ["f(1/(1+x^2))", "f(sqrt(x))", "f(x^2)"] {
+            let html = page(input);
+            assert!(html.contains("<mo>(</mo>"), "{input}: {html}");
+            assert!(html.contains("<mo>)</mo>"), "{input}: {html}");
         }
     }
 }
