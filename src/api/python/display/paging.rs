@@ -890,12 +890,13 @@ impl PythonMathMLViewer {
     fn _repr_html_(&mut self, py: Python<'_>) -> PyResult<String> {
         let pages = self.current(py)?;
         let page = &pages.main.value;
+        let html = super::scrollable_html(&page.html);
         if page.start == 0 && page.end == page.total && page.markers.is_empty() {
-            return Ok(page.html.clone());
+            return Ok(html);
         }
         Ok(format!(
             "<div>{}<p>Expression preview · items {}–{} of {}. Numbered markers identify omitted subexpressions. Navigation requires a live notebook with symbolica[notebook].</p></div>",
-            page.html,
+            html,
             page.start + 1,
             page.end,
             page.total
