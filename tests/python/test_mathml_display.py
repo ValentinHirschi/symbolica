@@ -1,12 +1,84 @@
 """Static MathML embeds remain usable in constrained notebook layouts."""
 
 from html.parser import HTMLParser
+from fractions import Fraction
 import builtins
 import json
 import unittest
 from unittest.mock import patch
+from xml.etree import ElementTree
 
-from symbolica import E, FormattedOutput, MathMLViewer, PrintMode
+from symbolica import E, S, FormattedOutput, MathMLViewer, PrintMode
+
+
+def mathml_value(html, variables):
+    """Evaluate the arithmetic MathML subset used by these sign regressions."""
+    def tokens(node):
+        tag = node.tag.rsplit("}", 1)[-1]
+        if tag == "mn":
+            yield Fraction(node.text)
+        elif tag == "mi":
+            yield Fraction(variables[node.text])
+        elif tag == "mspace":
+            pass
+        elif tag == "mo":
+            operator = node.text
+            if operator in ("(", ")", "+", "−"):
+                yield operator
+            elif operator not in ("*", "·", "×", "\u2062"):
+                raise AssertionError(f"Unsupported arithmetic operator: {operator}")
+        elif tag == "mfrac":
+            yield value(node[0]) / value(node[1])
+        elif tag == "msup":
+            yield value(node[0]) ** value(node[1])
+        elif tag in ("math", "mrow"):
+            for child in node:
+                yield from tokens(child)
+        else:
+            raise AssertionError(f"Unsupported arithmetic element: {tag}")
+
+    def value(node):
+        items = list(tokens(node))
+        index = 0
+
+        def factor():
+            nonlocal index
+            sign = 1
+            while items[index] in ("+", "−"):
+                if items[index] == "−":
+                    sign = -sign
+                index += 1
+            item = items[index]
+            index += 1
+            if item == "(":
+                item = expression()
+                assert items[index] == ")"
+                index += 1
+            assert isinstance(item, Fraction)
+            return sign * item
+
+        def product():
+            nonlocal index
+            result = factor()
+            while index < len(items) and items[index] not in ("+", "−", ")"):
+                result *= factor()
+            return result
+
+        def expression():
+            nonlocal index
+            result = product()
+            while index < len(items) and items[index] in ("+", "−"):
+                operator = items[index]
+                index += 1
+                term = product()
+                result += term if operator == "+" else -term
+            return result
+
+        result = expression()
+        assert index == len(items)
+        return result
+
+    return value(ElementTree.fromstring(f"<math>{html}</math>"))
 
 
 class MathDisplay(HTMLParser):
@@ -30,6 +102,39 @@ class MathDisplay(HTMLParser):
 
 
 class MathMLDisplayTests(unittest.TestCase):
+    def test_rendered_signs_preserve_the_expression_value(self):
+        polynomial = E("x^4+4*y^4")
+        factored = polynomial.factor()
+        self.assertEqual(factored.expand(), polynomial)
+        expressions = [factored, *map(E, [
+            "(-x+y)*(x+y)",
+            "-(-x+y)*(x+y)",
+            "(-x+y)*(-x+2*y)",
+            "(-x-y)*(x-y)",
+            "(-x+y)/(x+y)",
+            "(-x+y)*(x+y)/(x+2*y)",
+            "(-x+y)*(x+y)+3*x",
+            "-3*x/7",
+            "x-3*y/7",
+            "(-x+y)^2",
+            "(-x+y)^-2",
+            "(-2*x+y)^-3/7",
+        ])]
+        for expression in expressions:
+            viewer = expression.mathml_viewer()
+            try:
+                page = viewer.page()
+                self.assertFalse(page["markers"])
+                outputs = [expression.format(mode=PrintMode.MathML), page["html"]]
+                for x, y in [(2, 3), (-3, 2), (5, -1)]:
+                    expected = expression.replace(S("x"), E(str(x))).replace(S("y"), E(str(y)))
+                    for html in outputs:
+                        with self.subTest(expression=str(expression), x=x, y=y, html=html):
+                            displayed = mathml_value(html, {"x": x, "y": y})
+                            self.assertEqual(E(str(displayed)), expected)
+            finally:
+                viewer.close()
+
     def test_standalone_viewer_never_imports_notebook_packages(self):
         expression = E("(1+x)^100").expand()
         original_import = builtins.__import__
