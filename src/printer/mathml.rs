@@ -160,7 +160,14 @@ impl Renderer<'_> {
         format!("<mfrac>{numerator}{denominator}</mfrac>")
     }
 
-    fn leading_minus(fragment: &str) -> Option<usize> {
+    fn leading_minus(atom: AtomView<'_>, fragment: &str) -> Option<usize> {
+        // A sum's first term can be negative without negating the whole sum.
+        // Only our number and product renderers emit a sign for the whole atom.
+        if !matches!(atom, AtomView::Num(_) | AtomView::Mul(_))
+            || atom.mathml_complex_coefficient()
+        {
+            return None;
+        }
         let mut offset = 0;
         while fragment[offset..].starts_with("<mrow>") || fragment[offset..].starts_with("<mrow ") {
             offset += fragment[offset..].find('>')? + 1;
@@ -170,8 +177,8 @@ impl Renderer<'_> {
             .then_some(offset)
     }
 
-    fn product_sign(mut fragment: String, negative: &mut bool) -> String {
-        if let Some(offset) = Self::leading_minus(&fragment) {
+    fn product_sign(atom: AtomView<'_>, mut fragment: String, negative: &mut bool) -> String {
+        if let Some(offset) = Self::leading_minus(atom, &fragment) {
             *negative = !*negative;
             fragment.replace_range(offset..offset + "<mo>−</mo>".len(), "");
         }
@@ -695,7 +702,7 @@ impl Renderer<'_> {
             }
             if i > start {
                 if matches!(atom, AtomView::Add(_))
-                    && let Some(offset) = Self::leading_minus(&fragment)
+                    && let Some(offset) = Self::leading_minus(child, &fragment)
                 {
                     body.push_str(if wrap {
                         "<mo form=\"infix\">−</mo>"
@@ -841,7 +848,7 @@ impl Renderer<'_> {
             }
             path.pop();
             if let Some(parts) = parts {
-                let n = Self::product_sign(parts.numerator, &mut negative);
+                let n = Self::product_sign(child, parts.numerator, &mut negative);
                 if n != "<mn>1</mn>" && n != "<mrow><mn>1</mn></mrow>" {
                     numerator.push(ProductFactor {
                         html: n,
@@ -850,9 +857,7 @@ impl Renderer<'_> {
                 }
                 denominator.push(parts.denominator);
             } else {
-                if !child.mathml_complex_coefficient() {
-                    html = Self::product_sign(html, &mut negative);
-                }
+                html = Self::product_sign(child, html, &mut negative);
                 if html != "<mrow><mn>1</mn></mrow>" {
                     numerator.push(ProductFactor {
                         html,
