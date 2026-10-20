@@ -680,6 +680,30 @@ impl PythonMathMLViewer {
         Ok(())
     }
 
+    /// Return the bounded initial page and responsive layout alternatives.
+    /// This is ordinary Python data suitable for JSON transport to a frontend.
+    fn page(&mut self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        self._page(py)
+    }
+
+    /// Process a frontend request without a widget connection.
+    /// Returns (field, payload), or None when no update is needed. An empty
+    /// field acknowledges disposal. Pass responses to the JavaScript mount.
+    fn handle_message(
+        &mut self,
+        py: Python<'_>,
+        message: &Bound<'_, PyDict>,
+    ) -> PyResult<Option<(String, Py<PyDict>)>> {
+        self._message(py, message)
+    }
+
+    /// Return the pager ES module, including its dependency-free mount() API.
+    /// Existing notebook adapters use the same module's default render export.
+    #[staticmethod]
+    fn javascript() -> &'static str {
+        include_str!("paging.js")
+    }
+
     #[pyo3(signature = (include=None, exclude=None))]
     fn _repr_mimebundle_(
         slf: Py<Self>,

@@ -564,6 +564,16 @@ impl PythonFormattedOutput {
         Ok(self.render(py, FormattedOutputBackend::Text)?.unwrap())
     }
 
+    /// Return the underlying MathML viewer, when provided by this output.
+    /// This does not import notebook or widget packages. Retain the viewer to
+    /// serve bounded pages, and close it when its display is removed.
+    #[gen_stub(override_return_type(type_repr = "MathMLViewer | None"))]
+    pub fn mathml_viewer(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        Ok(self
+            .notebook_value(py)?
+            .filter(|value| display::is_mathml_viewer(value.bind(py))))
+    }
+
     /// Supply a live display to marimo, or the existing static representation.
     pub fn _display_(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         if let Some(value) = self.notebook_value(py)? {

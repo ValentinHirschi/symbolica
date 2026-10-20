@@ -4460,6 +4460,15 @@ impl PythonExpression {
         ._repr_mimebundle_(py, include, exclude)
     }
 
+    /// Create a bounded MathML viewer without importing notebook or widget packages.
+    /// Use its page(), handle_message(), and javascript() methods to connect a
+    /// custom frontend. The viewer retains the expression until close() is called.
+    #[pyo3(signature = (page_size=25))]
+    #[gen_stub(override_return_type(type_repr = "MathMLViewer"))]
+    pub fn mathml_viewer(slf: Py<Self>, py: Python<'_>, page_size: usize) -> PyResult<Py<PyAny>> {
+        display::viewer(py, slf, display::default_options(), page_size)
+    }
+
     /// Return native MathML or a live pager in marimo notebooks.
     pub fn _display_(slf: Py<Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
         display::formatted(
