@@ -20,6 +20,7 @@ mod native;
 mod python;
 mod rational;
 mod simd;
+mod tracked;
 
 #[cfg(test)]
 mod complex_tests;
@@ -34,6 +35,7 @@ pub use field::{FloatComparisonError, FloatField};
 pub use interval::{ComplexBall, RealBall};
 pub use multiprecision::Float;
 pub use native::F64;
+pub use tracked::{ErrorQuality, TrackedComplex, TrackedComponentPrecision, TrackedPrecision};
 #[cfg(feature = "python")]
 pub use python::{
     PythonComplexFloat, PythonFloat, PythonMultiPrecisionComplex, PythonMultiPrecisionFloat,
