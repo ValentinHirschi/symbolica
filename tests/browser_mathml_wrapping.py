@@ -58,6 +58,50 @@ def sum_page(display="inline-flex", start=0):
 
 
 class MathMLWrappingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_product_cell_padding_survives_measured_repacking(self):
+        async with async_playwright() as playwright:
+            for engine in ("chromium", "firefox", "webkit"):
+                with self.subTest(engine=engine):
+                    options = {"headless": True}
+                    executable = os.environ.get(f"{engine.upper()}_EXECUTABLE")
+                    if executable:
+                        options["executable_path"] = executable
+                    browser = await getattr(playwright, engine).launch(**options)
+                    try:
+                        page = await browser.new_page()
+                        await page.route("https://cdn.jsdelivr.net/**", lambda route: route.abort())
+                        await page.set_content('<div id="host" style="width:260px"></div>')
+                        factors = ''.join(f'<mrow data-symbolica-factor=""><mi>x{i}</mi></mrow>'
+                                          for i in range(20))
+                        html = ('<math><mrow><mo>−</mo><mtable data-symbolica-product="" '
+                                'data-symbolica-row-gap="0.5em" rowspacing="0">'
+                                '<mtr><mtd style="padding:0"><mrow>' + factors
+                                + '</mrow></mtd></mtr></mtable></mrow></math>')
+                        fixture = dict(html=html, start=0, end=20, total=20,
+                                       kind="Product", unit="factors", markers=[], layout=0,
+                                       previous=False, next=None, back=False, page_size=25)
+                        await page.evaluate("""async ({source, fixture}) => {
+                          const url = URL.createObjectURL(new Blob([source], {type:'text/javascript'}));
+                          const {mount} = await import(url);
+                          URL.revokeObjectURL(url);
+                          mount({el:document.querySelector('#host'),page:fixture,send:()=>{}});
+                        }""", {"source": JAVASCRIPT, "fixture": fixture})
+                        await page.wait_for_function("""() => document.querySelector('#host')
+                          .shadowRoot.querySelectorAll('mtable mtr').length > 1""")
+                        padding = await page.locator('#host').evaluate("""host => {
+                          const table = host.shadowRoot.querySelector('mtable');
+                          return [...table.querySelectorAll('mtd')].map(cell => {
+                            const s = getComputedStyle(cell);
+                            return [s.paddingTop,s.paddingRight,s.paddingBottom,s.paddingLeft].map(parseFloat);
+                          });
+                        }""")
+                        self.assertEqual(padding[0], [0, 0, 0, 0], padding)
+                        for top, right, bottom, left in padding[1:]:
+                            self.assertGreater(top, 0, padding)
+                            self.assertEqual([right, bottom, left], [0, 0, 0], padding)
+                    finally:
+                        await browser.close()
+
     async def test_root_sums_resize_and_preview_in_each_engine(self):
         async with async_playwright() as playwright:
             for engine in ("chromium", "firefox", "webkit"):
