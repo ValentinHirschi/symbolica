@@ -1,5 +1,7 @@
 //! Methods for printing rings.
 
+pub(crate) mod mathml;
+
 use std::borrow::Cow;
 
 use ahash::HashMap;

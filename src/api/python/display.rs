@@ -2,6 +2,7 @@
 use super::*;
 use crate::printer::mathml::{self, MathMlCursorCache, MathMlPage};
 
+pub(super) mod algebraic;
 mod provider;
 pub use provider::{MathMLMarker, MathMLPage};
 #[cfg(feature = "python_export")]
@@ -182,6 +183,23 @@ pub(super) fn scrollable_html(html: &str) -> String {
     format!(
         "<span style=\"display:inline-block;max-width:100%;min-width:0;overflow-x:auto;vertical-align:middle\"><span style=\"display:block;width:max-content;padding:.3em .1em;font-size:21px\">{html}</span></span>"
     )
+}
+
+/// Native MathML for algebraic containers, independent of notebook packages.
+pub(super) fn algebraic_fragment_html(fragment: &str) -> String {
+    let html = mathml::document(fragment);
+    // Flex MathML can have ink below its line box. Include that ink inside the
+    // HTML scrollport, and give wrapping rows the container's available width.
+    format!(
+        "<span style=\"display:block;width:100%;max-width:100%;min-width:0;overflow-x:auto\"><span style=\"display:block;padding:.6em .1em;font-size:21px\">{html}</span></span>"
+    )
+}
+
+pub(super) fn algebraic_html(value: &impl mathml::AlgebraicMathMl) -> String {
+    let page = value
+        .page(&default_options(), &[], 0, mathml::DEFAULT_PAGE_SIZE)
+        .unwrap();
+    algebraic_fragment_html(&page.fragment())
 }
 
 pub(super) fn preview(page: &MathMlPage) -> String {
