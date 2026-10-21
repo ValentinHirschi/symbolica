@@ -250,7 +250,81 @@ function render({ model, el }) {
   function setWrapWidth(container, width) {
     const style = getComputedStyle(container);
     const padding = parseFloat(style.paddingLeft) + parseFloat(style.paddingRight);
-    container.style.setProperty('--symbolica-wrap-width', `${Math.max(0, width - padding)}px`);
+    const available = Math.max(0, width - padding);
+    container.style.setProperty('--symbolica-wrap-width', `${available}px`);
+    // The kernel's product rows are a static fallback. Fit the final notation,
+    // including decorated omissions, using the font actually loaded here.
+    // Nested sums in a long factor use the same measured packing policy.
+    for (const table of [...container.querySelectorAll('mtable[data-symbolica-product],mtable[data-symbolica-sum]')].reverse()) {
+      const rows = [...table.children].map(row => {
+        const cell = row.children.length === 1 ? row.firstElementChild : null;
+        const body = cell?.localName === 'mtd' && cell.children.length === 1
+          ? cell.firstElementChild : null;
+        const factors = body?.localName === 'mrow'
+          && [...body.childNodes].every(node => node.nodeType === 1
+            ? node.hasAttribute('data-symbolica-factor') || node.hasAttribute('data-symbolica-term')
+            : node.nodeType === 3 && !node.textContent.trim())
+          ? [...body.children] : [];
+        return { row, factors };
+      });
+      const factorCount = rows.reduce((n, row) => n + row.factors.length, 0);
+      if (factorCount < 2) continue;
+      // Reserve the table's cell padding and surrounding signs, fences and
+      // fraction padding. Other table rows and wrapping sums/products do not
+      // restrict this table to their current arrangement.
+      const rowWidth = Math.max(0, ...rows.map(({ row }) =>
+        row.querySelector(':scope > mtd > mrow')?.getBoundingClientRect().width || 0));
+      const cellOverhead = Math.max(0, table.getBoundingClientRect().width - rowWidth);
+      let overhead = cellOverhead;
+      for (let child = table, parent = child.parentElement;
+          parent && parent !== container; child = parent, parent = parent.parentElement) {
+        if (['mtable', 'mtr', 'mtd'].includes(parent.localName)
+            || (parent.style.display === 'inline-flex' && parent.style.flexWrap === 'wrap')
+            || (parent.localName === 'mrow'
+              && [...parent.children].some(node => node.hasAttribute('data-symbolica-factor') || node.hasAttribute('data-symbolica-term')))) continue;
+        const children = [...parent.children];
+        const childWidth = parent.localName === 'mfrac'
+          ? Math.max(0, ...children.map(node => node.getBoundingClientRect().width))
+          : child.getBoundingClientRect().width;
+        overhead += Math.max(0, parent.getBoundingClientRect().width - childWidth);
+      }
+      const tableLimit = Math.max(0, available - (overhead - cellOverhead));
+      let limit = Math.max(0, available - overhead);
+      for (let attempt = 0; attempt < factorCount; attempt++) {
+        const measured = rows.map(({ row, factors }) => ({
+          row, factors: factors.map(node => ({ node, width: node.getBoundingClientRect().width }))
+        }));
+        const packed = [];
+        let line, lineWidth = 0;
+        for (const { row, factors } of measured) {
+          if (!factors.length) {
+            // In particular, keep a terminal product omission on its own row.
+            packed.push(row);
+            line = null;
+            continue;
+          }
+          for (const factor of factors) {
+            if (!line || lineWidth + factor.width > limit + 0.5) {
+              const row = doc.createElementNS(table.namespaceURI, 'mtr');
+              const cell = doc.createElementNS(table.namespaceURI, 'mtd');
+              line = doc.createElementNS(table.namespaceURI, 'mrow');
+              cell.append(line);
+              row.append(cell);
+              packed.push(row);
+              lineWidth = 0;
+            }
+            line.append(factor.node);
+            lineWidth += factor.width;
+          }
+        }
+        table.replaceChildren(...packed);
+        // WebKit can change intrinsic cell widths when factors move between
+        // rows. Check the packed table too, and only reduce this pass's budget.
+        const overflow = table.getBoundingClientRect().width - tableLimit;
+        if (overflow <= 0.5 || limit === 0) break;
+        limit = Math.max(0, limit - overflow);
+      }
+    }
   }
   function displayPreview(value) {
     if (!activePreview || value.request !== activePreview.request) return;
@@ -278,6 +352,7 @@ function render({ model, el }) {
       setWrapWidth(previewMath, previewMath.clientWidth);
       revealFittingParts(layouts, previewMath.clientWidth - 4, previewMath, value.context);
       numberMarkers(previewMath);
+    setWrapWidth(previewMath, previewMath.clientWidth);
       activePreview.page = selected;
       activePreview.start = selected.start;
       previewMath.scrollTop = previewMath.scrollLeft = 0;
@@ -456,8 +531,10 @@ function render({ model, el }) {
     status.hidden = !page.error && !page.back;
     decorateMarkers(page);
     available = Math.min(available, math.clientWidth);
+    setWrapWidth(content, available);
     revealFittingParts(layouts, available);
     numberMarkers(content);
+    setWrapWidth(content, available);
     content.style.setProperty('--expression-zoom', zoom || 1);
   }
   function numberMarkers(container) {
@@ -521,6 +598,7 @@ function render({ model, el }) {
           const replacement = original.cloneNode(true);
           decorateMarkers(page, replacement, context);
           part.replaceWith(replacement);
+          setWrapWidth(container, fittingWidth);
           const width = context
             ? Math.max(container.scrollWidth - 4, container.firstElementChild?.getBoundingClientRect().width || 0)
             : Math.max(container.scrollWidth, container.getBoundingClientRect().width);
@@ -532,6 +610,7 @@ function render({ model, el }) {
             break;
           }
           replacement.replaceWith(part);
+          setWrapWidth(container, fittingWidth);
         }
       }
       if (!changed) break;
