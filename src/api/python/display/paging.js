@@ -59,7 +59,7 @@ function render({ model, el }) {
     /* MathML glyph ink can extend beyond its line box. Keep that space inside
        the zoomed content so fractions do not create a vertical scrollbar. */
     .math-content {
-      width:fit-content; box-sizing:border-box; padding:.3em .1em;
+      width:fit-content; box-sizing:border-box; padding:.6em .1em;
       font-size:21px; zoom:var(--expression-zoom,1);
     }
     .math-content > math { overflow:visible!important; }

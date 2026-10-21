@@ -2,8 +2,12 @@
 //! never substitutions in the underlying expression.
 use super::*;
 mod cursor;
+mod structured;
 use cursor::MathMlChildren;
 pub(crate) use cursor::MathMlCursorCache;
+pub(crate) use structured::{
+    AlgebraicMathMl, atom_coefficient, polynomial, rational_polynomial, series,
+};
 
 pub(crate) const DEFAULT_PAGE_SIZE: usize = 25;
 // Bounded alternatives let each notebook view fit locally without kernel traffic.
@@ -389,12 +393,9 @@ impl Renderer<'_> {
     }
 
     fn name(&mut self, symbol: Symbol) -> String {
-        let mut name = String::new();
-        symbol
-            .format_with_custom(self.opts, PrintState::new(), false, &mut name)
-            .unwrap();
+        let name = symbol_html(symbol, self.opts);
         self.bytes = self.bytes.saturating_sub(name.len());
-        Self::token("mi", &name)
+        name
     }
 
     fn render(&mut self, atom: AtomView<'_>, path: &mut Vec<usize>, depth: usize) -> String {
@@ -1428,4 +1429,44 @@ mod tests {
             assert!(html.contains("<mo>)</mo>"), "{input}: {html}");
         }
     }
+}
+
+/// A namespace qualifies the identifier, rather than becoming part of its glyph.
+/// Keep it upright and subordinate, while retaining the complete name on hover.
+pub(crate) fn symbol_html(symbol: Symbol, opts: &PrintOptions) -> String {
+    if symbol.get_name().len() > MAX_LEAF_BYTES {
+        return Renderer::token("mtext", "⋯");
+    }
+    let mut plain = opts.clone();
+    plain.mode = PrintMode::Symbolica;
+    plain.color_mode = ColorMode::Never;
+    let mut text = String::new();
+    symbol
+        .format_with_custom(&plain, PrintState::new(), false, &mut text)
+        .unwrap();
+    let name = symbol.get_stripped_name();
+    let prefix = text
+        .strip_suffix(name)
+        .unwrap_or_default()
+        .trim_end_matches("::");
+    let identifier = Renderer::token("mi", name);
+    if prefix.is_empty() {
+        identifier
+    } else {
+        format!(
+            "<msub title=\"{}\">{identifier}<mtext style=\"font-size:.85em\">{}</mtext></msub>",
+            AnsiHtmlFormatter::escape_html(symbol.get_name()),
+            AnsiHtmlFormatter::escape_html(prefix)
+        )
+    }
+}
+
+pub(crate) fn document(fragment: &str) -> String {
+    let open = MATH_OPEN
+        .replace("<math ", "<math display=\"block\" ")
+        .replace(
+            "font-synthesis:none",
+            "font-synthesis:none;display:block;text-align:left",
+        );
+    format!("{open}{fragment}{MATH_CLOSE}")
 }
