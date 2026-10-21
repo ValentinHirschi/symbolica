@@ -31,7 +31,7 @@ def mathml_value(html, variables):
             yield value(node[0]) / value(node[1])
         elif tag == "msup":
             yield value(node[0]) ** value(node[1])
-        elif tag in ("math", "mrow"):
+        elif tag in ("math", "mrow", "mtable", "mtr", "mtd"):
             for child in node:
                 yield from tokens(child)
         else:
@@ -102,6 +102,44 @@ class MathDisplay(HTMLParser):
 
 
 class MathMLDisplayTests(unittest.TestCase):
+    def test_default_viewer_juxtaposes_symbolic_product_factors(self):
+        expression = E("*".join(f"product_spacing::x{i}" for i in range(10)))
+        original = bytes(expression.__getstate__())
+        viewer = expression.mathml_viewer()
+        try:
+            root = ElementTree.fromstring(viewer.page()["html"])
+            operators = [
+                node.text for node in root.iter() if node.tag.rsplit("}", 1)[-1] == "mo"
+            ]
+            self.assertEqual(operators.count("\u2062"), 9)
+            self.assertNotIn("·", operators)
+            explicit = expression.format(
+                mode=PrintMode.MathML, multiplication_operator="×"
+            )
+            self.assertEqual(explicit.count("<mo>×</mo>"), 9)
+            self.assertEqual(bytes(expression.__getstate__()), original)
+        finally:
+            viewer.close()
+
+    def test_adjacent_numeric_custom_fragments_keep_a_separator(self):
+        expression = E("1")
+        for index in range(10):
+            expression *= S(
+                f"numeric_product_spacing::n{index}",
+                print={"mathml": f"<mn>{index + 2}</mn>"},
+            )
+        original = bytes(expression.__getstate__())
+        viewer = expression.mathml_viewer()
+        try:
+            root = ElementTree.fromstring(viewer.page()["html"])
+            operators = [
+                node.text for node in root.iter() if node.tag.rsplit("}", 1)[-1] == "mo"
+            ]
+            self.assertEqual(operators.count("·"), 9)
+            self.assertEqual(bytes(expression.__getstate__()), original)
+        finally:
+            viewer.close()
+
     def test_rendered_signs_preserve_the_expression_value(self):
         polynomial = E("x^4+4*y^4")
         factored = polynomial.factor()
@@ -134,6 +172,24 @@ class MathMLDisplayTests(unittest.TestCase):
                             self.assertEqual(E(str(displayed)), expected)
             finally:
                 viewer.close()
+
+    def test_two_large_factors_retain_all_terms_and_reflow_boundaries(self):
+        left = E("+".join(f"product_left_{i}" for i in range(12)))
+        right = E("+".join(f"product_right_{i}" for i in range(12)))
+        expression = left * right
+        before = expression.format()
+        viewer = expression.mathml_viewer()
+        try:
+            page = viewer.page()
+            self.assertFalse(page["markers"])
+            self.assertEqual((page["start"], page["end"], page["total"]), (0, 2, 2))
+            math = ElementTree.fromstring(page["html"])
+            self.assertEqual(sum("data-symbolica-factor" in node.attrib for node in math.iter()), 2)
+            self.assertEqual(sum(node.tag.endswith("mi") for node in math.iter()), 24)
+            self.assertEqual(sum("data-symbolica-term" in node.attrib for node in math.iter()), 24)
+            self.assertEqual(expression.format(), before)
+        finally:
+            viewer.close()
 
     def test_standalone_viewer_never_imports_notebook_packages(self):
         expression = E("(1+x)^100").expand()

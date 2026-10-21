@@ -771,7 +771,7 @@ impl Renderer<'_> {
             path.pop();
             let term_start = body.len();
             let separator = match atom {
-                AtomView::Add(_) if wrap => "<mo form=\"infix\">+</mo>".to_owned(),
+                AtomView::Add(_) if wrap || expanded_sum => "<mo form=\"infix\">+</mo>".to_owned(),
                 AtomView::Add(_) => "<mo>+</mo>".to_owned(),
                 _ => "<mo>,</mo>".to_owned(),
             };
@@ -782,7 +782,7 @@ impl Renderer<'_> {
                 if matches!(atom, AtomView::Add(_))
                     && let Some(offset) = Self::leading_minus(child, &fragment)
                 {
-                    body.push_str(if wrap {
+                    body.push_str(if wrap || expanded_sum {
                         "<mo form=\"infix\">−</mo>"
                     } else {
                         "<mo>−</mo>"
@@ -830,11 +830,17 @@ impl Renderer<'_> {
             .nested_limit
             .clamp(2, if self.multiline_sums { 6 } else { 8 });
         if expanded_sum && expanded_terms.len() > columns {
-            body = "<mtable columnalign=\"left\" rowspacing=\"0.35em\">".to_owned();
+            body = "<mtable data-symbolica-sum=\"\" columnalign=\"left\" rowspacing=\"0.35em\">"
+                .to_owned();
             for terms in expanded_terms.chunks(columns) {
                 body.push_str(&format!(
                     "<mtr><mtd>{}</mtd></mtr>",
-                    Self::row(terms.concat())
+                    Self::row(
+                        terms
+                            .iter()
+                            .map(|term| { format!("<mrow data-symbolica-term=\"\">{term}</mrow>") })
+                            .collect()
+                    )
                 ));
             }
             body.push_str("</mtable>");
@@ -871,11 +877,11 @@ impl Renderer<'_> {
         start: usize,
         limit: usize,
     ) -> (String, usize) {
-        // Normal inline products retain implicit multiplication. Pages and
-        // explicitly expanded products can span lines; give every subsequent
-        // factor a visible operator so a line break cannot look like a sum.
+        // Every root product needs factor boundaries: even two factors may be
+        // wider than the available notebook cell. The browser repacks these
+        // rows with the loaded font, while static output keeps a bounded fallback.
         let expanded = self.expansions.iter().any(|(p, _)| p == path);
-        let multiline = (depth == 0 && atom.mathml_child_count() > 8) || expanded;
+        let multiline = depth == 0 || expanded;
         let previous_nested_limit = self.nested_limit;
         if expanded {
             // Reveal factors before spending the entire page budget inside the
@@ -981,10 +987,7 @@ impl Renderer<'_> {
                 }
                 let numeric = leading.starts_with("<mn>");
                 if i > 0 && !result.ends_with("<mo>−</mo>") {
-                    if !multiline
-                        && self.opts.multiplication_operator == '·'
-                        && !(previous_numeric && numeric)
-                    {
+                    if self.opts.multiplication_operator == '·' && !(previous_numeric && numeric) {
                         result.push_str("<mo>&#x2062;</mo><mspace width=\"0.167em\"/>");
                     } else {
                         result.push_str(&Self::token(
@@ -1249,6 +1252,41 @@ mod tests {
             .as_view()
             .render_mathml_page(&PrintOptions::new(), 0, 25)
             .html
+    }
+
+    #[test]
+    fn few_large_factors_keep_reflow_boundaries() {
+        let left = (0..12)
+            .map(|i| format!("x{i}"))
+            .collect::<Vec<_>>()
+            .join("+");
+        let right = (0..12)
+            .map(|i| format!("y{i}"))
+            .collect::<Vec<_>>()
+            .join("+");
+        let expression = crate::parse!(&format!("({left})*({right})"));
+        let before = expression.clone();
+        let html = expression
+            .as_view()
+            .render_mathml_page(&PrintOptions::new(), 0, 25);
+        assert!(html.markers.is_empty(), "{}", html.html);
+        assert!(
+            html.html.contains("<mtable data-symbolica-product"),
+            "{}",
+            html.html
+        );
+        assert_eq!(html.html.matches("data-symbolica-factor").count(), 2);
+        assert_eq!(html.html.matches("data-symbolica-sum").count(), 2);
+        assert_eq!(html.html.matches("data-symbolica-term").count(), 24);
+        assert_eq!(expression, before);
+        // Small products use the same scalar spacing as their inline form.
+        let short = crate::parse!("x*y")
+            .as_view()
+            .render_mathml_page(&PrintOptions::new().multiplication_operator('·'), 0, 25)
+            .html;
+        assert_eq!(short.matches("data-symbolica-factor").count(), 2);
+        assert!(short.contains("<mo>&#x2062;</mo>"), "{short}");
+        assert!(!short.contains("<mo>·</mo>"), "{short}");
     }
 
     #[test]
