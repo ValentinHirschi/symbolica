@@ -329,9 +329,10 @@ function render({ model, el }) {
       });
       const factorCount = rows.reduce((n, row) => n + row.factors.length, 0);
       if (factorCount < 2) continue;
-      // Reserve the table's cell padding and surrounding signs, fences and
-      // fraction padding. Other table rows and wrapping sums/products do not
-      // restrict this table to their current arrangement.
+      // Reserve surrounding signs, fences and fraction padding. Products
+      // have zero outer cell padding, including after measured row packing.
+      // Other table rows and wrapping sums/products do not restrict this table
+      // to their current arrangement.
       const rowWidth = Math.max(0, ...rows.map(({ row }) =>
         row.querySelector(':scope > mtd > mrow')?.getBoundingClientRect().width || 0));
       const cellOverhead = Math.max(0, table.getBoundingClientRect().width - rowWidth);
@@ -378,6 +379,16 @@ function render({ model, el }) {
           }
         }
         table.replaceChildren(...packed);
+        const rowGap = table.getAttribute('data-symbolica-row-gap');
+        if (rowGap) {
+          // Repacking creates cells and can move the omission row. Apply the
+          // same internal-only spacing as the kernel's static product layout.
+          for (const [index, row] of packed.entries()) {
+            for (const cell of row.children) {
+              cell.style.padding = index ? `${rowGap} 0 0` : '0';
+            }
+          }
+        }
         // WebKit can change intrinsic cell widths when factors move between
         // rows. Check the packed table too, and only reduce this pass's budget.
         const overflow = table.getBoundingClientRect().width - tableLimit;

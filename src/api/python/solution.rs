@@ -105,12 +105,10 @@ fn solution_html(
         html.push_str("<div style=\"grid-column: 1 / -1\">{}</div>");
     }
     for coordinate in assignments {
-        let variable: PythonExpression = coordinate.0.to_atom().into();
-        let value: PythonExpression = coordinate.1.clone().into();
         html.push_str(&format!(
             "{}<span> = </span>{}",
-            variable._repr_html_()?,
-            value._repr_html_()?,
+            display::embedded_preview(coordinate.0.to_atom().as_view()),
+            display::embedded_preview(coordinate.1.as_view()),
         ));
     }
     if !conditions.is_empty() {
@@ -420,7 +418,9 @@ impl PythonSolution {
             .into_iter()
             .map(|c| c.condition)
             .collect::<Vec<_>>();
-        solution_html(&self.solution, &conditions, None)
+        solution_html(&self.solution, &conditions, None).map(|html| {
+            format!("<div style=\"max-width:100%;min-width:0;overflow-x:auto\">{html}</div>")
+        })
     }
     /// Display the assignments in IPython.
     ///
@@ -603,7 +603,7 @@ impl PythonSolutionSet {
     }
     /// Display all solution branches as aligned equations.
     fn _repr_html_(&self) -> PyResult<String> {
-        let mut html = String::from("<div>");
+        let mut html = String::from("<div style=\"max-width:100%;min-width:0;overflow-x:auto\">");
         if self.set.len() == 0 {
             html.push_str(if self.set.coverage() == SolveCoverage::Complete {
                 "<div>No solutions.</div>"
