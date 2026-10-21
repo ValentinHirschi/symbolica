@@ -138,8 +138,8 @@ fn precision_is_recomputed_and_batch_matches_individual_values() {
 fn fixed_point_enclosures_include_higher_precision_recomputations() {
     let evaluator =
         SixthRootHplEvaluator::new(&[vec![-1, 1, 0, -1, 1, 0], vec![0, 0, 1, 0, 0, 0]]).unwrap();
-    let lower = evaluator.evaluate_balls(100).unwrap();
-    let upper = evaluator.evaluate_balls(250).unwrap();
+    let lower = evaluator.evaluate_balls(1, 100).unwrap();
+    let upper = evaluator.evaluate_balls(1, 250).unwrap();
     for (a, b) in lower.iter().zip(&upper) {
         assert!(a.re.contains(&b.re.center));
         assert!(a.im.contains(&b.im.center));
@@ -223,4 +223,58 @@ fn frozen_independent_weight_six_references() {
             665,
         );
     }
+}
+
+#[cfg(feature = "float-mpfr")]
+#[test]
+fn trilog_fractional_transform_matches_sixth_root_hpls() {
+    // For z=exp(sign*i*pi/3), (1-z)/(1+z)=-sign*i/sqrt(3).
+    // This HPL identity follows by differentiating in z and matching the
+    // z=0 value zeta(3). Check both conjugate endpoints against the independent
+    // native Li_3 series, whose argument lies strictly inside the unit disk.
+    let bits = 720;
+    let reference_bits = 840;
+    let ordinary_map = HashMap::<Atom, Complex<Float>>::new();
+    let tracked_map = HashMap::<Atom, TrackedComplex>::new();
+    let mut ordinary_values = Vec::new();
+    let mut tracked_values = Vec::new();
+    for sign in [1, -1] {
+        let h = |word: &[i8]| sixth_root_hpl(word, sign).unwrap();
+        let mut identity = parse!("zeta(3)") - parse!("zeta(2)") * (h(&[1]) + h(&[-1]));
+        for a in [-1, 1] {
+            for b in [-1, 1] {
+                identity -= parse!("log(2)") * h(&[a, b]);
+                identity -= h(&[a, b, 0]);
+                identity += h(&[a, b, -1]);
+            }
+        }
+        let direct = if sign == 1 {
+            parse!("polylog(3,-𝑖/sqrt(3))")
+        } else {
+            parse!("polylog(3,𝑖/sqrt(3))")
+        };
+        let reference = direct
+            .evaluate_with_prec(&ordinary_map, reference_bits)
+            .unwrap();
+        let reference_ball = direct
+            .evaluate_tracked(&tracked_map, reference_bits)
+            .unwrap();
+        let ordinary = identity.evaluate_with_prec(&ordinary_map, bits).unwrap();
+        let tracked = identity.evaluate_tracked(&tracked_map, bits).unwrap();
+        close(&ordinary, &reference, bits);
+        assert!(reference_ball.ball.contains_complex(&reference));
+        assert!(tracked.ball.contains_ball(&reference_ball.ball));
+        assert_eq!(tracked.error_quality, ErrorQuality::Bounded);
+        assert!(tracked.precision().real.significant_digits().unwrap() >= 200);
+        assert!(tracked.precision().imaginary.significant_digits().unwrap() >= 200);
+        ordinary_values.push(ordinary);
+        tracked_values.push(tracked);
+    }
+    close(&ordinary_values[0].conj(), &ordinary_values[1], bits);
+    assert!(
+        tracked_values[0]
+            .ball
+            .conj()
+            .intersects(&tracked_values[1].ball)
+    );
 }

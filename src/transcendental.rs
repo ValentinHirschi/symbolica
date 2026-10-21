@@ -5,8 +5,14 @@ use std::{
 
 mod cpp;
 mod harmonic_polylog;
+mod projections;
+pub(crate) mod tracked;
 
-pub use harmonic_polylog::{SixthRootHplEvaluator, hpl_at_sixth_root, sixth_root_hpl};
+pub use harmonic_polylog::{
+    EndpointOneGplEvaluator, GplLetter, SixthRootHplEvaluator, endpoint_one_gpl, gpl_at_one,
+    hpl_at_sixth_root, sixth_root_hpl,
+};
+pub use projections::{imaginary_part, real_part};
 
 use crate::{
     atom::{Atom, AtomCore, AtomOrView, AtomView, EvaluationInfo, FunctionBuilder, Symbol},

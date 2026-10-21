@@ -113,6 +113,43 @@ impl TrackedComplex {
         )
     }
 
+    /// Enclose a real decimal value with an explicit absolute error bound.
+    ///
+    /// Both strings are parsed as exact decimals before outward conversion, so
+    /// the supplied error is retained even when it is much smaller than the
+    /// working precision. Conversion rounding is added to that error. The
+    /// imaginary component is exactly zero. The caller selects `error_quality`
+    /// according to the provenance of the bound; this constructor does not
+    /// authenticate external data or turn an estimated error into a proof.
+    ///
+    /// The error must be finite and nonnegative. A zero bound is allowed for a
+    /// known exact decimal, including a proven zero. Precision suffixes are
+    /// rejected because accuracy is supplied explicitly by `absolute_error`.
+    pub fn from_decimal_with_error(
+        value: &str,
+        absolute_error: &str,
+        working_bits: u32,
+        error_quality: ErrorQuality,
+    ) -> Result<Self, String> {
+        let center = parse_decimal(value, working_bits)
+            .map_err(|error| format!("invalid decimal value: {error}"))?
+            .value;
+        let radius = parse_decimal(absolute_error, working_bits)
+            .map_err(|error| format!("invalid absolute error bound: {error}"))?
+            .value;
+        if radius.is_negative() {
+            return Err("absolute error bound must be nonnegative".into());
+        }
+        let ball = RealBall::from_rational_ball(&center, &radius, working_bits);
+        if !ball.is_finite() {
+            return Err("decimal value and error exceed the finite numerical range".into());
+        }
+        Ok(Self::from_ball(
+            Complex::new(ball, RealBall::exact(Float::new(working_bits))),
+            error_quality,
+        ))
+    }
+
     /// Construct a real estimate from a decimal sample with validated digits.
     ///
     /// The source radius is one unit in the last validated significant decimal
@@ -128,52 +165,16 @@ impl TrackedComplex {
         if validated_decimal_digits == 0 {
             return Err("source decimal precision must be positive".into());
         }
-        // Validate precision and syntax with the common float parser first.
-        let parsed = Float::parse(value, Some(working_bits))?;
-        if !parsed.is_finite() || value.contains('`') {
-            return Err("source value must be a finite decimal without a precision suffix".into());
-        }
-        let value = value.trim();
-        let (mantissa, exponent) = value
-            .split_once(['e', 'E'])
-            .map_or((value, "0"), |(m, e)| (m, e));
-        let exponent: i64 = exponent
-            .parse()
-            .map_err(|_| "source decimal exponent is out of range")?;
-        let fractional_digits = mantissa.split_once('.').map_or(0, |(_, f)| f.len());
-        let fractional_digits =
-            i64::try_from(fractional_digits).map_err(|_| "source decimal is too long")?;
-        let scale = exponent
-            .checked_sub(fractional_digits)
-            .ok_or("source decimal exponent is out of range")?;
-        let digits = mantissa.replace('.', "");
-        let integer: Integer = digits.parse().map_err(|_| "invalid source decimal")?;
-        if !integer.is_zero() && parsed.is_zero() {
-            return Err("source decimal underflows the supported exponent range".into());
-        }
-        let center = if integer.is_zero() {
-            Rational::from(0)
-        } else {
-            Rational::from(integer.clone()) * decimal_power(scale)
-        };
-        let significant_digits = digits
-            .trim_start_matches(['+', '-'])
-            .trim_start_matches('0')
-            .len();
-        let radius_scale = if integer.is_zero() {
-            -i64::from(validated_decimal_digits)
-        } else {
-            scale
-                .checked_add(
-                    i64::try_from(significant_digits).map_err(|_| "source decimal is too long")?,
-                )
-                .and_then(|s| s.checked_sub(i64::from(validated_decimal_digits)))
-                .ok_or("source decimal uncertainty exponent is out of range")?
-        };
+        let parsed = parse_decimal(value, working_bits)?;
+        let radius_scale = parsed
+            .magnitude
+            .unwrap_or(0)
+            .checked_sub(i64::from(validated_decimal_digits))
+            .ok_or("source decimal uncertainty exponent is out of range")?;
         let radius = decimal_power(radius_scale);
         Ok(Self::from_ball(
             Complex::new(
-                RealBall::from_rational_ball(&center, &radius, working_bits),
+                RealBall::from_rational_ball(&parsed.value, &radius, working_bits),
                 RealBall::exact(Float::new(working_bits)),
             ),
             ErrorQuality::Estimated,
@@ -340,6 +341,55 @@ impl TrackedComplex {
     }
 }
 
+struct ParsedDecimal {
+    value: Rational,
+    /// For nonzero x, the integer d such that 10^(d-1) <= |x| < 10^d.
+    magnitude: Option<i64>,
+}
+
+fn parse_decimal(value: &str, working_bits: u32) -> Result<ParsedDecimal, String> {
+    // Use the common parser for syntax, working precision, and exponent-range
+    // validation, but never use its rounded value to construct the rational.
+    let parsed = Float::parse(value, Some(working_bits))?;
+    if !parsed.is_finite() || value.contains('`') {
+        return Err("expected a finite decimal without a precision suffix".into());
+    }
+    let value = value.trim();
+    let (mantissa, exponent) = value
+        .split_once(['e', 'E'])
+        .map_or((value, "0"), |(m, e)| (m, e));
+    let exponent: i64 = exponent
+        .parse()
+        .map_err(|_| "decimal exponent is out of range")?;
+    let fractional_digits = mantissa.split_once('.').map_or(0, |(_, f)| f.len());
+    let fractional_digits = i64::try_from(fractional_digits).map_err(|_| "decimal is too long")?;
+    let scale = exponent
+        .checked_sub(fractional_digits)
+        .ok_or("decimal exponent is out of range")?;
+    let digits = mantissa.replace('.', "");
+    let integer: Integer = digits.parse().map_err(|_| "invalid decimal")?;
+    if integer.is_zero() {
+        return Ok(ParsedDecimal {
+            value: Rational::from(0),
+            magnitude: None,
+        });
+    }
+    if parsed.is_zero() {
+        return Err("decimal underflows the supported exponent range".into());
+    }
+    let significant_digits = digits
+        .trim_start_matches(['+', '-'])
+        .trim_start_matches('0')
+        .len();
+    let magnitude = scale
+        .checked_add(i64::try_from(significant_digits).map_err(|_| "decimal is too long")?)
+        .ok_or("decimal magnitude exponent is out of range")?;
+    Ok(ParsedDecimal {
+        value: Rational::from(integer) * decimal_power(scale),
+        magnitude: Some(magnitude),
+    })
+}
+
 fn binary_power(exponent: i64) -> Rational {
     let power = Integer::from(2).pow(exponent.unsigned_abs());
     if exponent >= 0 {
@@ -379,7 +429,7 @@ fn component_precision(value: &RealBall, quality: ErrorQuality) -> TrackedCompon
     } else {
         let radius = value.radius.to_rational().abs();
         let min_magnitude = value.center.to_rational().abs() - &radius;
-        if min_magnitude <= Rational::from(0) {
+        if min_magnitude <= 0 {
             None
         } else {
             let bits = floor_log2(&(min_magnitude / radius)) + 1;
@@ -506,6 +556,102 @@ mod tests {
         );
         assert_eq!(high.error_quality, ErrorQuality::Estimated);
         assert!(high.precision().imaginary.exact_zero);
+    }
+
+    #[test]
+    fn explicit_decimal_bound_keeps_twenty_thousand_digit_exponent() {
+        let expected = decimal_power(-20_000);
+        for bits in [32, 256] {
+            let value = TrackedComplex::from_decimal_with_error(
+                "0",
+                "1e-20000",
+                bits,
+                ErrorQuality::Bounded,
+            )
+            .unwrap();
+            let radius = value.ball.re.radius.to_rational();
+            assert!(radius >= expected);
+            assert!(radius < &expected * &Rational::from((1001, 1000)));
+            assert!(!value.precision().real.exact_zero);
+            assert!(value.precision().imaginary.exact_zero);
+            assert_eq!(value.error_quality, ErrorQuality::Bounded);
+            assert!(value.to_float_with_precision().is_err());
+        }
+    }
+
+    #[test]
+    fn explicit_decimal_bound_includes_conversion_and_export_rounding() {
+        let center_text = "1.23456789012345678901234567890123456789";
+        let center = parse_decimal(center_text, 256).unwrap().value;
+        let error = decimal_power(-25);
+        for bits in [32, 256] {
+            let value = TrackedComplex::from_decimal_with_error(
+                center_text,
+                "1e-25",
+                bits,
+                ErrorQuality::Estimated,
+            )
+            .unwrap();
+            let rounded = value.rounded(Some(20)).unwrap();
+            for enclosure in [&value.ball.re, &rounded.ball.re] {
+                let converted_center = enclosure.center.to_rational();
+                let converted_radius = enclosure.radius.to_rational();
+                assert!(&converted_center - &converted_radius <= &center - &error);
+                assert!(converted_center + converted_radius >= &center + &error);
+            }
+            assert_eq!(rounded.error_quality, ErrorQuality::Estimated);
+            assert!(
+                rounded.precision().real.significant_bits.unwrap() >= rounded.ball.re.center.prec()
+            );
+        }
+        let exact_zero =
+            TrackedComplex::from_decimal_with_error("0.0e-50", "0", 128, ErrorQuality::Bounded)
+                .unwrap();
+        assert!(exact_zero.precision().real.exact_zero);
+        assert!(exact_zero.to_float_with_precision().unwrap().is_zero());
+        let exact_point =
+            TrackedComplex::from_decimal_with_error("1.25", "0", 128, ErrorQuality::Bounded)
+                .unwrap();
+        assert!(exact_point.ball.re.radius.is_zero());
+    }
+
+    #[test]
+    fn explicit_decimal_bounds_reject_invalid_inputs_and_precision_suffixes() {
+        for value in ["NaN", "inf", "-inf", "1e", "1/2", "1.25`20000"] {
+            assert!(
+                TrackedComplex::from_decimal_with_error(value, "0", 128, ErrorQuality::Bounded)
+                    .is_err()
+            );
+        }
+        for error in ["-1", "-1e-20000", "NaN", "inf", "1e", "0.01`20000"] {
+            assert!(
+                TrackedComplex::from_decimal_with_error("1", error, 128, ErrorQuality::Bounded)
+                    .is_err()
+            );
+        }
+        assert!(
+            TrackedComplex::from_decimal_with_error("1", "0", 0, ErrorQuality::Bounded).is_err()
+        );
+    }
+
+    #[test]
+    fn source_decimal_fallback_preserves_significant_place_conventions() {
+        for literal in ["1.23450", "123.450e-2", "0001.2345000E+0", "+.0012345e3"] {
+            let value = TrackedComplex::from_source_decimal(literal, 5, 128).unwrap();
+            let explicit = TrackedComplex::from_decimal_with_error(
+                "1.2345",
+                "1e-4",
+                128,
+                ErrorQuality::Estimated,
+            )
+            .unwrap();
+            assert_eq!(value.ball, explicit.ball);
+        }
+        let fallback_zero = TrackedComplex::from_source_decimal("0.0e+40", 5, 128).unwrap();
+        let explicit_zero =
+            TrackedComplex::from_decimal_with_error("0", "1e-5", 128, ErrorQuality::Estimated)
+                .unwrap();
+        assert_eq!(fallback_zero.ball, explicit_zero.ball);
     }
 
     #[test]

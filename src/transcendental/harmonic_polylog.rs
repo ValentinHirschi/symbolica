@@ -12,13 +12,18 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, OnceLock};
 
 use crate::atom::{Atom, AtomView, EvaluationInfo, Symbol};
-use crate::domains::float::{Complex, ComplexBall, Float, Real, RealBall, SingleFloat};
+use crate::domains::float::{
+    Complex, ComplexBall, ErrorQuality, Float, Real, RealBall, SingleFloat, TrackedComplex,
+};
 use crate::domains::integer::Integer;
 use crate::domains::rational::Rational;
 use crate::state::StateInitializer;
 use crate::{function, get_symbol, symbol};
 
 use super::SymbolCache;
+
+mod endpoint_one;
+pub use endpoint_one::{EndpointOneGplEvaluator, GplLetter, endpoint_one_gpl, gpl_at_one};
 
 const MAX_WEIGHT: usize = 6;
 const MAX_WORDS: usize = 4096;
@@ -38,7 +43,14 @@ crate::_inventory::submit! {
         let _ = symbol!("hpl_indices";);
         let _ = symbol!(
             "hpl_at_sixth_root",
-            eval = EvaluationInfo::constant(evaluate_constant).with_tags(2)
+            eval = EvaluationInfo::constant(evaluate_constant)
+                .with_tags(2)
+                .register_tracked(|tags, arguments, bits| {
+                    if !arguments.is_empty() {
+                        return Err("sixth-root HPL expects exactly two symbolic tags".into());
+                    }
+                    evaluate_tracked_constant(tags, bits)
+                })
         );
     }, &["symbolica"])
 }
@@ -77,7 +89,39 @@ fn validate_sign(sign: i8) -> Result<(), String> {
 
 type ConstantCache = BTreeMap<(Vec<i8>, u32), Complex<Float>>;
 
-fn evaluate_constant(tags: &[AtomView], bits: u32) -> Result<Complex<Float>, String> {
+fn evaluate_tracked_constant(tags: &[AtomView], bits: u32) -> Result<TrackedComplex, String> {
+    let (indices, sign) = parse_tags(tags)?;
+    type BallCache = BTreeMap<(Vec<i8>, u32), ComplexBall>;
+    static CACHE: OnceLock<Mutex<BallCache>> = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    let key = (indices.clone(), bits);
+    let cached = cache
+        .lock()
+        .map_err(|_| "HPL tracked cache is poisoned")?
+        .get(&key)
+        .cloned();
+    let mut value = if let Some(value) = cached {
+        value
+    } else {
+        let value = SixthRootHplEvaluator::new(&[indices])?
+            .evaluate_balls(1, bits)?
+            .remove(0);
+        let mut cache = cache.lock().map_err(|_| "HPL tracked cache is poisoned")?;
+        if cache.len() >= MAX_WORDS
+            || cache.keys().map(|(_, p)| u64::from(*p)).sum::<u64>() + u64::from(bits) > 64_000_000
+        {
+            cache.clear();
+        }
+        cache.insert(key, value.clone());
+        value
+    };
+    if sign == -1 {
+        value.im = -value.im;
+    }
+    Ok(TrackedComplex::from_ball(value, ErrorQuality::Bounded))
+}
+
+fn parse_tags(tags: &[AtomView]) -> Result<(Vec<i8>, i8), String> {
     let [word, sign] = tags else {
         return Err("sixth-root HPL expects an index tag and a sign".into());
     };
@@ -98,6 +142,11 @@ fn evaluate_constant(tags: &[AtomView], bits: u32) -> Result<Complex<Float>, Str
         .ok_or("sixth-root HPL sign must be exactly -1 or +1")?;
     validate_word(&indices)?;
     validate_sign(sign)?;
+    Ok((indices, sign))
+}
+
+fn evaluate_constant(tags: &[AtomView], bits: u32) -> Result<Complex<Float>, String> {
+    let (indices, sign) = parse_tags(tags)?;
     static CACHE: OnceLock<Mutex<ConstantCache>> = OnceLock::new();
     let cache = CACHE.get_or_init(Default::default);
     let key = (indices.clone(), bits);
@@ -189,6 +238,7 @@ impl Pole {
     fn complement(self) -> Self {
         match self {
             Self::Zero => Self::One,
+            Self::One => Self::Zero,
             Self::Plus => Self::ComplementPlus,
             Self::Minus => Self::ComplementMinus,
             _ => unreachable!(),
@@ -261,6 +311,25 @@ struct Node {
     weight: usize,
 }
 
+fn intern_poles(
+    word: &[Pole],
+    nodes: &mut Vec<Node>,
+    indices: &mut BTreeMap<Vec<Pole>, usize>,
+) -> usize {
+    if let Some(&index) = indices.get(word) {
+        return index;
+    }
+    let suffix = intern_poles(&word[1..], nodes, indices);
+    let index = nodes.len() + 1;
+    nodes.push(Node {
+        pole: word[0],
+        suffix,
+        weight: word.len(),
+    });
+    indices.insert(word.to_vec(), index);
+    index
+}
+
 /// A reusable batch of sixth-root HPLs with a shared suffix-series graph.
 ///
 /// Batch evaluation avoids recalculating common GPL suffixes. Output order
@@ -292,24 +361,6 @@ impl SixthRootHplEvaluator {
             .collect::<BTreeSet<_>>();
         let mut nodes = vec![];
         let mut indices = BTreeMap::from([(vec![], 0)]);
-        fn intern(
-            word: &[Pole],
-            nodes: &mut Vec<Node>,
-            indices: &mut BTreeMap<Vec<Pole>, usize>,
-        ) -> usize {
-            if let Some(&index) = indices.get(word) {
-                return index;
-            }
-            let suffix = intern(&word[1..], nodes, indices);
-            let index = nodes.len() + 1;
-            nodes.push(Node {
-                pole: word[0],
-                suffix,
-                weight: word.len(),
-            });
-            indices.insert(word.to_vec(), index);
-            index
-        }
         let mut regular = BTreeMap::new();
         for word in regular_words {
             // G(a1,...,an;1) = sum_j (-1)^j
@@ -329,8 +380,8 @@ impl SixthRootHplEvaluator {
                         .map(|p| p.complement())
                         .collect::<Vec<_>>();
                     (
-                        intern(&left, &mut nodes, &mut indices),
-                        intern(&poles[split..], &mut nodes, &mut indices),
+                        intern_poles(&left, &mut nodes, &mut indices),
+                        intern_poles(&poles[split..], &mut nodes, &mut indices),
                         if split % 2 == 0 { hpl_sign } else { -hpl_sign },
                     )
                 })
@@ -364,7 +415,7 @@ impl SixthRootHplEvaluator {
         let mut guard = 64;
         for _ in 0..4 {
             let work = bits.checked_add(guard).ok_or("HPL precision overflow")?;
-            let balls = self.evaluate_balls(work)?;
+            let balls = self.evaluate_balls(1, work)?;
             if balls
                 .iter()
                 .all(|b| component_is_accurate(&b.re, bits) && component_is_accurate(&b.im, bits))
@@ -387,76 +438,32 @@ impl SixthRootHplEvaluator {
         Err("sixth-root HPL could not enclose the requested accuracy after increasing guard precision".into())
     }
 
-    fn evaluate_balls(&self, bits: u32) -> Result<Vec<ComplexBall>, String> {
-        let weight = self.nodes.iter().map(|n| n.weight).max().unwrap_or(1);
-        let mut n_terms = bits.max((4 * weight) as u32);
-        // |coefficient_n| <= (n+1)^(weight-1). For n >= 4*weight the
-        // successive majorant ratio is <3/4, giving a geometric tail bound.
-        while n_terms + 1 < bits + 2 + (weight as u32 - 1) * ceil_log2(n_terms + 2) {
-            n_terms += 1;
+    /// Evaluate once, retaining the component error enclosures at `bits` working precision.
+    ///
+    /// Unlike [`Self::evaluate`], this method does not retry with increased guard
+    /// precision and does not discard the radii. Cancellation may reduce the
+    /// achieved accuracy; callers should inspect the returned balls. The sign
+    /// selects the sixth-root endpoint and conjugates the complete enclosure.
+    pub fn evaluate_balls(&self, sign: i8, bits: u32) -> Result<Vec<ComplexBall>, String> {
+        validate_sign(sign)?;
+        if !(2..=MAX_BITS).contains(&bits) {
+            return Err(format!(
+                "sixth-root HPL precision must be between 2 and {MAX_BITS} bits"
+            ));
         }
-        if u64::from(n_terms) * self.nodes.len() as u64 > MAX_SERIES_WORK {
-            return Err(
-                "sixth-root HPL series work limit exceeded; split the batch or reduce precision"
-                    .into(),
-            );
-        }
-        let scale = Integer::one() << bits;
-        let mut previous = vec![Fixed::default(); self.nodes.len() + 1];
-        let mut current = previous.clone();
-        let mut states = previous.clone();
-        let mut sums = previous.clone();
-        previous[0].a = scale.clone();
-        sums[0].a = scale.clone();
-        for n in 1..=n_terms {
-            for (offset, node) in self.nodes.iter().enumerate() {
-                let index = offset + 1;
-                // b_w(n) = [t^n] G(w;t) / 2^n. For a nonzero first pole a,
-                // n*b_w(n) = (1/(2*a))*((n-1)*b_w(n-1)-b_suffix(n-1)).
-                // A zero first pole instead divides b_suffix(n) by n.
-                current[index] = if node.pole == Pole::Zero {
-                    current[node.suffix].div(i64::from(n))
-                } else {
-                    states[index] = node
-                        .pole
-                        .multiply_half_inverse(states[index].sub(&previous[node.suffix]));
-                    states[index].div(i64::from(n))
-                };
-                sums[index].add_assign(&current[index]);
+        let mut values = self.evaluate_positive_balls(bits)?;
+        if sign == -1 {
+            for value in &mut values {
+                value.im = -value.im.clone();
             }
-            std::mem::swap(&mut previous, &mut current);
-            current[0] = Fixed::default();
         }
-        let rational = |value: Integer| Rational::from((value, scale.clone()));
-        let sqrt_integer =
-            Integer::from((Integer::from(3) << (2 * bits)).to_multi_prec().root_ref(2));
-        let sqrt3 = RealBall::from_rational_bounds(
-            &rational(sqrt_integer.clone()),
-            &rational(sqrt_integer + 1),
-            bits,
-        );
+        Ok(values)
+    }
+
+    fn evaluate_positive_balls(&self, bits: u32) -> Result<Vec<ComplexBall>, String> {
+        let gpls = evaluate_gpl_nodes(&self.nodes, bits)?;
         let zero = RealBall::exact(Float::new(bits));
         let one = RealBall::exact(Float::with_val(bits, 1));
-        let gpls = sums
-            .into_iter()
-            .enumerate()
-            .map(|(index, value)| {
-                // If suffix coefficient error <=2*(d-1) ulps, the n*a_n state
-                // accumulates <=n*(2*d-1) ulps, and division by n adds <1.
-                // Thus each coefficient has <=2*d ulps error, and the sum <=2*d*N.
-                // The additional ulp encloses the exact analytic tail.
-                let error = if index == 0 {
-                    0
-                } else {
-                    2 * self.nodes[index - 1].weight as u64 * u64::from(n_terms) + 1
-                };
-                let radius = rational(Integer::from(error));
-                Complex::new(
-                    RealBall::from_rational_ball(&rational(value.a), &radius, bits),
-                    RealBall::from_rational_ball(&rational(value.b), &radius, bits) * &sqrt3,
-                )
-            })
-            .collect::<Vec<_>>();
         let mut masters = BTreeMap::new();
         for (word, terms) in &self.regular {
             let mut value = Complex::new(zero.clone(), zero.clone());
@@ -491,6 +498,75 @@ impl SixthRootHplEvaluator {
             })
             .collect())
     }
+}
+
+fn evaluate_gpl_nodes(nodes: &[Node], bits: u32) -> Result<Vec<ComplexBall>, String> {
+    let weight = nodes.iter().map(|n| n.weight).max().unwrap_or(1);
+    let mut n_terms = bits.max((4 * weight) as u32);
+    // |coefficient_n| <= (n+1)^(weight-1). For n >= 4*weight the
+    // successive majorant ratio is <3/4, giving a geometric tail bound.
+    while n_terms + 1 < bits + 2 + (weight as u32 - 1) * ceil_log2(n_terms + 2) {
+        n_terms += 1;
+    }
+    if u64::from(n_terms) * nodes.len() as u64 > MAX_SERIES_WORK {
+        return Err(
+            "sixth-root HPL series work limit exceeded; split the batch or reduce precision".into(),
+        );
+    }
+    let scale = Integer::one() << bits;
+    let mut previous = vec![Fixed::default(); nodes.len() + 1];
+    let mut current = previous.clone();
+    let mut states = previous.clone();
+    let mut sums = previous.clone();
+    previous[0].a = scale.clone();
+    sums[0].a = scale.clone();
+    for n in 1..=n_terms {
+        for (offset, node) in nodes.iter().enumerate() {
+            let index = offset + 1;
+            // b_w(n) = [t^n] G(w;t) / 2^n. For a nonzero first pole a,
+            // n*b_w(n) = (1/(2*a))*((n-1)*b_w(n-1)-b_suffix(n-1)).
+            // A zero first pole instead divides b_suffix(n) by n.
+            current[index] = if node.pole == Pole::Zero {
+                current[node.suffix].div(i64::from(n))
+            } else {
+                states[index] = node
+                    .pole
+                    .multiply_half_inverse(states[index].sub(&previous[node.suffix]));
+                states[index].div(i64::from(n))
+            };
+            sums[index].add_assign(&current[index]);
+        }
+        std::mem::swap(&mut previous, &mut current);
+        current[0] = Fixed::default();
+    }
+    let rational = |value: Integer| Rational::from((value, scale.clone()));
+    let sqrt_integer = Integer::from((Integer::from(3) << (2 * bits)).to_multi_prec().root_ref(2));
+    let sqrt3 = RealBall::from_rational_bounds(
+        &rational(sqrt_integer.clone()),
+        &rational(sqrt_integer + 1),
+        bits,
+    );
+    let gpls = sums
+        .into_iter()
+        .enumerate()
+        .map(|(index, value)| {
+            // If suffix coefficient error <=2*(d-1) ulps, the n*a_n state
+            // accumulates <=n*(2*d-1) ulps, and division by n adds <1.
+            // Thus each coefficient has <=2*d ulps error, and the sum <=2*d*N.
+            // The additional ulp encloses the exact analytic tail.
+            let error = if index == 0 {
+                0
+            } else {
+                2 * nodes[index - 1].weight as u64 * u64::from(n_terms) + 1
+            };
+            let radius = rational(Integer::from(error));
+            Complex::new(
+                RealBall::from_rational_ball(&rational(value.a), &radius, bits),
+                RealBall::from_rational_ball(&rational(value.b), &radius, bits) * &sqrt3,
+            )
+        })
+        .collect::<Vec<_>>();
+    Ok(gpls)
 }
 
 fn ceil_log2(value: u32) -> u32 {
