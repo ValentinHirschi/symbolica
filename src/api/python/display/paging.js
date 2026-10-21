@@ -63,6 +63,9 @@ function render({ model, el }) {
       font-size:21px; zoom:var(--expression-zoom,1);
     }
     .math-content > math { overflow:visible!important; }
+    /* MathML Core uses CSS alignment; columnalign alone is not portable. */
+    mtable[data-symbolica-product] > mtr > mtd,
+    mtable[data-symbolica-sum] > mtr > mtd { text-align:left; }
     .zoom-feedback {
       position:absolute; top:4px; right:4px; padding:3px 8px; border-radius:4px;
       background:var(--background,var(--jp-layout-color1,#fff));
