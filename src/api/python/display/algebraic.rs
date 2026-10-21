@@ -11,7 +11,13 @@ impl<T: AlgebraicMathMl + Send> MathMLPageSource for Source<T> {
     fn page(&mut self, _: Python<'_>, request: MathMLPageRequest<'_>) -> PyResult<MathMLPage> {
         let page = self
             .value
-            .page(&self.options, request.path, request.start, request.size)
+            .page_expanded(
+                &self.options,
+                request.path,
+                request.start,
+                request.size,
+                request.expansions,
+            )
             .ok_or_else(|| exceptions::PyValueError::new_err("Unknown algebraic subexpression"))?;
         let mut result = MathMLPage::new(page.html, page.start, page.end, page.total);
         result.kind = self.value.kind().into();
@@ -37,6 +43,7 @@ pub(in crate::api::python) fn viewer<T: AlgebraicMathMl + Send + 'static>(
 ) -> PyResult<Py<PyAny>> {
     MathMLViewer::new(Source { value, options })
         .page_size(size)
+        .supports_expansion(true)
         .into_python(py)
 }
 

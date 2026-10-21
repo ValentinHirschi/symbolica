@@ -362,6 +362,16 @@ pub(crate) trait AlgebraicMathMl: SelfRing {
         start: usize,
         size: usize,
     ) -> Option<MathMlPage>;
+    fn page_expanded(
+        &self,
+        opts: &PrintOptions,
+        path: &[usize],
+        start: usize,
+        size: usize,
+        _expansions: &[(Vec<usize>, usize)],
+    ) -> Option<MathMlPage> {
+        self.page(opts, path, start, size)
+    }
     fn kind(&self) -> &'static str;
 }
 
@@ -445,6 +455,16 @@ impl<R: Ring, E: PositiveExponent> AlgebraicMathMl for RationalPolynomial<R, E> 
         start: usize,
         size: usize,
     ) -> Option<MathMlPage> {
+        self.page_expanded(opts, path, start, size, &[])
+    }
+    fn page_expanded(
+        &self,
+        opts: &PrintOptions,
+        path: &[usize],
+        start: usize,
+        size: usize,
+        expansions: &[(Vec<usize>, usize)],
+    ) -> Option<MathMlPage> {
         if let Some((part, rest)) = path.split_first() {
             return match part {
                 0 => self.numerator.page(opts, rest, start, size),
@@ -459,8 +479,18 @@ impl<R: Ring, E: PositiveExponent> AlgebraicMathMl for RationalPolynomial<R, E> 
             print_ring: false,
             ..opts.clone()
         };
-        let num = self.numerator.page(&inner, &[], 0, size)?;
-        let den = self.denominator.page(&inner, &[], 0, size)?;
+        let limit = |part| {
+            expansions
+                .iter()
+                .filter(|(path, _)| path.as_slice() == [part])
+                .map(|(_, count)| *count)
+                .max()
+                .unwrap_or(size)
+                .max(size)
+                .min(500)
+        };
+        let num = self.numerator.page(&inner, &[], 0, limit(0))?;
+        let den = self.denominator.page(&inner, &[], 0, limit(1))?;
         let mut markers = vec![];
         let mut parts = vec![];
         for (part, page) in [num, den].into_iter().enumerate() {

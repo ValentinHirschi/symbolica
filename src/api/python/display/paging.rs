@@ -247,6 +247,7 @@ struct Position {
     start: usize,
     previous: Vec<usize>,
     size: usize,
+    compact_size: usize,
 }
 #[derive(Clone)]
 struct Navigation {
@@ -356,6 +357,17 @@ impl PythonMathMLViewer {
             .collect()
     }
 
+    fn can_collapse(&self) -> bool {
+        let p = &self.navigation.position;
+        self.supports_expansion
+            && (p.size > p.compact_size
+                || self
+                    .navigation
+                    .expanded
+                    .keys()
+                    .any(|path| path.len() > p.path.len() && path.starts_with(&p.path)))
+    }
+
     fn context(message: &Bound<'_, PyDict>) -> PyResult<Option<String>> {
         message
             .get_item("context")?
@@ -443,6 +455,7 @@ impl PythonMathMLViewer {
                 let size = size(message, "value", self.navigation.position.size)?;
                 let p = &mut self.navigation.position;
                 p.size = size;
+                p.compact_size = size;
                 p.start = 0;
                 p.previous.clear();
             }
@@ -459,6 +472,18 @@ impl PythonMathMLViewer {
                     *count = 500.min((*count).max(target.start).saturating_add(size));
                 }
             }
+            Some("collapse") => {
+                if !self.supports_expansion {
+                    return Err(invalid("this source does not support in-place expansion"));
+                }
+                let p = &mut self.navigation.position;
+                p.size = p.compact_size;
+                p.start = 0;
+                p.previous.clear();
+                self.navigation
+                    .expanded
+                    .retain(|path, _| path.len() <= p.path.len() || !path.starts_with(&p.path));
+            }
             Some("open") => {
                 let target = Self::target(&page, message)?;
                 let size = size(message, "size", self.navigation.position.size)?;
@@ -468,6 +493,7 @@ impl PythonMathMLViewer {
                 self.navigation.position = Position {
                     path: target.path,
                     size,
+                    compact_size: size,
                     ..Position::default()
                 };
             }
@@ -622,6 +648,7 @@ impl PythonMathMLViewer {
             navigation: Navigation {
                 position: Position {
                     size: page_size,
+                    compact_size: page_size,
                     ..Position::default()
                 },
                 parents: Vec::new(),
@@ -782,6 +809,7 @@ impl PythonMathMLViewer {
         dict.set_item("back", !self.navigation.parents.is_empty())?;
         dict.set_item("page_size", self.navigation.position.size)?;
         dict.set_item("supports_expansion", self.supports_expansion)?;
+        dict.set_item("can_collapse", self.can_collapse())?;
         self.last_page = Some(dict.clone().unbind());
         Ok(dict.unbind())
     }

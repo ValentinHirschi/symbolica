@@ -126,7 +126,8 @@ function render({ model, el }) {
       <button class="preview-previous" type="button">Previous</button>
       <button class="preview-next" type="button">Next</button>
       <select class="preview-size" aria-label="Items per page"></select>
-      <button class="preview-expand" type="button">Show more here</button>
+      <button class="preview-expand" type="button">Show more</button>
+      <button class="preview-collapse" type="button" hidden>Show less</button>
       <button class="preview-inspect" type="button">Inspect</button>
     </nav>
     <div class="preview-hint">Click to explore this part. Escape closes this preview.</div>
@@ -161,6 +162,9 @@ function render({ model, el }) {
   const previewSize = root.querySelector('.preview-size');
   const previewInspect = root.querySelector('.preview-inspect');
   const previewExpand = root.querySelector('.preview-expand');
+  const previewCollapse = root.querySelector('.preview-collapse');
+  pageArrow(previewPrevious, 'Previous', 'previous');
+  pageArrow(previewNext, 'Next', 'next');
   const previewHint = root.querySelector('.preview-hint');
   preview.id = `symbolica-preview-${view}`;
   preview.tabIndex = -1;
@@ -199,6 +203,7 @@ function render({ model, el }) {
     if (!state) return;
     state.request = `${view}-${++previewSequence}`;
     previewPrevious.disabled = previewNext.disabled = previewSize.disabled = true;
+    previewExpand.disabled = previewCollapse.disabled = true;
     preview.setAttribute('aria-busy', 'true');
     model.send({ action: 'preview', value: state.path, request: state.request,
       layout: state.layout, context: state.context, popup: state.pinned, start: state.start, size: state.size });
@@ -219,9 +224,10 @@ function render({ model, el }) {
       previewBack.hidden = true;
       previewPrevious.hidden = previewNext.hidden = previewSize.hidden = true;
       previewExpand.hidden = !model.get('page').supports_expansion;
+      previewCollapse.hidden = !model.get('page').can_collapse;
       previewHint.textContent = pinned
         ? (model.get('page').supports_expansion
-          ? 'Show more here expands the parent expression. Inspect opens this part separately.'
+          ? 'Show more expands the main view. Show less restores its compact display. Inspect opens this part separately.'
           : 'Inspect opens this part in the main view.')
         : 'Click to explore this part. Escape closes this preview.';
       previewHeading.textContent = label.replace('Inspect ', '');
@@ -367,6 +373,7 @@ function render({ model, el }) {
       previewSize.disabled = false;
       previewExpand.disabled = value.kind === 'Value' || value.can_expand === false;
       previewExpand.title = previewExpand.disabled ? 'Inline display limit reached; use pagination or Inspect.' : '';
+      previewCollapse.disabled = false;
     }
     positionPreview();
   }
@@ -382,6 +389,7 @@ function render({ model, el }) {
     preview.setAttribute('role', 'dialog');
     previewControls.hidden = previewClose.hidden = false;
     previewExpand.hidden = !model.get('page').supports_expansion;
+    previewCollapse.hidden = !model.get('page').can_collapse;
     previewHint.textContent = 'Back returns to the previous popup. Inspect opens this part in the main view.';
     previewHeading.textContent = label.replace('Inspect ', '');
     previewMath.textContent = 'Loading preview…';
@@ -398,7 +406,7 @@ function render({ model, el }) {
     previewMath.scrollLeft = activePreview.scrollLeft || 0;
     if (!activePreview.parent) {
       previewHint.textContent = model.get('page').supports_expansion
-        ? 'Show more here expands the parent expression. Inspect opens this part separately.'
+        ? 'Show more expands the main view. Show less restores its compact display. Inspect opens this part separately.'
         : 'Inspect opens this part in the main view.';
     }
     preview.focus({preventScroll:true});
@@ -423,6 +431,10 @@ function render({ model, el }) {
     const { path, layout, size, context } = activePreview;
     hidePreview();
     model.send({ action: 'expand', value: path, layout, size, context });
+  };
+  previewCollapse.onclick = () => {
+    hidePreview();
+    model.send({ action: 'collapse' });
   };
   previewInspect.onclick = () => {
     const { path, layout, size, context } = activePreview;
@@ -477,16 +489,19 @@ function render({ model, el }) {
   math.addEventListener('scroll', positionPreview);
   let currentLayout = 0;
   const send = (action, value) => model.send({ action, value, layout: currentLayout });
+  function pageArrow(b, label, action) {
+    b.classList.add('page-arrow');
+    b.title = label;
+    b.setAttribute('aria-label', label);
+    const path = action === 'previous' ? 'M15 18l-6-6 6-6' : 'M9 6l6 6-6 6';
+    b.innerHTML = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="${path}"/></svg>`;
+  }
   function button(label, action) {
     const b = document.createElement('button');
     b.textContent = label;
     b.type = 'button';
     if (action === 'previous' || action === 'next') {
-      b.className = 'page-arrow';
-      b.title = label;
-      b.setAttribute('aria-label', label);
-      const path = action === 'previous' ? 'M15 18l-6-6 6-6' : 'M9 6l6 6-6 6';
-      b.innerHTML = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="${path}"/></svg>`;
+      pageArrow(b, label, action);
     }
     b.onclick = () => send(action);
     controls.append(b);
@@ -495,6 +510,8 @@ function render({ model, el }) {
   const back = button('Back to parent', 'back');
   const previous = button('Previous', 'previous');
   const next = button('Next', 'next');
+  const collapse = button('Show less', 'collapse');
+  collapse.title = 'Restore the compact display';
   function update() {
     hidePreview();
     const base = model.get('page');
@@ -529,7 +546,8 @@ function render({ model, el }) {
     back.hidden = !page.back;
     const paginated = page.previous || page.next !== null;
     previous.hidden = next.hidden = !page.back || !paginated;
-    controls.hidden = !page.back;
+    collapse.hidden = !page.can_collapse;
+    controls.hidden = !page.back && !page.can_collapse;
     math.classList.toggle('compact', controls.hidden);
     status.hidden = !page.error && !page.back;
     decorateMarkers(page);
