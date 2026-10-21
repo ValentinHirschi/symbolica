@@ -192,6 +192,60 @@ class AlgebraicMathMLTests(unittest.TestCase):
         for name in ['anywidget', 'ipywidgets', 'IPython', 'marimo', 'traitlets']:
             self.assertNotIn(name, sys.modules)
 
+    def test_show_more_and_less_restore_compact_display(self):
+        x = S('x')
+        objects = [E('(1+x)^20').expand(),
+                   E('(1+x)^20').expand().to_polynomial(),
+                   E('exp(x)').series(x, 0, 20)]
+        for obj in objects:
+            original = str(obj)
+            viewer = obj.mathml_viewer(page_size=7)
+            try:
+                compact = viewer.page()
+                self.assertTrue(compact['supports_expansion'])
+                self.assertFalse(compact['can_collapse'])
+                self.assertEqual(compact['end'], 7)
+                for end in [14, 21]:
+                    _, page = viewer.handle_message({'action': 'expand', 'value': [], 'size': 7})
+                    self.assertEqual(page['end'], end)
+                    self.assertTrue(page['can_collapse'])
+                # The final omission disappears; the main view must still offer
+                # Show less, without requiring a marker to open a popup.
+                self.assertFalse(page['markers'])
+                _, restored = viewer.handle_message({'action': 'collapse'})
+                self.assertEqual(restored['html'], compact['html'])
+                self.assertEqual(restored['end'], 7)
+                self.assertFalse(restored['can_collapse'])
+                self.assertEqual(str(obj), original)
+            finally:
+                viewer.close()
+
+    def test_rational_parts_expand_independently_and_collapse_together(self):
+        poly = RationalPolynomial.parse('(1+x)^40/(1+y)^35', ['x', 'y'])
+        viewer = poly.mathml_viewer(page_size=7)
+        def counts(page):
+            fraction = next(n for n in root(page['html']).iter() if kind(n) == 'mfrac')
+            return [sum(not any('data-symbolica-marker' in n.attrib for n in term.iter())
+                        for term in part) for part in fraction]
+        try:
+            compact = viewer.page()
+            self.assertEqual(counts(compact), [7, 7])
+            _, page = viewer.handle_message({'action': 'expand', 'value': [0], 'size': 7})
+            self.assertEqual(counts(page), [14, 7])
+            _, inspected = viewer.handle_message({'action': 'open', 'value': [0]})
+            self.assertFalse(inspected['can_collapse'])
+            _, page = viewer.handle_message({'action': 'back'})
+            self.assertTrue(page['can_collapse'])
+            self.assertEqual(counts(page), [14, 7])
+            _, page = viewer.handle_message({'action': 'expand', 'value': [1], 'size': 7})
+            self.assertEqual(counts(page), [14, 14])
+            self.assertTrue(page['can_collapse'])
+            _, page = viewer.handle_message({'action': 'collapse'})
+            self.assertEqual(page['html'], compact['html'])
+            self.assertFalse(page['can_collapse'])
+        finally:
+            viewer.close()
+
 
 if __name__ == '__main__':
     unittest.main()
