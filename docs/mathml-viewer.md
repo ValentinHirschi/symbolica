@@ -45,6 +45,13 @@ viewers under its own identifiers, allowing independent displays to coexist.
 The initial page includes bounded responsive alternatives, not a hidden complete
 expression.
 
+Products keep factor boundaries even when they contain only a few factors.
+The browser repacks product rows and sum rows inside large factors using their
+rendered widths, the loaded font and the available container width. Resizing,
+font loading, previews and restored subtrees use the same packing policy without
+additional kernel requests. Static MathML retains bounded fallback rows; source
+expressions and omission paths are unchanged.
+
 When removing a display, first `await pager.close()` in JavaScript, then call
 `viewer.close()` and release its worker entry. The JavaScript cleanup sends a
 disposal message, disconnects observers and removes event handlers; the Python
