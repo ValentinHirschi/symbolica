@@ -510,8 +510,6 @@ function render({ model, el }) {
   const back = button('Back to parent', 'back');
   const previous = button('Previous', 'previous');
   const next = button('Next', 'next');
-  const collapse = button('Show less', 'collapse');
-  collapse.title = 'Restore the compact display';
   function update() {
     hidePreview();
     const base = model.get('page');
@@ -546,8 +544,7 @@ function render({ model, el }) {
     back.hidden = !page.back;
     const paginated = page.previous || page.next !== null;
     previous.hidden = next.hidden = !page.back || !paginated;
-    collapse.hidden = !page.can_collapse;
-    controls.hidden = !page.back && !page.can_collapse;
+    controls.hidden = !page.back;
     math.classList.toggle('compact', controls.hidden);
     status.hidden = !page.error && !page.back;
     decorateMarkers(page);
