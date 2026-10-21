@@ -192,11 +192,8 @@ impl Renderer<'_> {
                 Self::token("mn", n),
                 Self::token("mn", d)
             )
-        } else if value
-            .chars()
-            .all(|c| c.is_ascii_digit() || matches!(c, '.' | 'e' | 'E' | '+' | '-'))
-        {
-            Self::token("mn", value)
+        } else if let Some(number) = super::mathml_number(value) {
+            number
         } else {
             // Exotic coefficient domains retain the existing exact notation.
             Self::token("mtext", value)
