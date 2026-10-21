@@ -1010,10 +1010,20 @@ impl Renderer<'_> {
                 }
                 let rows = rows
                     .into_iter()
-                    .map(|r| format!("<mtr><mtd>{}</mtd></mtr>", Self::row(r)))
+                    .enumerate()
+                    .map(|(index, r)| {
+                        // Table cells have browser-default padding on every
+                        // edge. Products need no outer space: add only the
+                        // intended gap above continuation rows.
+                        let padding = if index == 0 { "0" } else { "0.5em 0 0" };
+                        format!(
+                            "<mtr><mtd style=\"padding:{padding}\">{}</mtd></mtr>",
+                            Self::row(r)
+                        )
+                    })
                     .collect::<String>();
                 format!(
-                    "<mtable data-symbolica-product=\"\" columnalign=\"left\" rowspacing=\"0.5em\">{rows}</mtable>"
+                    "<mtable data-symbolica-product=\"\" data-symbolica-row-gap=\"0.5em\" columnalign=\"left\" rowspacing=\"0\">{rows}</mtable>"
                 )
             } else {
                 Self::row(result)
@@ -1285,6 +1295,32 @@ mod tests {
         assert_eq!(short.matches("data-symbolica-factor").count(), 2);
         assert!(short.contains("<mo>&#x2062;</mo>"), "{short}");
         assert!(!short.contains("<mo>·</mo>"), "{short}");
+    }
+
+    #[test]
+    fn product_tables_have_only_deliberate_internal_row_spacing() {
+        for input in ["-2*sqrt(5)", "-sqrt(5)", "x*y", "x/(a*b)"] {
+            let html = page(input);
+            assert!(html.contains("data-symbolica-product"), "{input}: {html}");
+            assert!(
+                html.contains("rowspacing=\"0\"><mtr><mtd style=\"padding:0\">"),
+                "{input}: {html}"
+            );
+            assert!(!html.contains("<mtd>"), "{input}: {html}");
+            assert!(!html.contains("padding:0.5em"), "{input}: {html}");
+        }
+        let product = (0..40)
+            .map(|i| format!("x{i}"))
+            .collect::<Vec<_>>()
+            .join("*");
+        let html = page(&product);
+        assert!(html.contains("<mtd style=\"padding:0.5em 0 0\">"), "{html}");
+        assert_eq!(
+            html.matches("<mtd style=\"padding:0\">").count(),
+            1,
+            "{html}"
+        );
+        assert!(!html.contains("<mtd>"), "{html}");
     }
 
     #[test]
