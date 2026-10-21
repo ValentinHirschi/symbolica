@@ -1,4 +1,4 @@
-//! The two endpoint-one GPL words required by four-loop vacuum periods.
+//! Endpoint-one GPLs in the unit sixth-root alphabet used by vacuum periods.
 //!
 //! This is the ordinary G convention, with kernel 1/(t-a), on the real path
 //! from zero to one. No HPL sign conversion is applied.
@@ -11,8 +11,15 @@ use crate::atom::AtomCore;
 pub enum GplLetter {
     Zero,
     One,
+    MinusOne,
+    /// (1+i sqrt(3))/2, with positive real sqrt(3).
+    R1,
+    /// (-1+i sqrt(3))/2, with positive real sqrt(3).
+    R2,
     /// (-1-i sqrt(3))/2, with positive real sqrt(3).
     R4,
+    /// (1-i sqrt(3))/2, with positive real sqrt(3).
+    R5,
 }
 
 static GPL: SymbolCache<Symbol> =
@@ -50,42 +57,56 @@ crate::_inventory::submit! {
     }, &["symbolica"])
 }
 
-/// The tagged constant `gpl_at_one(gpl_letters(a1,...,a4))`.
+/// The tagged constant `gpl_at_one(gpl_letters(a1,...,an))`.
 ///
-/// Initially supports G(0,0,r4,1;1) and G(0,1,1,r4;1), using the ordinary
-/// kernel 1/(t-a). Other words are rejected explicitly.
+/// Supports words through weight six over zero and the sixth roots of unity,
+/// using the ordinary kernel 1/(t-a). Nonempty words must start with a letter
+/// other than one and end with a nonzero letter. No analytic continuation or
+/// trailing-zero regularization is performed.
 pub fn gpl_at_one() -> Symbol {
     *GPL
 }
 
-fn r4() -> Atom {
-    (Atom::num(-1)
-        - Atom::num(Complex::new(Rational::zero(), Rational::one()))
-            * Atom::num(3).pow(Atom::num((1, 2))))
-        / 2
+impl GplLetter {
+    fn atom(self) -> Atom {
+        match self {
+            Self::Zero => Atom::num(0),
+            Self::One => Atom::num(1),
+            Self::MinusOne => Atom::num(-1),
+            Self::R1 | Self::R2 | Self::R4 | Self::R5 => {
+                let real = if matches!(self, Self::R1 | Self::R5) {
+                    1
+                } else {
+                    -1
+                };
+                let imaginary = if matches!(self, Self::R1 | Self::R2) {
+                    1
+                } else {
+                    -1
+                };
+                (Atom::num(real)
+                    + Atom::num(Complex::new(Rational::zero(), Rational::from(imaginary)))
+                        * Atom::num(3).pow(Atom::num((1, 2))))
+                    / 2
+            }
+        }
+    }
 }
 
-/// Construct one of the supported endpoint-one GPL constants.
+/// Construct a supported endpoint-one GPL constant with exact letter tags.
 pub fn endpoint_one_gpl(word: &[GplLetter]) -> Result<Atom, String> {
     validate(word)?;
-    let letters = word
-        .iter()
-        .map(|letter| match letter {
-            GplLetter::Zero => Atom::num(0),
-            GplLetter::One => Atom::num(1),
-            GplLetter::R4 => r4(),
-        })
-        .collect::<Vec<_>>();
+    let letters = word.iter().map(|letter| letter.atom()).collect::<Vec<_>>();
     Ok(GPL.call(LETTERS.call(&letters)))
 }
 
 fn validate(word: &[GplLetter]) -> Result<(), String> {
     use GplLetter::*;
-    if word == [Zero, Zero, R4, One] || word == [Zero, One, One, R4] {
+    if word.len() <= MAX_WEIGHT && word.first() != Some(&One) && word.last() != Some(&Zero) {
         Ok(())
     } else {
         Err(
-            "endpoint-one GPL supports only G(0,0,r4,1;1) and G(0,1,1,r4;1), r4=(-1-i sqrt(3))/2"
+            "endpoint-one GPL requires weight at most six, a first letter other than one and a nonzero final letter"
                 .into(),
         )
     }
@@ -98,19 +119,24 @@ fn parse_tags(tags: &[AtomView]) -> Result<Vec<GplLetter>, String> {
     if letters.get_symbol() != *LETTERS {
         return Err("endpoint-one GPL requires gpl_letters(...) as its symbolic tag".into());
     }
-    let root = r4();
+    let alphabet = [
+        GplLetter::Zero,
+        GplLetter::One,
+        GplLetter::MinusOne,
+        GplLetter::R1,
+        GplLetter::R2,
+        GplLetter::R4,
+        GplLetter::R5,
+    ]
+    .map(|letter| (letter.atom().expand(), letter));
     let word = letters
         .iter()
         .map(|letter| {
-            if letter == Atom::num(0).as_view() {
-                Ok(GplLetter::Zero)
-            } else if letter == Atom::num(1).as_view() {
-                Ok(GplLetter::One)
-            } else if letter == root.as_view() {
-                Ok(GplLetter::R4)
-            } else {
-                Err(format!("unsupported endpoint-one GPL letter: {letter}"))
-            }
+            let expanded = letter.expand();
+            alphabet
+                .iter()
+                .find_map(|(atom, tag)| (atom == &expanded).then_some(*tag))
+                .ok_or_else(|| format!("unsupported endpoint-one GPL letter: {letter}"))
         })
         .collect::<Result<Vec<_>, _>>()?;
     validate(&word)?;
@@ -126,14 +152,18 @@ pub struct EndpointOneGplEvaluator {
 impl EndpointOneGplEvaluator {
     pub fn new(word: &[GplLetter]) -> Result<Self, String> {
         validate(word)?;
-        // Pole::Minus is conjugate(r4). Evaluate in that exact quadratic field
+        // Evaluate conjugated letters in the exact quadratic field
         // using the existing recurrence, then conjugate the complete result.
         let poles = word
             .iter()
             .map(|letter| match letter {
                 GplLetter::Zero => Pole::Zero,
                 GplLetter::One => Pole::One,
+                GplLetter::MinusOne => Pole::NegativeOne,
+                GplLetter::R1 => Pole::Plus,
+                GplLetter::R2 => Pole::ConjugateMinus,
                 GplLetter::R4 => Pole::Minus,
+                GplLetter::R5 => Pole::ComplementPlus,
             })
             .collect::<Vec<_>>();
         let mut nodes = Vec::new();
@@ -179,3 +209,6 @@ impl EndpointOneGplEvaluator {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod alphabet_tests;

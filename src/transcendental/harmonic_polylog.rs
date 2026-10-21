@@ -222,8 +222,12 @@ enum Pole {
     Plus,
     Minus,
     One,
+    NegativeOne,
+    Two,
+    ConjugateMinus,
     ComplementPlus,
     ComplementMinus,
+    ComplementConjugateMinus,
 }
 
 impl Pole {
@@ -241,7 +245,12 @@ impl Pole {
             Self::One => Self::Zero,
             Self::Plus => Self::ComplementPlus,
             Self::Minus => Self::ComplementMinus,
-            _ => unreachable!(),
+            Self::NegativeOne => Self::Two,
+            Self::Two => Self::NegativeOne,
+            Self::ConjugateMinus => Self::ComplementConjugateMinus,
+            Self::ComplementPlus => Self::Plus,
+            Self::ComplementMinus => Self::Minus,
+            Self::ComplementConjugateMinus => Self::ConjugateMinus,
         }
     }
 
@@ -260,6 +269,15 @@ impl Pole {
                 b: -(a + b) / 4,
             },
             Self::One => Fixed { a: a / 2, b: b / 2 },
+            Self::NegativeOne => Fixed {
+                a: -a / 2,
+                b: -b / 2,
+            },
+            Self::Two => Fixed { a: a / 4, b: b / 4 },
+            Self::ConjugateMinus => Fixed {
+                a: -(&a + &b * 3i64) / 4,
+                b: (a - b) / 4,
+            },
             Self::ComplementPlus => Fixed {
                 a: (&a + &b * 3) / 4,
                 b: (b - a) / 4,
@@ -267,6 +285,10 @@ impl Pole {
             Self::ComplementMinus => Fixed {
                 a: (&a - &b) / 4,
                 b: (b * 3 + a) / 12,
+            },
+            Self::ComplementConjugateMinus => Fixed {
+                a: (&a + &b) / 4,
+                b: (b * 3 - a) / 12,
             },
             Self::Zero => unreachable!(),
         }

@@ -278,3 +278,46 @@ fn trilog_fractional_transform_matches_sixth_root_hpls() {
             .intersects(&tracked_values[1].ball)
     );
 }
+#[test]
+fn unit_alphabet_pole_matrices_and_convergence_bounds_are_exact() {
+    // Define the poles independently in Q(i sqrt(3)). Multiplying each
+    // computed matrix column by its pole must give half the corresponding
+    // input column. This also checks conjugate/complement signs exactly.
+    let poles = [
+        (Pole::Plus, (1, 2), (-1, 2)),
+        (Pole::Minus, (-1, 2), (1, 2)),
+        (Pole::One, (1, 1), (0, 1)),
+        (Pole::NegativeOne, (-1, 1), (0, 1)),
+        (Pole::Two, (2, 1), (0, 1)),
+        (Pole::ConjugateMinus, (-1, 2), (-1, 2)),
+        (Pole::ComplementPlus, (1, 2), (1, 2)),
+        (Pole::ComplementMinus, (3, 2), (-1, 2)),
+        (Pole::ComplementConjugateMinus, (3, 2), (1, 2)),
+    ];
+    for (pole, real, imaginary) in poles {
+        let real = Rational::from(real);
+        let imaginary = Rational::from(imaginary);
+        assert!(
+            real.clone() * &real + imaginary.clone() * &imaginary * Rational::from(3)
+                >= Rational::one()
+        );
+        assert_eq!(pole.complement().complement(), pole);
+        let mut columns = Vec::new();
+        for (a, b) in [(12, 0), (0, 12)] {
+            let output = pole.multiply_half_inverse(Fixed {
+                a: Integer::from(a),
+                b: Integer::from(b),
+            });
+            let x = Rational::from(output.a.clone());
+            let y = Rational::from(output.b.clone());
+            assert_eq!(
+                &x * &real - &y * &imaginary * Rational::from(3),
+                Rational::from((a, 2))
+            );
+            assert_eq!(&x * &imaginary + &y * &real, Rational::from((b, 2)));
+            columns.push((output.a.abs(), output.b.abs()));
+        }
+        assert!(&columns[0].0 + &columns[1].0 <= Integer::from(12));
+        assert!(&columns[0].1 + &columns[1].1 <= Integer::from(12));
+    }
+}
