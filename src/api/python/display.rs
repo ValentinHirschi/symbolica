@@ -179,15 +179,20 @@ pub(super) fn is_mathml_viewer(value: &Bound<'_, PyAny>) -> bool {
 }
 
 pub(super) fn scrollable_html(html: &str) -> String {
+    boxed_mathml(html, true)
+}
+
+fn boxed_mathml(html: &str, scroll: bool) -> String {
+    let overflow = if scroll { "overflow-x:auto;" } else { "" };
     if let Some(html) = html::wrapping_mathml(html) {
         return format!(
-            "<span style=\"display:block;width:100%;max-width:100%;min-width:0;overflow-x:auto\"><span style=\"display:block;padding:.6em .1em;font-size:21px\">{html}</span></span>"
+            "<span style=\"display:block;width:100%;max-width:100%;min-width:0;{overflow}\"><span style=\"display:block;padding:.6em .1em;font-size:21px\">{html}</span></span>"
         );
     }
     // Keep the MathML root unconstrained. The inner HTML box includes room for
     // glyph ink outside its line box; only the outer box handles scrolling.
     format!(
-        "<span style=\"display:inline-block;max-width:100%;min-width:0;overflow-x:auto;vertical-align:middle\"><span style=\"display:block;width:max-content;padding:.3em .1em;font-size:21px\">{html}</span></span>"
+        "<span style=\"display:inline-block;max-width:100%;min-width:0;{overflow}vertical-align:middle\"><span style=\"display:block;width:max-content;padding:.3em .1em;font-size:21px\">{html}</span></span>"
     )
 }
 
@@ -210,7 +215,18 @@ pub(super) fn algebraic_html(value: &impl mathml::AlgebraicMathMl) -> String {
 }
 
 pub(super) fn preview(page: &MathMlPage) -> String {
-    let html = scrollable_html(&page.html);
+    preview_with_scroll(page, true)
+}
+
+/// A cell embedded in a larger result must not become its own scrollport.
+/// The containing result owns horizontal overflow, including math glyph ink.
+pub(super) fn embedded_preview(atom: AtomView<'_>) -> String {
+    let page = atom.render_mathml_page(&default_options(), 0, mathml::DEFAULT_PAGE_SIZE);
+    preview_with_scroll(&page, false)
+}
+
+fn preview_with_scroll(page: &MathMlPage, scroll: bool) -> String {
+    let html = boxed_mathml(&page.html, scroll);
     if page.is_partial() {
         format!(
             "<div>{}<p>Expression preview · items {}–{} of {}. Omitted subexpressions are marked ⋯. Use .formatted(page_size=25) in a live notebook with symbolica[notebook] to navigate.</p></div>",

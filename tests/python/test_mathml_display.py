@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 from xml.etree import ElementTree
 
-from symbolica import E, S, FormattedOutput, MathMLViewer, PrintMode
+from symbolica import E, S, Expression, FormattedOutput, MathMLViewer, PrintMode
 
 
 def mathml_value(html, variables):
@@ -302,6 +302,31 @@ class MathMLDisplayTests(unittest.TestCase):
                             tag in ("span", "div") and "overflow-x:auto" in attrs.get("style", "")
                             for tag, attrs in ancestors
                         ))
+
+    def test_solution_cells_leave_scrolling_to_the_result_container(self):
+        x, y = S('solution_scroll::x', 'solution_scroll::y')
+        solutions = Expression.solve([x**2 + y**2 - 25, x - 2*y], [x, y])
+        self.assertEqual(len(solutions), 2)
+        for result in [solutions, *solutions]:
+            html = result._repr_html_()
+            self.assertEqual(html.count('overflow-x:auto'), 1, html)
+            for attrs, ancestors in MathDisplay(html).math:
+                scrollers = [(tag, attrs) for tag, attrs in ancestors
+                             if 'overflow-x:auto' in attrs.get('style', '')]
+                self.assertEqual(len(scrollers), 1, html)
+                self.assertEqual(scrollers[0][0], 'div', html)
+                self.assertNotIn('overflow', attrs.get('style', ''))
+        polynomial = E('(1+solution_scroll::x)^100').expand()
+        original = bytes(polynomial.__getstate__())
+        large = Expression.solve([y - polynomial], [y])
+        html = large._repr_html_()
+        self.assertEqual(large[0][y], polynomial)
+        self.assertEqual(bytes(polynomial.__getstate__()), original)
+        self.assertEqual(html.count('overflow-x:auto'), 1, html)
+        self.assertIn('symbolica-math-flow', html)
+        self.assertIn('data-symbolica-marker', html)
+        self.assertIn('1–25 of 101', html)
+        self.assertLess(len(MathDisplay(html).math), 30)
 
     def test_mathml_fragments_stay_embeddable_in_math(self):
         fragment = E("sin(1/x)").format(mode=PrintMode.MathML)
