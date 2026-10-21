@@ -1,6 +1,7 @@
 //! Methods for printing rings.
 
 pub(crate) mod mathml;
+pub use mathml::number as mathml_number;
 
 use std::borrow::Cow;
 

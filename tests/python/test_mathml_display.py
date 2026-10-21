@@ -102,6 +102,52 @@ class MathDisplay(HTMLParser):
 
 
 class MathMLDisplayTests(unittest.TestCase):
+    def test_scientific_floats_preserve_displayed_digits_and_value(self):
+        for text in ["4.21359549995700e+1", "-4.21359549995700e+1",
+                     "1.2300e-7", "-1.2300e-7", "1.25e100", "1.25e-100"]:
+            expression = E(text)
+            original = bytes(expression.__getstate__())
+            for precision in [None, 6, 15, 25]:
+                options = {} if precision is None else {"precision": precision}
+                plain = expression.format(**options)
+                html = expression.format(mode=PrintMode.MathML, **options)
+                with self.subTest(text=text, precision=precision, plain=plain):
+                    root = ElementTree.fromstring("<math>" + html + "</math>")
+                    powers = list(root.iter("msup"))
+                    self.assertEqual(mathml_value(html, {}), Fraction(plain))
+                    if "e" in plain.lower():
+                        mantissa, exponent = plain.lower().split("e")
+                        self.assertEqual(len(powers), 1)
+                        self.assertEqual(powers[0][0].text, "10")
+                        self.assertIn("<mn>" + mantissa.lstrip("-") + "</mn>", html)
+                        self.assertIn("<mo>×</mo>", html)
+                        self.assertEqual(mathml_value(ElementTree.tostring(powers[0][1], encoding="unicode"), {}), int(exponent))
+                    else:
+                        self.assertFalse(powers)
+                        self.assertIn("<mn>" + plain.lstrip("-") + "</mn>", html)
+            self.assertEqual(bytes(expression.__getstate__()), original)
+
+    def test_scientific_coefficients_keep_product_power_and_complex_grouping(self):
+        scalar = E("-4.21359549995700e+1")
+        imaginary = E("2.5e-3")
+        real_value = Fraction(scalar.format())
+        imag_value = Fraction(imaginary.format())
+        for expression, expected in [
+            (scalar * S("x"), real_value * 2),
+            (scalar / S("x"), real_value / 2),
+            (scalar ** S("n"), real_value ** 2),
+            (S("x") + scalar, 2 + real_value),
+            (scalar + imaginary * S("𝑖"), real_value + 3 * imag_value),
+            (scalar - imaginary * S("𝑖"), real_value - 3 * imag_value),
+        ]:
+            viewer = expression.mathml_viewer()
+            try:
+                for html in [expression.format(mode=PrintMode.MathML), viewer.page()["html"]]:
+                    with self.subTest(expression=str(expression)):
+                        self.assertEqual(mathml_value(html, {"x": 2, "n": 2, "𝑖": 3}), expected)
+            finally:
+                viewer.close()
+
     def test_default_viewer_juxtaposes_symbolic_product_factors(self):
         expression = E("*".join(f"product_spacing::x{i}" for i in range(10)))
         original = bytes(expression.__getstate__())
