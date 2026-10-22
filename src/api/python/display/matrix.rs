@@ -153,16 +153,11 @@ impl Source<'_> {
             }
             body.push_str("</tr>");
         }
-        // CSS draws square brackets around HTML cells. Each cell keeps a
-        // MathML root, so the shared frontend can wrap its sums portably.
-        let edge = "position:absolute;top:0;bottom:0;width:.35em;border-top:1.5px solid currentColor;border-bottom:1.5px solid currentColor";
-        let mut html = format!(
-            "<div aria-label=\"Matrix with {rows} rows and {cols} columns\" style=\"width:fit-content;max-width:var(--symbolica-wrap-width,100%);min-width:min-content\"><div style=\"position:relative;padding:0 .35em;min-width:0\"><span aria-hidden=\"true\" style=\"{edge};left:0;border-left:1.5px solid currentColor\"></span><table style=\"border-collapse:collapse;table-layout:auto;width:100%;color:inherit\">{body}</table><span aria-hidden=\"true\" style=\"{edge};right:0;border-right:1.5px solid currentColor\"></span></div>"
-        );
         if end < total {
             let id = markers.len();
-            html.push_str(&format!(
-                "<div style=\"padding:.5em 0\"><math>{}</math></div>",
+            let span = columns.len() + usize::from(partial);
+            body.push_str(&format!(
+                "<tr data-symbolica-matrix-omission=\"\"><td colspan=\"{span}\" style=\"padding:.5em .6em;text-align:center\"><math>{}</math></td></tr>",
                 MathMLMarker::marker(id)
             ));
             markers.push(MathMLMarker::new(
@@ -171,7 +166,12 @@ impl Source<'_> {
                 end,
             ));
         }
-        html.push_str("</div>");
+        // CSS draws square brackets around HTML cells. Each cell keeps a
+        // MathML root, so the shared frontend can wrap its sums portably.
+        let edge = "position:absolute;top:0;bottom:0;width:.35em;border-top:1.5px solid currentColor;border-bottom:1.5px solid currentColor";
+        let html = format!(
+            "<div aria-label=\"Matrix with {rows} rows and {cols} columns\" style=\"width:fit-content;max-width:var(--symbolica-wrap-width,100%);min-width:min-content\"><div style=\"position:relative;padding:0 .35em;min-width:0\"><span aria-hidden=\"true\" style=\"{edge};left:0;border-left:1.5px solid currentColor\"></span><table style=\"border-collapse:collapse;table-layout:auto;width:100%;color:inherit\">{body}</table><span aria-hidden=\"true\" style=\"{edge};right:0;border-right:1.5px solid currentColor\"></span></div></div>"
+        );
         let mut result = MathMLPage::new(html, start, end, total);
         result.kind = format!("Matrix {rows}×{cols}");
         result.unit = "entries".into();
