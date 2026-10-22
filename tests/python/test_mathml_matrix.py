@@ -88,6 +88,16 @@ class MatrixMathMLTests(unittest.TestCase):
         finally:
             viewer.close()
 
+    def test_coordinates_only_label_truncated_dimensions(self):
+        for rows, cols, expected_rows, expected_cols in [(12, 11, True, False), (1, 40, False, True), (2, 2, False, False)]:
+            viewer = Matrix.from_linear(rows, cols, list(range(rows * cols))).mathml_viewer()
+            try:
+                html = ET.fromstring(viewer.page()['html'])
+                self.assertEqual(bool(html.findall('.//th[@scope="row"]')), expected_rows)
+                self.assertEqual(bool(html.findall('.//th[@scope="col"]')), expected_cols)
+            finally:
+                viewer.close()
+
     def test_dense_large_cells_stay_within_the_transfer_budget(self):
         large = E('(1+x)^100').expand()
         matrix = Matrix.from_nested([[large] * 8 for _ in range(8)])
