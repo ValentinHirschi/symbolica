@@ -59,11 +59,15 @@ impl Source<'_> {
         let start = request.start.min(total - 1);
         let end = (start + request.size).min(total);
         let columns = (start..end).map(|i| i % cols).collect::<BTreeSet<_>>();
-        let partial = start != 0 || end != total;
+        let show_rows = start / cols != 0 || (end - 1) / cols + 1 < rows;
+        let show_columns = columns.len() < cols;
         let mut markers = Vec::new();
         let mut body = String::new();
-        if partial {
-            body.push_str("<tr><th></th>");
+        if show_columns {
+            body.push_str("<tr>");
+            if show_rows {
+                body.push_str("<th></th>");
+            }
             for col in &columns {
                 body.push_str(&format!(
                     "<th scope=\"col\" style=\"font:12px system-ui;padding:.2em\">{}</th>",
@@ -75,7 +79,7 @@ impl Source<'_> {
         let mut bytes = 0;
         for row in start / cols..=(end - 1) / cols {
             body.push_str("<tr>");
-            if partial {
+            if show_rows {
                 body.push_str(&format!(
                     "<th scope=\"row\" style=\"font:12px system-ui;padding:.2em\">{}</th>",
                     row + 1
@@ -155,7 +159,7 @@ impl Source<'_> {
         }
         if end < total {
             let id = markers.len();
-            let span = columns.len() + usize::from(partial);
+            let span = columns.len() + usize::from(show_rows);
             body.push_str(&format!(
                 "<tr data-symbolica-matrix-omission=\"\"><td colspan=\"{span}\" style=\"padding:.5em .6em;text-align:center\"><math>{}</math></td></tr>",
                 MathMLMarker::marker(id)
