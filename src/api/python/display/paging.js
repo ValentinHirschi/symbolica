@@ -316,6 +316,8 @@ function render({ model, el }) {
     // including decorated omissions, using the font actually loaded here.
     // Nested sums in a long factor use the same measured packing policy.
     for (const table of [...container.querySelectorAll('mtable[data-symbolica-product],mtable[data-symbolica-sum]')].reverse()) {
+      const cell = table.closest('[data-symbolica-cell]');
+      if (cell && cell !== container) continue;
       const rows = [...table.children].map(row => {
         const cell = row.children.length === 1 ? row.firstElementChild : null;
         const body = cell?.localName === 'mtd' && cell.children.length === 1
@@ -396,6 +398,22 @@ function render({ model, el }) {
         limit = Math.max(0, limit - overflow);
       }
     }
+    // Composite outputs retain a static frame while each value is fitted to
+    // its own cell width. Root-flow conversion stays outside nested MathML.
+    for (const cell of container.querySelectorAll('[data-symbolica-cell]')) {
+      const parent = cell.parentElement.closest('[data-symbolica-cell]');
+      if (!parent || parent === container) setWrapWidth(cell, cell.clientWidth);
+    }
+  }
+  function widthWithCells(container, width, available) {
+    // A wide term can overlap the next column without overflowing the entire
+    // matrix. Treat overflow within a value cell as a reason to try a more
+    // compact native page too.
+    let excess = 0;
+    for (const cell of container.querySelectorAll('[data-symbolica-cell]')) {
+      excess = Math.max(excess, cell.scrollWidth - cell.clientWidth);
+    }
+    return excess > 1 ? Math.max(width, available + excess) : width;
   }
   function displayPreview(value) {
     if (!activePreview || value.request !== activePreview.request) return;
@@ -412,7 +430,9 @@ function render({ model, el }) {
         previewMath.innerHTML = candidate.html;
         decorateMarkers(candidate, previewMath, value.context);
         setWrapWidth(previewMath, previewMath.clientWidth);
-        const width = Math.max(previewMath.scrollWidth - 4, previewMath.firstElementChild?.getBoundingClientRect().width || 0);
+        const width = widthWithCells(previewMath,
+          Math.max(previewMath.scrollWidth - 4, previewMath.firstElementChild?.getBoundingClientRect().width || 0),
+          previewMath.clientWidth - 4);
         if (width < smallest) { selected = candidate; smallest = width; }
         // Rendering a tall candidate may introduce a vertical scrollbar and
         // reduce the available width on platforms with classic scrollbars.
@@ -604,7 +624,8 @@ function render({ model, el }) {
       // caused by trial layouts, so compacting cannot reopen a wider layout.
       available = Math.min(available, math.clientWidth);
       setWrapWidth(content, available);
-      const width = Math.max(content.scrollWidth, content.getBoundingClientRect().width);
+      const width = widthWithCells(content,
+        Math.max(content.scrollWidth, content.getBoundingClientRect().width), available);
       if (width < smallestWidth) {
         page = candidate;
         smallestWidth = width;
