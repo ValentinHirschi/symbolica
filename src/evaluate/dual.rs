@@ -27,9 +27,20 @@ impl<T: Default + Clone> ExpressionEvaluator<T> {
                 *index = constants[*index];
                 ins.unknown_constants[*index / ins.dim] = true;
             }
+            if let Some(body) = &mut external.body {
+                for (instruction, _) in &mut Arc::make_mut(body).instructions {
+                    if let Instr::ExternalFun(_, function, _) = instruction {
+                        *function = functions[*function];
+                    }
+                }
+            }
             let index = external_functions
                 .iter()
-                .position(|f| f == &external && f.constant_index == external.constant_index)
+                .position(|f| {
+                    f == &external
+                        && f.constant_index == external.constant_index
+                        && f.body == external.body
+                })
                 .unwrap_or_else(|| {
                     external_functions.push(external);
                     external_functions.len() - 1

@@ -17,7 +17,7 @@ pub struct ExpressionEvaluator<T> {
 
 /// Immutable, coefficient-independent instructions for a single non-inlined function.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(super) struct FunctionBody {
     pub(super) instructions: Vec<(Instr, ComplexPhase)>,
     pub(super) param_count: usize,
