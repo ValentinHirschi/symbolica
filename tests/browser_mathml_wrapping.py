@@ -58,6 +58,42 @@ def sum_page(display="inline-flex", start=0):
 
 
 class MathMLWrappingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_composite_cell_overflow_selects_a_compact_page(self):
+        async with async_playwright() as playwright:
+            for engine in ("chromium", "firefox", "webkit"):
+                with self.subTest(engine=engine):
+                    options = {"headless": True}
+                    executable = os.environ.get(f"{engine.upper()}_EXECUTABLE")
+                    if executable:
+                        options["executable_path"] = executable
+                    browser = await getattr(playwright, engine).launch(**options)
+                    try:
+                        page = await browser.new_page()
+                        await page.route("https://cdn.jsdelivr.net/**", lambda route: route.abort())
+                        await page.set_content('<div id="host" style="width:480px"></div>')
+                        html = ('<div style="width:var(--symbolica-wrap-width)"><table '
+                                'style="width:100%;table-layout:fixed"><tr><td>'
+                                '<div data-symbolica-cell=""><math><mspace width="300px"/></math></div>'
+                                '</td><td><div data-symbolica-cell=""><math><mi>x</mi></math></div>'
+                                '</td></tr></table></div>')
+                        fixture = dict(html=html, start=0, end=2, total=2,
+                                       kind="Matrix", unit="entries", markers=[], layout=0,
+                                       previous=False, next=None, back=False, page_size=25,
+                                       layouts=[dict(html=html.replace('300px', '80px'), layout=1)])
+                        await page.evaluate("""async ({source, fixture}) => {
+                          const url = URL.createObjectURL(new Blob([source], {type:'text/javascript'}));
+                          const {mount} = await import(url);
+                          URL.revokeObjectURL(url);
+                          mount({el:document.querySelector('#host'),page:fixture,send:()=>{}});
+                        }""", {"source": JAVASCRIPT, "fixture": fixture})
+                        await page.wait_for_function("""() => document.querySelector('#host')
+                          .shadowRoot.querySelector('.math-content').dataset.layout === '1'""")
+                        self.assertTrue(await page.locator('#host').evaluate("""host =>
+                          [...host.shadowRoot.querySelectorAll('[data-symbolica-cell]')]
+                            .every(cell => cell.scrollWidth <= cell.clientWidth + 1)"""))
+                    finally:
+                        await browser.close()
+
     async def test_product_cell_padding_survives_measured_repacking(self):
         async with async_playwright() as playwright:
             for engine in ("chromium", "firefox", "webkit"):

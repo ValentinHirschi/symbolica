@@ -3,6 +3,7 @@ use super::*;
 use crate::printer::mathml::{self, MathMlCursorCache, MathMlPage};
 
 pub(super) mod algebraic;
+pub(super) mod matrix;
 mod html;
 mod provider;
 pub use provider::{MathMLMarker, MathMLPage};
