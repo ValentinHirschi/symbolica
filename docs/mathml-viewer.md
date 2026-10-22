@@ -70,3 +70,18 @@ close releases the retained expression and cached pages.
 
 The same JavaScript module retains its default `render` export for the optional
 notebook adapter. Custom applications use `mount` and need no widget library.
+
+### Matrices
+
+`Matrix.mathml_viewer(page_size=25)` uses the same standalone viewer. The matrix
+frame keeps its row and column layout while large rational-polynomial cells
+have independent omission markers. Numerators and denominators can be inspected
+and paged separately. Only requested entry and term ranges are rendered.
+
+For a large matrix, entry pages show original row and column numbers so a partial
+window cannot be confused with the complete matrix. Text and LaTeX formatting
+remain available through the existing methods. Static HTML provides a bounded
+MathML preview; interactive markers require the viewer host.
+
+A viewer retains a snapshot: later matrix row swaps or reductions do not change
+its source. Standalone hosts need no notebook or widget packages.

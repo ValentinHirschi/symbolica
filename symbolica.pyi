@@ -11113,9 +11113,16 @@ class Matrix:
         """
 
     def _repr_html_(self) -> str:
-        """
-        Convert the matrix into an HTML representation.
-        """
+        """Render bounded native MathML cells in a matrix layout."""
+
+    def mathml_viewer(self, page_size: int = 25) -> MathMLViewer:
+        """Create a pager for matrix entries and their polynomial terms."""
+
+    def _repr_mimebundle_(self, include: list[str] | None = None, exclude: list[str] | None = None) -> Any:
+        """Prefer the shared MathML pager in notebooks."""
+
+    def _display_(self) -> Any:
+        """Display a matrix with the shared pager in marimo."""
 
     def _repr_latex_(self) -> str:
         """
