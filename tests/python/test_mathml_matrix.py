@@ -99,6 +99,12 @@ class MatrixMathMLTests(unittest.TestCase):
             self.assertTrue(any(path == [] and label == 'Open remaining matrix entries'
                                 for path, label in page['markers']))
             self.assertEqual(len(page['marker_ids']), len(set(page['marker_ids'])))
+            table = ET.fromstring(page['html']).find('.//table')
+            omission = list(table)[-1]
+            self.assertIn('data-symbolica-matrix-omission', omission.attrib)
+            self.assertEqual(omission[0].get('colspan'), '9')
+            self.assertEqual(len(list(omission.iter('mtext'))), 1)
+
         finally:
             viewer.close()
 
