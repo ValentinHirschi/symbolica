@@ -160,8 +160,6 @@ impl<T: Default + Clone> EvaluatorComposer<T> {
             });
         }
         let inputs = self.slots(inputs)?;
-        let mut evaluator = evaluator.clone();
-        evaluator.undo_stack_optimization();
         let checkpoint = (
             self.instructions.instructions.len(),
             self.instructions.constants.len(),
@@ -176,17 +174,11 @@ impl<T: Default + Clone> EvaluatorComposer<T> {
         );
         // Exporters identify callable functions by name. Reject incompatible
         // definitions instead of silently calling the first evaluator's body.
-        let mut definitions = HashMap::default();
+        // Identical definitions were already interned when importing instructions.
+        let mut definitions = HashSet::default();
         let conflict = self.external_functions.iter().find_map(|function| {
-            if function.constant_index.is_some() {
-                return None;
-            }
-            definitions
-                .insert(&function.export_name, function)
-                .and_then(|previous| {
-                    (previous != function || previous.body != function.body)
-                        .then_some(function.symbol)
-                })
+            (function.constant_index.is_none() && !definitions.insert(&function.export_name))
+                .then_some(function.symbol)
         });
         if let Some(symbol) = conflict {
             self.instructions.instructions.truncate(checkpoint.0);

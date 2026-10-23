@@ -202,7 +202,8 @@ pub struct ExportedSubEvaluator<T> {
 
 impl<T: Default + Clone> ExpressionEvaluator<T> {
     /// Inline this evaluator's scalar instructions into an instruction list.
-    /// Call `undo_stack_optimization` first so each temporary is assigned once.
+    /// Each output updates the source-slot map after its inputs are read, so reused
+    /// stack slots become distinct temporaries without modifying the source.
     /// Constants occupy the first component of each vector-sized group; remaining
     /// components are zero. Shared function bodies are imported without inlining.
     pub(super) fn inline_instructions(
@@ -213,9 +214,8 @@ impl<T: Default + Clone> ExpressionEvaluator<T> {
         next_label: &mut usize,
     ) -> Vec<Slot> {
         let mut slots = args.to_vec();
-        let mut constants = Vec::new();
+        let constant_offset = ins.constants.len();
         for value in &self.stack[self.param_count..self.reserved_indices] {
-            constants.push(ins.constants.len());
             slots.push(Slot::Const(ins.constants.len()));
             // InstructionList tracks constants in vector-sized groups.
             ins.constants.push(value.clone());
@@ -227,7 +227,7 @@ impl<T: Default + Clone> ExpressionEvaluator<T> {
         for external in &self.external_fns {
             let mut external = external.clone();
             if let Some(index) = external.constant_index.as_mut() {
-                *index = constants[*index];
+                *index = constant_offset + *index * ins.dim;
                 ins.unknown_constants[*index / ins.dim] = true;
             }
             if let Some(body) = &mut external.body {

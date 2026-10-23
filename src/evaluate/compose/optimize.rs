@@ -23,7 +23,7 @@ impl VectorInstruction {
 
 impl<T: Default + Clone> EvaluatorComposer<T> {
     /// Slice data dependencies and the structured branches guarding live values.
-    /// Keeping a live branch's join and labels preserves lazy evaluation and the
+    /// Keeping a live branch's labels preserves lazy evaluation and the
     /// branch structure expected by native CSE/CPE. Completely dead branches vanish.
     pub(super) fn prune_unused(&mut self, outputs: &mut [Slot]) {
         let instructions = &self.instructions.instructions;
@@ -42,7 +42,7 @@ impl<T: Default + Clone> EvaluatorComposer<T> {
                     unreachable!("Native evaluators use structured if/else branches");
                 };
                 let end = labels[&end];
-                let mut controls = vec![i, otherwise - 1, otherwise, end];
+                let controls = [i, otherwise - 1, otherwise, end];
                 // A vectorized branch can produce several consecutive joins.
                 let mut last = end;
                 while let Some(VectorInstruction::Join(c, _, _)) = instructions.get(last + 1) {
@@ -50,7 +50,6 @@ impl<T: Default + Clone> EvaluatorComposer<T> {
                         break;
                     }
                     last += 1;
-                    controls.push(last);
                 }
                 starts.insert(i, branches.len());
                 branches.push((last, controls));
@@ -186,9 +185,9 @@ impl<T: Default + Clone + Eq + Hash> EvaluatorComposer<T> {
     /// Intern live constants before optimization and remap the selected outputs.
     pub(super) fn deduplicate_constants(&mut self, outputs: &mut [Slot]) {
         #[derive(PartialEq, Eq, Hash)]
-        enum Constant<T> {
-            Literal(T),
-            Function(Symbol, Vec<Atom>, Vec<Complex<Rational>>),
+        enum Constant<'a, T> {
+            Literal(&'a T),
+            Function(Symbol, &'a [Atom], &'a [Complex<Rational>]),
         }
         let mut callbacks = HashMap::default();
         for function in &self.external_functions {
@@ -202,13 +201,9 @@ impl<T: Default + Clone + Eq + Hash> EvaluatorComposer<T> {
         let mut unknown = Vec::new();
         for (old, value) in self.instructions.constants.iter().enumerate() {
             let key = if let Some(function) = callbacks.get(&old) {
-                Constant::Function(
-                    function.symbol,
-                    function.tags.clone(),
-                    function.fixed_args.clone(),
-                )
+                Constant::Function(function.symbol, &function.tags, &function.fixed_args)
             } else {
-                Constant::Literal(value.clone())
+                Constant::Literal(value)
             };
             let next = *known.entry(key).or_insert_with(|| {
                 let index = values.len();
@@ -265,13 +260,12 @@ impl<T: Default + Clone + Eq + Hash> EvaluatorComposer<T> {
 
 impl<T: Default + Clone> ExpressionEvaluator<T> {
     /// Restore native n-ary operations after scalar inlining. Only single-use
-    /// intermediates in the same branch are absorbed, so shared work stays shared
+    /// intermediates in the same basic block are absorbed, so shared work stays shared
     /// and branch-local computations are never moved into an unconditional path.
     pub(super) fn flatten_composition_operations(&mut self) {
         let mut uses = vec![0; self.reserved_indices + self.instructions.len()];
-        let mut branch = vec![0; self.instructions.len()];
-        let mut active = vec![0];
-        let mut next_branch = 1;
+        let mut blocks = vec![0; self.instructions.len()];
+        let mut block = 0;
         for (i, (instruction, _)) in self.instructions.iter().enumerate() {
             match instruction {
                 Instr::Add(_, args) | Instr::Mul(_, args) | Instr::ExternalFun(_, _, args) => {
@@ -286,22 +280,17 @@ impl<T: Default + Clone> ExpressionEvaluator<T> {
                 }
                 Instr::IfElse(c, _) => {
                     uses[*c] += 1;
-                    active.push(next_branch);
-                    next_branch += 1;
-                }
-                Instr::Goto(_) => {
-                    *active.last_mut().unwrap() = next_branch;
-                    next_branch += 1;
+                    block += 1;
                 }
                 Instr::Join(_, c, a, b) => {
                     uses[*c] += 1;
                     uses[*a] += 1;
                     uses[*b] += 1;
-                    active.pop();
+                    block += 1;
                 }
-                Instr::Label(_) => {}
+                Instr::Goto(_) | Instr::Label(_) => block += 1,
             }
-            branch[i] = *active.last().unwrap();
+            blocks[i] = block;
         }
         for output in &self.result_indices {
             uses[*output] += 1;
@@ -316,7 +305,7 @@ impl<T: Default + Clone> ExpressionEvaluator<T> {
                     continue;
                 }
                 let child = *arg - self.reserved_indices;
-                if branch[child] == branch[i]
+                if blocks[child] == blocks[i]
                     && matches!(
                         (instruction, &self.instructions[child].0),
                         (Instr::Add(..), Instr::Add(..)) | (Instr::Mul(..), Instr::Mul(..))

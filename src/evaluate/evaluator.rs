@@ -780,6 +780,7 @@ impl<T: Default> ExpressionEvaluator<T> {
 
         let mut dag_nodes = vec![0]; // store index to parent node
         let mut current_node = 0;
+        let mut branch_ends = HashMap::default();
 
         for (instr, phase) in &mut self.instructions {
             let new_pos = new_instr.len() + self.reserved_indices;
@@ -821,7 +822,6 @@ impl<T: Default> ExpressionEvaluator<T> {
                     }
                 }
                 Instr::Join(p, a, b, c) => {
-                    current_node = dag_nodes[current_node];
                     *a = rename_map[*a];
                     *b = rename_map[*b];
                     *c = rename_map[*c];
@@ -832,12 +832,19 @@ impl<T: Default> ExpressionEvaluator<T> {
                     current_node = dag_nodes.len() - 1;
                     *c = rename_map[*c];
                 }
-                Instr::Goto(_) => {
+                Instr::Goto(end) => {
                     let parent = dag_nodes[current_node];
+                    branch_ends.insert(*end, parent);
                     dag_nodes.push(parent); // enter else block (included goto and labels)
                     current_node = dag_nodes.len() - 1;
                 }
-                _ => {}
+                Instr::Label(label) => {
+                    // Vectorized branches may have several joins. The end label
+                    // closes their scope once, before any of those joins.
+                    if let Some(parent) = branch_ends.remove(label) {
+                        current_node = parent;
+                    }
+                }
             }
 
             let key = match &*instr {
@@ -920,6 +927,7 @@ impl<T: Default> ExpressionEvaluator<T> {
         let mut branch_id = vec![0; self.instructions.len()];
         let mut dag_nodes = vec![0]; // store index to parent node
         let mut current_node = 0;
+        let mut branch_ends = HashMap::default();
 
         const PROMOTED_PAIR: u32 = 1 << 31;
 
@@ -997,13 +1005,20 @@ impl<T: Default> ExpressionEvaluator<T> {
                     current_node = dag_nodes.len() - 1;
                     continue;
                 }
-                Instr::Goto(_) => {
+                Instr::Goto(end) => {
                     let parent = dag_nodes[current_node];
+                    branch_ends.insert(*end, parent);
                     dag_nodes.push(parent); // enter else block (included goto and labels)
                     current_node = dag_nodes.len() - 1;
                 }
-                Instr::Join(..) => {
-                    current_node = dag_nodes[current_node];
+                Instr::Label(label) => {
+                    // New pairs are inserted before their assigned line, so
+                    // only lines after the label belong to the parent scope.
+                    branch_id[p] = current_node;
+                    if let Some(parent) = branch_ends.remove(label) {
+                        current_node = parent;
+                    }
+                    continue;
                 }
                 _ => {}
             }

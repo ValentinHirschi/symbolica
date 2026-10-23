@@ -175,7 +175,7 @@ impl<T: Default + Clone> ExpressionEvaluator<T> {
                         let generated = match generated_functions.entry((f, a.len())) {
                             Entry::Occupied(entry) => entry.into_mut(),
                             Entry::Vacant(entry) => {
-                                let mut evaluator = v.vectorize_function(external.symbol, &external.tags, a.len())?
+                                let evaluator = v.vectorize_function(external.symbol, &external.tags, a.len())?
                                     .ok_or_else(|| format!(
                                         "To vectorize the function '{0}', the symbol '{0}_v' must be defined that takes the vector index as an additional tag",
                                         external.symbol.get_name()
@@ -188,7 +188,6 @@ impl<T: Default + Clone> ExpressionEvaluator<T> {
                                         external.symbol
                                     ));
                                 }
-                                evaluator.undo_stack_optimization();
                                 entry.insert(evaluator)
                             }
                         };

@@ -359,6 +359,146 @@ fn pruning_removes_dead_branches_beside_live_nested_branches() {
 }
 
 #[test]
+fn composition_preserves_vectorized_nested_branches() {
+    use crate::{domains::dual::HyperDual, evaluate::Dualizer};
+
+    let dualizer = Dualizer::new(
+        HyperDual::<Complex<Rational>>::new(vec![vec![0], vec![1]]),
+        vec![],
+    );
+    // Repeated z^2 exercises CSE after the inner branch's multiple joins;
+    // the common y+z pair also exercises CPE across branch boundaries.
+    let unconditional = parse!("z^2+y+z+1")
+        .evaluator(&[parse!("y"), parse!("z")])
+        .optimization_settings(settings())
+        .build()
+        .unwrap()
+        .vectorize(&dualizer)
+        .unwrap();
+
+    for nested_on_true in [true, false] {
+        let expression = if nested_on_true {
+            parse!("if(x,if(y,x+y,x-y)+z^2+y+z,7)")
+        } else {
+            parse!("if(x,7,if(y,x+y,x-y)+z^2+y+z)")
+        };
+        let original = expression
+            .evaluator(&[parse!("x"), parse!("y"), parse!("z")])
+            .optimization_settings(settings())
+            .build()
+            .unwrap()
+            .vectorize(&dualizer)
+            .unwrap();
+        for rounds in [Some(0), None] {
+            let mut all_joins = 0;
+            for selected in [vec![0, 1, 2, 3], vec![1, 2]] {
+                let (mut c, inputs) = EvaluatorComposer::new_with_inputs(3);
+                let zero = c.constant(Complex::<Rational>::default());
+                let one = c.constant(Complex::new(Rational::from(1), Rational::from(0)));
+                let mut out = c
+                    .add(
+                        &original,
+                        &[inputs[0], zero, inputs[1], zero, inputs[2], one],
+                    )
+                    .unwrap();
+                out.extend(
+                    c.add(&unconditional, &[inputs[1], zero, inputs[2], one])
+                        .unwrap(),
+                );
+                let selected_outputs: Vec<_> = selected.iter().map(|i| out[*i]).collect();
+                let exact = c
+                    .finish(&selected_outputs, settings().cpe_iterations(rounds))
+                    .unwrap();
+                let joins = exact
+                    .instructions
+                    .iter()
+                    .filter(|(i, _)| matches!(i, Instr::Join(..)))
+                    .count();
+                if selected.len() == 4 {
+                    all_joins = joins;
+                } else {
+                    assert!(joins < all_joins, "unused vector components must be pruned");
+                }
+                #[cfg(feature = "native_code_generation")]
+                let mut jit = exact
+                    .jit_compile::<f64>(
+                        JITCompilationSettings::default()
+                            .optimization_level(2)
+                            .with_option("use_threads", "false"),
+                    )
+                    .unwrap();
+                let mut e = exact.map_coeff(&|q| q.re.to_f64());
+                #[cfg(feature = "native_code_generation")]
+                let (source, library, mut cpp) = {
+                    let base = std::env::temp_dir().join(format!(
+                        "symbolica_composed_branches_{}_{nested_on_true}_{rounds:?}_{}",
+                        std::process::id(),
+                        selected.len(),
+                    ));
+                    let source = base.with_extension("cpp");
+                    let library = base.with_extension("so");
+                    let cpp = e
+                        .export_cpp::<f64>(
+                            &source,
+                            "composed_branches",
+                            ExportSettings::new().inline_asm(InlineASM::None),
+                        )
+                        .unwrap()
+                        .compile(
+                            &library,
+                            CompileOptions::default()
+                                .compiler(
+                                    std::env::var("SYMBOLICA_TEST_CXX")
+                                        .unwrap_or_else(|_| "g++".into()),
+                                )
+                                .fast_math(false)
+                                .unsafe_math(false)
+                                .arg("-std=c++17"),
+                        )
+                        .unwrap()
+                        .load()
+                        .unwrap();
+                    (source, library, cpp)
+                };
+                for (x, y, z) in [(0., 0., 3.), (2., 1., 4.), (2., 0., 5.), (0., 1., 6.)] {
+                    let nested = (x != 0.) == nested_on_true;
+                    let value = if nested {
+                        (if y == 0. { x - y } else { x + y }) + z * z + y + z
+                    } else {
+                        7.
+                    };
+                    let expected = [
+                        value,
+                        if nested { 2. * z + 1. } else { 0. },
+                        z * z + y + z + 1.,
+                        2. * z + 1.,
+                    ];
+                    let mut actual = vec![0.; selected.len()];
+                    e.evaluate(&[x, y, z], &mut actual);
+                    for (actual, selected) in actual.iter().zip(&selected) {
+                        assert_eq!(*actual, expected[*selected], "x={x}, y={y}, z={z}");
+                    }
+                    #[cfg(feature = "native_code_generation")]
+                    {
+                        let mut compiled = vec![0.; selected.len()];
+                        jit.evaluate(&[x, y, z], &mut compiled);
+                        assert_eq!(compiled, actual, "JIT: x={x}, y={y}, z={z}");
+                        cpp.evaluate(&[x, y, z], &mut compiled);
+                        assert_eq!(compiled, actual, "C++: x={x}, y={y}, z={z}");
+                    }
+                }
+                #[cfg(feature = "native_code_generation")]
+                {
+                    drop(cpp);
+                    std::fs::remove_file(source).unwrap();
+                    std::fs::remove_file(library).unwrap();
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn shared_functions_remap_transitive_calls_and_reject_conflicts_atomically() {
     let make = |body| {
         parse!("outer(x)+outer(y)")
