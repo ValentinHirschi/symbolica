@@ -183,18 +183,8 @@ impl<T: Default + Clone> EvaluatorComposer<T> {
 }
 
 impl<T: Default + Clone + Eq + Hash> EvaluatorComposer<T> {
-    /// Intern equal literal constants and equivalent callback constants.
-    ///
-    /// All existing value handles remain valid. This optional optimization enables
-    /// CSE across applications containing equal constants. It requires exact-value
-    /// equality and hashing; floating-point compositions may simply omit it.
-    pub fn deduplicate_constants(&mut self) {
-        let mut values = std::mem::take(&mut self.values);
-        self.intern_constants(&mut values);
-        self.values = values;
-    }
-
-    fn intern_constants(&mut self, outputs: &mut [Slot]) {
+    /// Intern live constants before optimization and remap the selected outputs.
+    pub(super) fn deduplicate_constants(&mut self, outputs: &mut [Slot]) {
         #[derive(PartialEq, Eq, Hash)]
         enum Constant<T> {
             Literal(T),

@@ -70,7 +70,6 @@ fn composition_preserves_native_control_flow_callbacks_and_admission() {
     let selected = vec![
         d[0], a[0], b[0], a[1], b[1], a[2], b[2], k[0], k[1], inputs[1], d[0],
     ];
-    c.deduplicate_constants();
     let exact = c.finish(&selected, settings.clone()).unwrap();
     let mut e = exact.clone().map_coeff(&|q| q.re.to_f64());
     let mut first = p.clone().map_coeff(&|q| q.re.to_f64());
@@ -225,22 +224,23 @@ fn dynamic_inputs_float_constants_and_stable_handles() {
         .evaluator(&[parse!("x"), parse!("y")])
         .build()
         .unwrap()
-        .map_coeff(&|q| q.re.to_f64());
+        .map_coeff(&|q| F64(q.re.to_f64()));
     let mut c = EvaluatorComposer::default();
     let x = c.add_input();
-    let two = c.constant(2.);
+    let two = c.constant(F64(2.));
     let first = c.add(&sum, &[x, two]).unwrap();
     let y = c.add_input(); // Inputs may be added after constants and applications.
     let _unused = c.add_input();
     let second = c.add(&sum, &[first[0], y]).unwrap();
-    let negative_zero = c.constant(-0.0);
-    let nan = c.constant(f64::NAN);
+    let negative_zero = c.constant(F64(-0.0));
+    let nan = c.constant(F64(f64::NAN));
     let mut e = c
         .finish(
             &[second[0], x, two, negative_zero, nan, second[0]],
             settings(),
         )
-        .unwrap();
+        .unwrap()
+        .map_coeff(&|q| q.0);
     assert_eq!(e.get_input_len(), 3);
     let mut out = [0.; 6];
     e.evaluate(&[3., 4., 99.], &mut out);
@@ -248,14 +248,12 @@ fn dynamic_inputs_float_constants_and_stable_handles() {
     assert!(out[3].is_sign_negative());
     assert!(out[4].is_nan());
     assert_eq!(out[5], 9.);
-    assert_eq!(EvaluatorComposer::<f64>::new_with_inputs(0).1.len(), 0);
+    assert_eq!(EvaluatorComposer::<F64>::new_with_inputs(0).1.len(), 0);
 
     let mut c = EvaluatorComposer::<Complex<Rational>>::new();
     let one = c.constant(Complex::new(Rational::from(1), Rational::from(0)));
     let another_one = c.constant(Complex::new(Rational::from(1), Rational::from(0)));
-    c.deduplicate_constants();
     let input = c.add_input();
-    c.deduplicate_constants();
     let mut e = c
         .finish(&[another_one, input, one], settings())
         .unwrap()
@@ -410,7 +408,6 @@ fn shared_functions_remap_transitive_calls_and_reject_conflicts_atomically() {
         .iter()
         .map(|f| f.body.clone())
         .collect();
-    c.deduplicate_constants();
     let exact = c.finish(&[a[0], b[0]], settings()).unwrap();
     assert_eq!(
         exact
@@ -507,25 +504,71 @@ fn pruning_preserves_lazy_callbacks_in_live_branches() {
         .evaluator(&[parse!("x"), parse!("y")])
         .build()
         .unwrap()
-        .map_coeff(&|q| q.re.to_f64());
+        .map_coeff(&|q| F64(q.re.to_f64()));
     let observed = calls.clone();
     original
         .external_fns
         .iter_mut()
         .find(|f| f.constant_index.is_none())
         .unwrap()
-        .imp = Some(Box::new(move |args: &[f64]| {
+        .imp = Some(Box::new(move |args: &[F64]| {
         observed.fetch_add(1, Ordering::Relaxed);
-        assert!(args[0] > 0., "inactive branch callback was evaluated");
-        2. * args[0]
+        assert!(args[0].0 > 0., "inactive branch callback was evaluated");
+        F64(2. * args[0].0)
     }));
     let (mut c, inputs) = EvaluatorComposer::new_with_inputs(2);
     let out = c.add(&original, &inputs).unwrap();
     let mut e = c.finish(&out, settings()).unwrap();
-    assert_eq!(e.evaluate_single(&[0., -100.]), 7.);
+    assert_eq!(e.evaluate_single(&[F64(0.), F64(-100.)]).0, 7.);
     assert_eq!(calls.load(Ordering::Relaxed), 0);
-    assert_eq!(e.evaluate_single(&[1., 3.]), 6.);
+    assert_eq!(e.evaluate_single(&[F64(1.), F64(3.)]).0, 6.);
     assert_eq!(calls.load(Ordering::Relaxed), 1);
-    assert_eq!(e.evaluate_single(&[0., -100.]), 7.);
+    assert_eq!(e.evaluate_single(&[F64(0.), F64(-100.)]).0, 7.);
     assert_eq!(calls.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn finish_automatically_interns_constants_for_cross_evaluator_cse() {
+    let original = Atom::evaluator_multiple(&[parse!("x+2"), parse!("gamma(1/2)")], &[parse!("x")])
+        .optimization_settings(settings())
+        .build()
+        .unwrap();
+    let exported = original.export_instructions();
+    let callback = &exported.constant_functions[0];
+    let placeholder = exported.constants[callback.index].clone();
+    let (mut c, inputs) = EvaluatorComposer::new_with_inputs(1);
+    let a = c.add(&original, &inputs).unwrap();
+    let b = c.add(&original, &inputs).unwrap();
+    // A literal matching a callback's placeholder must stay distinct from it.
+    let literal = c.constant(placeholder.clone());
+    let two = c.constant(Complex::new(Rational::from(2), Rational::from(0)));
+    let exact = c
+        .finish(
+            &[b[1], literal, a[0], b[0], two, a[1]],
+            settings().cpe_iterations(Some(0)),
+        )
+        .unwrap();
+    // Equal constants from separate applications enable CSE without any opt-in.
+    assert_eq!(exact.count_operations().additions, 1);
+    assert_eq!(exact.get_constants().len(), 3);
+    assert_eq!(exact.export_instructions().constant_functions.len(), 1);
+    let mut expected = original.map_coeff(&|q| q.re.to_f64());
+    let mut e = exact.map_coeff(&|q| q.re.to_f64());
+    for x in [0., 3., -2.] {
+        let mut reference = [0.; 2];
+        expected.evaluate(&[x], &mut reference);
+        let mut out = [0.; 6];
+        e.evaluate(&[x], &mut out);
+        assert_eq!(
+            out,
+            [
+                reference[1],
+                placeholder.re.to_f64(),
+                reference[0],
+                reference[0],
+                2.,
+                reference[1]
+            ]
+        );
+    }
 }

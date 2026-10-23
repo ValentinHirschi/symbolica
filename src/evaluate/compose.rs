@@ -3,7 +3,7 @@ mod optimize;
 
 /// An opaque slot belonging to one [`EvaluatorComposer`].
 ///
-/// Handles remain valid when inputs are added or constants are deduplicated.
+/// Handles remain valid when inputs are added or internal storage is rewritten.
 /// A handle from another composer is rejected, even if its index happens to match.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ComposerSlot {
@@ -42,7 +42,10 @@ impl std::error::Error for ComposeError {}
 ///
 /// Inputs are ordered by creation. All declared inputs, including unused ones,
 /// remain in the finished evaluator's signature. Applications may bind any input,
-/// constant or earlier result; shared function bodies remain shared.
+/// constant or earlier result; shared function bodies remain shared. Finishing
+/// automatically interns equal constants before native CSE/CPE. Compose exact
+/// coefficients before mapping to a numerical domain, or use [`F64`] when
+/// composing floating-point evaluators: finishing requires `Eq + Hash`.
 ///
 /// ```
 /// use symbolica::prelude::*;
@@ -52,7 +55,6 @@ impl std::error::Error for ComposeError {}
 /// let (mut composer, inputs) = EvaluatorComposer::new_with_inputs(2);
 /// let mapped = composer.add(&map, &inputs).unwrap();
 /// let outputs = composer.add(&function, &mapped).unwrap();
-/// composer.deduplicate_constants(); // optional; requires exact-value Eq + Hash
 /// let mut evaluator = composer.finish(&outputs, OptimizationSettings::default())
 ///     .unwrap().map_coeff(&|c| c.re.to_f64());
 /// assert_eq!(evaluator.evaluate_single(&[2., 3.]), 25.);
@@ -132,7 +134,7 @@ impl<T: Default + Clone> EvaluatorComposer<T> {
         self.value(slot)
     }
 
-    /// Create a literal constant, without imposing an equality policy on `T`.
+    /// Create a literal constant. Equal constants are interned by [`Self::finish`].
     pub fn constant(&mut self, value: T) -> ComposerSlot {
         let slot = Slot::Const(self.instructions.constants.len());
         self.instructions.constants.push(value);
@@ -203,16 +205,20 @@ impl<T: Default + Clone> EvaluatorComposer<T> {
     /// are discarded. Live branches retain lazy evaluation. Native CSE runs to a
     /// fixed point, then CPE runs up to `settings.cpe_iterations` (or to a fixed
     /// point for `None`), followed by stack optimization. Symbolic Horner search
-    /// is not repeated. Literal interning is optional: call
-    /// [`Self::deduplicate_constants`] first when `T` supports exact equality.
+    /// is not repeated. Literal and callback constants are automatically interned
+    /// before CSE/CPE, enabling sharing across evaluator boundaries.
     pub fn finish(
         mut self,
         outputs: &[ComposerSlot],
         settings: OptimizationSettings,
-    ) -> Result<ExpressionEvaluator<T>, ComposeError> {
+    ) -> Result<ExpressionEvaluator<T>, ComposeError>
+    where
+        T: Eq + Hash,
+    {
         let rounds = settings.cpe_iterations;
         let mut outputs = self.slots(outputs)?;
         self.prune_unused(&mut outputs);
+        self.deduplicate_constants(&mut outputs);
         Ok(ExpressionEvaluator::from_instruction_list(
             self.parameters,
             self.instructions,
