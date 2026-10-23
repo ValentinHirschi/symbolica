@@ -168,7 +168,7 @@ impl<T: Default + Clone> EvaluatorComposer<T> {
             self.external_functions.len(),
             self.next_label,
         );
-        let outputs = evaluator.inline_vector_components(
+        let outputs = evaluator.inline_instructions(
             &inputs,
             &mut self.instructions,
             &mut self.external_functions,
@@ -219,104 +219,29 @@ impl<T: Default + Clone> EvaluatorComposer<T> {
         let mut outputs = self.slots(outputs)?;
         self.prune_unused(&mut outputs);
         self.deduplicate_constants(&mut outputs);
-        Ok(ExpressionEvaluator::from_instruction_list(
+        let mut evaluator = ExpressionEvaluator::from_instruction_list(
             self.parameters,
             self.instructions,
             self.external_functions,
             outputs,
             settings,
-            rounds,
-            true,
-        ))
-    }
-}
-
-impl<T: Default + Clone> ExpressionEvaluator<T> {
-    /// Lower scalar instruction storage shared by native vectorization/composition.
-    pub(super) fn from_instruction_list(
-        param_count: usize,
-        instructions: InstructionList<T>,
-        external_fns: Vec<ExternalFunctionContainer<T>>,
-        outputs: Vec<Slot>,
-        settings: OptimizationSettings,
-        cpe_rounds: Option<usize>,
-        eliminate_common_instructions: bool,
-    ) -> Self {
-        let reserved_indices = param_count + instructions.constants.len();
-        let index = |slot| match slot {
-            Slot::Param(index) => index,
-            Slot::Const(index) => param_count + index,
-            Slot::Temp(index) => reserved_indices + index,
-            Slot::Out(_) => unreachable!("composition validates all slots"),
-        };
-        let mut lowered = Vec::with_capacity(instructions.instructions.len());
-        for instruction in instructions.instructions {
-            let out = reserved_indices + lowered.len();
-            let instruction = match instruction {
-                VectorInstruction::Add(a, b) | VectorInstruction::Mul(a, b) => {
-                    let mut inputs = vec![index(a), index(b)];
-                    inputs.sort_unstable();
-                    if matches!(instruction, VectorInstruction::Add(..)) {
-                        Instr::Add(out, inputs)
-                    } else {
-                        Instr::Mul(out, inputs)
-                    }
-                }
-                VectorInstruction::Assign(a) => Instr::Add(out, vec![index(a)]),
-                VectorInstruction::Pow(a, power) => Instr::Pow(out, index(a), power),
-                VectorInstruction::Powf(a, b) => Instr::Powf(out, index(a), index(b)),
-                VectorInstruction::BuiltinFun(symbol, a) => {
-                    Instr::BuiltinFun(out, symbol, index(a))
-                }
-                VectorInstruction::ExternalFun(function, args) => {
-                    Instr::ExternalFun(out, function, args.into_iter().map(index).collect())
-                }
-                VectorInstruction::IfElse(condition, label) => {
-                    Instr::IfElse(index(condition), label)
-                }
-                VectorInstruction::Goto(label) => Instr::Goto(label),
-                VectorInstruction::Label(label) => Instr::Label(label),
-                VectorInstruction::Join(condition, a, b) => {
-                    Instr::Join(out, index(condition), index(a), index(b))
-                }
-            };
-            lowered.push((instruction, ComplexPhase::Any));
-        }
-        let mut stack = vec![T::default(); param_count];
-        stack.extend(instructions.constants);
-        stack.resize(reserved_indices + lowered.len(), T::default());
-        let mut evaluator = Self {
-            stack,
-            param_count,
-            reserved_indices,
-            instructions: lowered,
-            result_indices: outputs.into_iter().map(index).collect(),
-            external_fns,
-            settings,
-        };
-        if eliminate_common_instructions {
-            evaluator.flatten_composition_operations();
-            loop {
-                if evaluator.settings.abort_level > 0 || evaluator.remove_common_instructions() == 0
-                {
-                    evaluator.settings.abort_level = 0;
-                    break;
-                }
+        );
+        evaluator.flatten_composition_operations();
+        loop {
+            if evaluator.settings.abort_level > 0 || evaluator.remove_common_instructions() == 0 {
+                evaluator.settings.abort_level = 0;
+                break;
             }
         }
-        for _ in 0..cpe_rounds.unwrap_or(usize::MAX) {
-            if (eliminate_common_instructions && evaluator.settings.abort_level > 0)
-                || evaluator.remove_common_pairs() == 0
-            {
-                if eliminate_common_instructions {
-                    evaluator.settings.abort_level = 0;
-                }
+        for _ in 0..rounds.unwrap_or(usize::MAX) {
+            if evaluator.settings.abort_level > 0 || evaluator.remove_common_pairs() == 0 {
+                evaluator.settings.abort_level = 0;
                 break;
             }
         }
         evaluator.optimize_stack();
         evaluator.fix_labels();
-        evaluator
+        Ok(evaluator)
     }
 }
 

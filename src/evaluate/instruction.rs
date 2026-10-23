@@ -200,6 +200,173 @@ pub struct ExportedSubEvaluator<T> {
     pub instructions: Arc<ExportedInstructions<T>>,
 }
 
+impl<T: Default + Clone> ExpressionEvaluator<T> {
+    /// Inline this evaluator's scalar instructions into an instruction list.
+    /// Call `undo_stack_optimization` first so each temporary is assigned once.
+    /// Constants occupy the first component of each vector-sized group; remaining
+    /// components are zero. Shared function bodies are imported without inlining.
+    pub(super) fn inline_instructions(
+        &self,
+        args: &[Slot],
+        ins: &mut InstructionList<T>,
+        external_functions: &mut Vec<ExternalFunctionContainer<T>>,
+        next_label: &mut usize,
+    ) -> Vec<Slot> {
+        let mut slots = args.to_vec();
+        let mut constants = Vec::new();
+        for value in &self.stack[self.param_count..self.reserved_indices] {
+            constants.push(ins.constants.len());
+            slots.push(Slot::Const(ins.constants.len()));
+            // InstructionList tracks constants in vector-sized groups.
+            ins.constants.push(value.clone());
+            ins.constants.extend((1..ins.dim).map(|_| T::default()));
+            ins.unknown_constants.push(false);
+        }
+        slots.resize(self.stack.len(), Slot::Temp(0));
+        let mut functions = Vec::new();
+        for external in &self.external_fns {
+            let mut external = external.clone();
+            if let Some(index) = external.constant_index.as_mut() {
+                *index = constants[*index];
+                ins.unknown_constants[*index / ins.dim] = true;
+            }
+            if let Some(body) = &mut external.body {
+                for (instruction, _) in &mut Arc::make_mut(body).instructions {
+                    if let Instr::ExternalFun(_, function, _) = instruction {
+                        *function = functions[*function];
+                    }
+                }
+            }
+            let index = external_functions
+                .iter()
+                .position(|f| {
+                    f == &external
+                        && f.constant_index == external.constant_index
+                        && f.body == external.body
+                })
+                .unwrap_or_else(|| {
+                    external_functions.push(external);
+                    external_functions.len() - 1
+                });
+            functions.push(index);
+        }
+        let mut labels = HashMap::default();
+        for (instr, _) in &self.instructions {
+            if let Instr::Label(label) = instr {
+                labels.insert(*label, Label(*next_label));
+                *next_label += 1;
+            }
+        }
+        for (instr, _) in &self.instructions {
+            let (output, instr) = match instr {
+                Instr::Add(output, args) | Instr::Mul(output, args) => {
+                    let mut value = slots[args[0]];
+                    for arg in &args[1..] {
+                        value = ins.add(if matches!(instr, Instr::Add(..)) {
+                            VectorInstruction::Add(value, slots[*arg])
+                        } else {
+                            VectorInstruction::Mul(value, slots[*arg])
+                        });
+                    }
+                    slots[*output] = value;
+                    continue;
+                }
+                Instr::Pow(o, a, p) => (*o, VectorInstruction::Pow(slots[*a], *p)),
+                Instr::Powf(o, a, b) => (*o, VectorInstruction::Powf(slots[*a], slots[*b])),
+                Instr::BuiltinFun(o, f, a) => (*o, VectorInstruction::BuiltinFun(*f, slots[*a])),
+                Instr::ExternalFun(o, f, args) => (
+                    *o,
+                    VectorInstruction::ExternalFun(
+                        functions[*f],
+                        args.iter().map(|a| slots[*a]).collect(),
+                    ),
+                ),
+                Instr::Join(o, c, a, b) => {
+                    (*o, VectorInstruction::Join(slots[*c], slots[*a], slots[*b]))
+                }
+                Instr::IfElse(c, l) => {
+                    ins.add(VectorInstruction::IfElse(slots[*c], labels[l]));
+                    continue;
+                }
+                Instr::Goto(l) => {
+                    ins.add(VectorInstruction::Goto(labels[l]));
+                    continue;
+                }
+                Instr::Label(l) => {
+                    ins.add(VectorInstruction::Label(labels[l]));
+                    continue;
+                }
+            };
+            slots[output] = ins.add(instr);
+        }
+        self.result_indices.iter().map(|i| slots[*i]).collect()
+    }
+
+    /// Lower an instruction list to native evaluator storage.
+    /// The caller must optimize the stack and fix labels before evaluation, and
+    /// may run instruction optimizations before those final steps.
+    pub(super) fn from_instruction_list(
+        param_count: usize,
+        instructions: InstructionList<T>,
+        external_fns: Vec<ExternalFunctionContainer<T>>,
+        outputs: Vec<Slot>,
+        settings: OptimizationSettings,
+    ) -> Self {
+        let reserved_indices = param_count + instructions.constants.len();
+        let index = |slot| match slot {
+            Slot::Param(index) => index,
+            Slot::Const(index) => param_count + index,
+            Slot::Temp(index) => reserved_indices + index,
+            Slot::Out(_) => unreachable!("instruction lists do not use output slots"),
+        };
+        let mut lowered = Vec::with_capacity(instructions.instructions.len());
+        for instruction in instructions.instructions {
+            let out = reserved_indices + lowered.len();
+            let instruction = match instruction {
+                VectorInstruction::Add(a, b) | VectorInstruction::Mul(a, b) => {
+                    let mut inputs = vec![index(a), index(b)];
+                    inputs.sort_unstable();
+                    if matches!(instruction, VectorInstruction::Add(..)) {
+                        Instr::Add(out, inputs)
+                    } else {
+                        Instr::Mul(out, inputs)
+                    }
+                }
+                VectorInstruction::Assign(a) => Instr::Add(out, vec![index(a)]),
+                VectorInstruction::Pow(a, power) => Instr::Pow(out, index(a), power),
+                VectorInstruction::Powf(a, b) => Instr::Powf(out, index(a), index(b)),
+                VectorInstruction::BuiltinFun(symbol, a) => {
+                    Instr::BuiltinFun(out, symbol, index(a))
+                }
+                VectorInstruction::ExternalFun(function, args) => {
+                    Instr::ExternalFun(out, function, args.into_iter().map(index).collect())
+                }
+                VectorInstruction::IfElse(condition, label) => {
+                    Instr::IfElse(index(condition), label)
+                }
+                VectorInstruction::Goto(label) => Instr::Goto(label),
+                VectorInstruction::Label(label) => Instr::Label(label),
+                VectorInstruction::Join(condition, a, b) => {
+                    Instr::Join(out, index(condition), index(a), index(b))
+                }
+            };
+            lowered.push((instruction, ComplexPhase::Any));
+        }
+        let mut stack = vec![T::default(); param_count];
+        stack.extend(instructions.constants);
+        stack.resize(reserved_indices + lowered.len(), T::default());
+        Self {
+            stack,
+            param_count,
+            reserved_indices,
+            instructions: lowered,
+            result_indices: outputs.into_iter().map(index).collect(),
+            external_fns,
+            settings,
+        }
+    }
+}
+
 impl<T: Clone> ExpressionEvaluator<T> {
     /// Export the instruction stream, temporary storage size, constants, and sub-evaluators.
     ///
