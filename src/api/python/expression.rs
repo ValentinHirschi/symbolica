@@ -1,5 +1,5 @@
 use super::*;
-use crate::atom::{FunctionBuilder, NormalizationFunction};
+use crate::atom::{FunctionBuilder, NormalizationFunction, ZeroTestSettings};
 use crate::utils::Settable;
 use pyo3::types::{PySlice, PySliceMethods};
 
@@ -2748,11 +2748,10 @@ impl PythonCondition {
 
     /// Render algebraic expressions in the condition using native HTML formatting.
     pub fn _repr_html_(&self) -> String {
-        if let Some(text) = format_algebraic_condition(&self.condition, &solution::formatted_atom) {
-            solution::inline_html(&text)
-        } else {
-            crate::printer::AnsiHtmlFormatter::escape_html(&self.__str__())
-        }
+        display::with_math(|atom| {
+            format_algebraic_condition(&self.condition, &|a| atom(a))
+                .unwrap_or_else(|| self.__str__())
+        })
     }
 
     /// Evaluate the condition, returning None when its truth is undecidable.
@@ -4435,23 +4434,66 @@ impl PythonExpression {
         ))
     }
 
-    /// Convert the expression into an HTML representation.
+    /// Convert the expression into a bounded native MathML representation.
     pub fn _repr_html_(&self) -> PyResult<String> {
-        let formatted = self.expr.format_string(
-            &PrintOptions::new()
-                .max_line_length(Some(80))
-                .multiplication_operator('·')
-                .num_exp_as_superscript(true)
-                .max_terms(Some(100))
-                .color_mode(ColorMode::Always),
-            PrintState::new(),
-        );
+        Ok(display::preview(&self.expr.as_view().render_mathml_page(
+            &display::default_options(),
+            0,
+            crate::printer::mathml::DEFAULT_PAGE_SIZE,
+        )))
+    }
 
-        Ok(crate::printer::AnsiHtmlFormatter::new(&formatted).to_string())
+    /// Prefer native MathML, with live zoom and pagination.
+    #[pyo3(signature = (include=None, exclude=None))]
+    pub fn _repr_mimebundle_(
+        slf: Py<Self>,
+        py: Python<'_>,
+        include: Option<Vec<String>>,
+        exclude: Option<Vec<String>>,
+    ) -> PyResult<Py<PyAny>> {
+        display::formatted(
+            py,
+            slf,
+            display::default_options(),
+            crate::printer::mathml::DEFAULT_PAGE_SIZE,
+        )?
+        ._repr_mimebundle_(py, include, exclude)
+    }
+
+    /// Create a bounded MathML viewer without importing notebook or widget packages.
+    /// Use its page(), handle_message(), and javascript() methods to connect a
+    /// custom frontend. The viewer retains the expression until close() is called.
+    #[pyo3(signature = (page_size=25))]
+    #[gen_stub(override_return_type(type_repr = "MathMLViewer"))]
+    pub fn mathml_viewer(slf: Py<Self>, py: Python<'_>, page_size: usize) -> PyResult<Py<PyAny>> {
+        display::viewer(py, slf, display::default_options(), page_size)
+    }
+
+    /// Return native MathML or a live pager in marimo notebooks.
+    pub fn _display_(slf: Py<Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        display::formatted(
+            py,
+            slf,
+            display::default_options(),
+            crate::printer::mathml::DEFAULT_PAGE_SIZE,
+        )?
+        ._display_(py)
     }
 
     /// Convert the expression into a LaTeX representation.
     pub fn _repr_latex_(&self) -> PyResult<String> {
+        if self
+            .expr
+            .as_view()
+            .render_mathml_page(
+                &display::default_options(),
+                0,
+                crate::printer::mathml::DEFAULT_PAGE_SIZE,
+            )
+            .is_partial()
+        {
+            return Ok(r"$$\text{Large expression: use the MathML viewer}$$".to_owned());
+        }
         self.to_latex(Some(80))
     }
 
@@ -4507,6 +4549,9 @@ impl PythonExpression {
     /// >>> print(E('x^2 + f(x)').format(PrintMode.Mathematica))
     ///
     /// yields `x^2 + f[x]`
+    ///
+    /// `mode=PrintMode.MathML` returns a bounded MathML fragment for embedding
+    /// inside `<math>`. Use `formatted(mode=PrintMode.MathML)` for notebook display.
     ///
     /// Parameters
     /// ----------
@@ -4580,6 +4625,19 @@ impl PythonExpression {
             include_attributes = false,
             custom_print_mode = None)
         )]
+    // inspect.signature tokenizes extension signatures as ASCII. Escape the
+    // middle-dot default so notebook completion can read all parameters.
+    #[pyo3(
+        text_signature = "($self, max_terms=100, mode=..., max_line_length=80, \
+        indentation=4, fill_indented_lines=True, terms_on_new_line=False, \
+        color_top_level_sum=True, color_builtin_symbols=True, \
+        bracket_level_colors=[244, 25, 97, 36, 38, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58, 60], \
+        print_ring=True, symmetric_representation_for_finite_field=False, \
+        explicit_rational_polynomial=False, number_thousands_separator=None, \
+        multiplication_operator='\\u00b7', double_star_for_exponentiation=False, \
+        function_brackets=('(', ')'), num_exp_as_superscript=True, precision=None, \
+        show_namespaces=False, hide_namespace=None, include_attributes=False, custom_print_mode=None)"
+    )]
     pub fn format(
         &self,
         max_terms: Option<usize>,
@@ -4634,8 +4692,17 @@ impl PythonExpression {
 
     /// Convert the expression into a rich display object, with tunable settings.
     ///
-    /// In notebooks, the returned object displays as highlighted HTML while
-    /// `str(...)` returns the plain formatted text.
+    /// In notebooks, the returned object displays as native MathML. Large expressions
+    /// use a bounded, live pager (`symbolica[notebook]`). `page_size` controls the
+    /// number of items per page (1–500). Paged output uses a short text summary;
+    /// `max_terms` controls text in the legacy view and for complete small expressions.
+    /// Set `mathml=False` to restore the highlighted text view. Non-Symbolica
+    /// print modes retain their original text notation; `mode=PrintMode.MathML`
+    /// explicitly selects MathML. Text-layout options
+    /// apply to the text view; MathML uses native fractions, powers and fences.
+    /// Custom printers receive `PrintMode.MathML` and return MathML fragments,
+    /// or `None` for the default rendering. Their output must fit the rendering
+    /// budget; callback implementations are responsible for bounding their work.
     #[pyo3(signature =
         (max_terms = Some(100),
             mode = PythonPrintMode::Symbolica,
@@ -4660,10 +4727,23 @@ impl PythonExpression {
             show_namespaces = false,
             hide_namespace = None,
             include_attributes = false,
-            custom_print_mode = None)
+            custom_print_mode = None, *, mathml = true, page_size = 25)
         )]
+    #[pyo3(
+        text_signature = "($self, max_terms=100, mode=..., max_line_length=80, \
+        indentation=4, fill_indented_lines=True, terms_on_new_line=False, \
+        color_top_level_sum=True, color_builtin_symbols=True, \
+        bracket_level_colors=[244, 25, 97, 36, 38, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58, 60], \
+        print_ring=True, symmetric_representation_for_finite_field=False, \
+        explicit_rational_polynomial=False, number_thousands_separator=None, \
+        multiplication_operator='\\u00b7', double_star_for_exponentiation=False, \
+        function_brackets=('(', ')'), num_exp_as_superscript=True, precision=None, \
+        show_namespaces=False, hide_namespace=None, include_attributes=False, \
+        custom_print_mode=None, *, mathml=True, page_size=25)"
+    )]
     pub fn formatted(
-        &self,
+        slf: Py<Self>,
+        py: Python<'_>,
         max_terms: Option<usize>,
         mode: PythonPrintMode,
         max_line_length: Option<usize>,
@@ -4686,8 +4766,51 @@ impl PythonExpression {
         hide_namespace: Option<&str>,
         include_attributes: bool,
         custom_print_mode: Option<HashMap<String, PythonPrintUserData>>,
+        mathml: bool,
+        page_size: usize,
     ) -> PyResult<PythonFormattedOutput> {
-        let text = self.format_with_color_mode(
+        if matches!(mode, PythonPrintMode::MathML)
+            || (mathml && matches!(mode, PythonPrintMode::Symbolica))
+        {
+            return display::formatted(
+                py,
+                slf,
+                PrintOptions {
+                    max_line_length,
+                    indentation,
+                    fill_indented_lines,
+                    terms_on_new_line,
+                    color_top_level_sum,
+                    color_builtin_symbols,
+                    bracket_level_colors,
+                    print_ring,
+                    symmetric_representation_for_finite_field,
+                    explicit_rational_polynomial,
+                    number_thousands_separator,
+                    multiplication_operator,
+                    double_star_for_exponentiation,
+                    function_brackets,
+                    num_exp_as_superscript,
+                    precision,
+                    hide_all_namespaces: !show_namespaces,
+                    hide_namespace: if show_namespaces {
+                        hide_namespace.map(|s| std::borrow::Cow::Owned(s.to_owned()))
+                    } else {
+                        None
+                    },
+                    include_attributes,
+                    max_terms,
+                    custom_print_mode: custom_print_mode
+                        .map(|m| m.into_iter().map(|(k, v)| (k, v.0)).collect())
+                        .unwrap_or_default(),
+                    ..PrintOptions::new()
+                },
+                page_size,
+            );
+        }
+
+        let expression = slf.get();
+        let text = expression.format_with_color_mode(
             mode,
             max_line_length,
             indentation,
@@ -4713,7 +4836,7 @@ impl PythonExpression {
             ColorMode::Never,
         );
 
-        let formatted = self.format_with_color_mode(
+        let formatted = expression.format_with_color_mode(
             mode,
             max_line_length,
             indentation,
@@ -4738,7 +4861,7 @@ impl PythonExpression {
             custom_print_mode.clone(),
             ColorMode::Always,
         );
-        let latex = self.format_latex_with_options(
+        let latex = expression.format_latex_with_options(
             max_line_length,
             max_terms,
             precision,
@@ -5089,6 +5212,66 @@ impl PythonExpression {
                 self.expr
             ))),
         }
+    }
+
+    /// Test whether the expression is identically zero wherever it is defined.
+    ///
+    /// Returns True when zero is established, False when the expression is found
+    /// to be nonzero, and None when the test cannot decide. Use `is True` when
+    /// proof of zero is required. This tests an identity: `S('x')` returns False
+    /// even though it vanishes at x = 0. Small values are never treated as zero
+    /// using a numerical tolerance.
+    ///
+    /// Numerical nonzero results are heuristic; set numerical_samples=0 to
+    /// disable them. Calls to user-defined functions without evaluation info
+    /// are assumed independent unless identical, which can give false nonzero
+    /// results for identities involving those functions.
+    ///
+    /// Parameters
+    /// ----------
+    /// finite_field_samples: int, optional
+    ///     Maximum finite-field samples (default: 5). Zero disables this stage;
+    ///     values above five have no additional effect.
+    /// numerical_samples: int, optional
+    ///     Maximum numerical sample points (default: 5). Zero disables this stage.
+    /// max_precision: int, optional
+    ///     Maximum numerical working precision in binary bits (default: 1024).
+    ///     Values below 128 restrict numerical testing to machine precision.
+    /// exact_fallback: bool, optional
+    ///     Allow more expensive symbolic checks (default: True). Disable this
+    ///     to limit work, accepting more inconclusive results.
+    /// treat_floats_as_exact: bool, optional
+    ///     Interpret finite floating coefficients as their exact stored values
+    ///     (default: False), including in function arguments and exponents.
+    ///     This ignores their rounding uncertainty and cannot recover lost accuracy.
+    ///
+    /// Examples
+    /// --------
+    /// >>> E('(x+1)^2-x^2-2*x-1').check_zero()
+    /// True
+    /// >>> E('sin(x)^2+cos(x)^2-1').check_zero()
+    /// True
+    /// >>> E('x').check_zero()
+    /// False
+    /// >>> E('log(2)+log(3)-log(6)').check_zero() is None
+    /// True
+    #[pyo3(signature = (*, finite_field_samples = 5, numerical_samples = 5, max_precision = 1024, exact_fallback = true, treat_floats_as_exact = false))]
+    pub fn check_zero(
+        &self,
+        py: Python<'_>,
+        finite_field_samples: usize,
+        numerical_samples: usize,
+        max_precision: u32,
+        exact_fallback: bool,
+        treat_floats_as_exact: bool,
+    ) -> Option<bool> {
+        let settings = ZeroTestSettings::new()
+            .finite_field_samples(finite_field_samples)
+            .numerical_samples(numerical_samples)
+            .max_precision(max_precision)
+            .exact_fallback(exact_fallback)
+            .treat_floats_as_exact(treat_floats_as_exact);
+        py.detach(|| self.expr.check_zero_with(&settings)).into()
     }
 
     /// Check if the expression is a scalar. Symbols must have the scalar attribute.
@@ -8702,9 +8885,9 @@ impl PythonExpression {
     /// functions: Sequence[FunctionDefinition] = []
     ///     Function definitions available to the evaluator.
     /// iterations: int, optional
-    ///     The number of optimization iterations to perform.
+    ///     The number of Horner schemes to try.
     /// cpe_iterations: Optional[int], optional
-    ///     The number of common subexpression elimination iterations to perform.
+    ///     The maximum number of common-pair elimination iterations. If `None`, continue until no more pairs are eliminated.
     /// n_cores: int, optional
     ///     The number of cores to use for the optimization.
     /// verbose: bool, optional
@@ -8725,6 +8908,10 @@ impl PythonExpression {
     ///     The maximum number of entries in the common pair cache.
     /// max_common_pair_distance: int, optional
     ///     The maximum distance between common pairs. Used when clearing cache entries.
+    /// horner_use_cpe: bool, optional
+    ///     If `False` (the default), rank Horner candidates using common-subexpression elimination only.
+    ///     If `True`, also run common-pair elimination for each candidate; this can improve the selected scheme but is more expensive.
+    ///     The selected scheme receives final common-pair elimination in either mode, controlled by `cpe_iterations`.
     #[pyo3(signature =
         (
         params,
@@ -8740,7 +8927,8 @@ impl PythonExpression {
         jit_options = HashMap::default(),
         max_horner_scheme_variables = 500,
         max_common_pair_cache_entries = 1_000_000,
-        max_common_pair_distance = 100),
+        max_common_pair_distance = 100,
+        horner_use_cpe = false),
         )]
     pub fn evaluator(
         &self,
@@ -8758,6 +8946,7 @@ impl PythonExpression {
         max_horner_scheme_variables: usize,
         max_common_pair_cache_entries: usize,
         max_common_pair_distance: usize,
+        horner_use_cpe: bool,
         py: Python,
     ) -> PyResult<PythonExpressionEvaluator> {
         #[cfg(not(feature = "native_code_generation"))]
@@ -8791,6 +8980,7 @@ impl PythonExpression {
 
         let settings = OptimizationSettings {
             horner_iterations: iterations,
+            horner_use_cpe,
             cpe_iterations,
             n_cores,
             verbose: verbose.into(),
@@ -8865,9 +9055,9 @@ impl PythonExpression {
     /// functions: Sequence[FunctionDefinition]
     ///     Function definitions available to the evaluator.
     /// iterations: int
-    ///     The number of optimization passes to run.
+    ///     The number of Horner schemes to try.
     /// cpe_iterations: int | None
-    ///     The number of common subexpression elimination iterations to perform.
+    ///     The maximum number of common-pair elimination iterations. If `None`, continue until no more pairs are eliminated.
     /// n_cores: int
     ///     The number of CPU cores used for parallel optimization.
     /// verbose: bool
@@ -8888,6 +9078,10 @@ impl PythonExpression {
     ///     The maximum number of common-subexpression pairs to cache.
     /// max_common_pair_distance: int
     ///     The maximum distance between factors when searching for common pairs.
+    /// horner_use_cpe: bool
+    ///     If `False` (the default), rank Horner candidates using common-subexpression elimination only.
+    ///     If `True`, also run common-pair elimination for each candidate; this can improve the selected scheme but is more expensive.
+    ///     The selected scheme receives final common-pair elimination in either mode, controlled by `cpe_iterations`.
     #[classmethod]
     #[pyo3(signature =
         (exprs,
@@ -8904,7 +9098,8 @@ impl PythonExpression {
         jit_options = HashMap::default(),
         max_horner_scheme_variables = 500,
         max_common_pair_cache_entries = 1_000_000,
-        max_common_pair_distance = 100)
+        max_common_pair_distance = 100,
+        horner_use_cpe = false)
     )]
     pub fn evaluator_multiple(
         _cls: &Bound<'_, PyType>,
@@ -8923,6 +9118,7 @@ impl PythonExpression {
         max_horner_scheme_variables: usize,
         max_common_pair_cache_entries: usize,
         max_common_pair_distance: usize,
+        horner_use_cpe: bool,
         py: Python,
     ) -> PyResult<PythonExpressionEvaluator> {
         #[cfg(not(feature = "native_code_generation"))]
@@ -8956,6 +9152,7 @@ impl PythonExpression {
 
         let settings = OptimizationSettings {
             horner_iterations: iterations,
+            horner_use_cpe,
             cpe_iterations,
             n_cores,
             verbose: verbose.into(),

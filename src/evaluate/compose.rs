@@ -171,6 +171,7 @@ impl<T: Default + Clone> EvaluatorComposer<T> {
             &mut self.instructions,
             &mut self.external_functions,
             &mut self.next_label,
+            InstructionList::push_scalar_constant,
         );
         // Exporters identify callable functions by name. Reject incompatible
         // definitions instead of silently calling the first evaluator's body.
@@ -207,7 +208,6 @@ impl<T: Default + Clone> EvaluatorComposer<T> {
     where
         T: Eq + Hash,
     {
-        let rounds = settings.cpe_iterations;
         let mut outputs = self.slots(outputs)?;
         self.prune_unused(&mut outputs);
         self.deduplicate_constants(&mut outputs);
@@ -219,18 +219,7 @@ impl<T: Default + Clone> EvaluatorComposer<T> {
             settings,
         );
         evaluator.flatten_composition_operations();
-        loop {
-            if evaluator.settings.abort_level > 0 || evaluator.remove_common_instructions() == 0 {
-                evaluator.settings.abort_level = 0;
-                break;
-            }
-        }
-        for _ in 0..rounds.unwrap_or(usize::MAX) {
-            if evaluator.settings.abort_level > 0 || evaluator.remove_common_pairs() == 0 {
-                evaluator.settings.abort_level = 0;
-                break;
-            }
-        }
+        evaluator.optimize_instructions();
         evaluator.optimize_stack();
         evaluator.fix_labels();
         Ok(evaluator)

@@ -201,34 +201,44 @@ pub struct ExportedSubEvaluator<T> {
 }
 
 impl<T: Default + Clone> ExpressionEvaluator<T> {
-    /// Inline this evaluator's scalar instructions into an instruction list.
-    /// Each output updates the source-slot map after its inputs are read, so reused
-    /// stack slots become distinct temporaries without modifying the source.
-    /// Constants occupy the first component of each vector-sized group; remaining
-    /// components are zero. Shared function bodies are imported without inlining.
-    pub(super) fn inline_instructions(
+    /// Import scalar constants and shared function bodies, remapping their indices.
+    /// The caller chooses how to store literals; registered constant placeholders
+    /// always get distinct slots before any later literal can be interned.
+    pub(super) fn import_context(
         &self,
-        args: &[Slot],
         ins: &mut InstructionList<T>,
         external_functions: &mut Vec<ExternalFunctionContainer<T>>,
-        next_label: &mut usize,
-    ) -> Vec<Slot> {
-        let mut slots = args.to_vec();
-        let constant_offset = ins.constants.len();
-        for value in &self.stack[self.param_count..self.reserved_indices] {
-            slots.push(Slot::Const(ins.constants.len()));
-            // InstructionList tracks constants in vector-sized groups.
-            ins.constants.push(value.clone());
-            ins.constants.extend((1..ins.dim).map(|_| T::default()));
-            ins.unknown_constants.push(false);
+        mut import_scalar_constant: impl FnMut(&mut InstructionList<T>, T) -> Slot,
+    ) -> (Vec<Slot>, Vec<usize>) {
+        let unknown: HashSet<_> = self
+            .external_fns
+            .iter()
+            .filter_map(|external| external.constant_index)
+            .collect();
+        let mut slots = Vec::new();
+        let mut constants = Vec::new();
+        for (index, value) in self.stack[self.param_count..self.reserved_indices]
+            .iter()
+            .enumerate()
+        {
+            let slot = if unknown.contains(&index) {
+                let slot = ins.push_scalar_constant(value.clone());
+                *ins.unknown_constants.last_mut().unwrap() = true;
+                slot
+            } else {
+                import_scalar_constant(ins, value.clone())
+            };
+            let Slot::Const(index) = slot else {
+                panic!("Imported scalar constants must use constant slots");
+            };
+            constants.push(index);
+            slots.push(slot);
         }
-        slots.resize(self.stack.len(), Slot::Temp(0));
         let mut functions = Vec::new();
         for external in &self.external_fns {
             let mut external = external.clone();
             if let Some(index) = external.constant_index.as_mut() {
-                *index = constant_offset + *index * ins.dim;
-                ins.unknown_constants[*index / ins.dim] = true;
+                *index = constants[*index];
             }
             if let Some(body) = &mut external.body {
                 for (instruction, _) in &mut Arc::make_mut(body).instructions {
@@ -250,6 +260,27 @@ impl<T: Default + Clone> ExpressionEvaluator<T> {
                 });
             functions.push(index);
         }
+        (slots, functions)
+    }
+
+    /// Inline this evaluator's scalar instructions into an instruction list.
+    /// Each output updates the source-slot map after its inputs are read, so reused
+    /// stack slots become distinct temporaries without modifying the source.
+    /// Shared function bodies are imported without inlining, and the caller chooses
+    /// how scalar literals are stored in the destination's vector-sized groups.
+    pub(super) fn inline_instructions(
+        &self,
+        args: &[Slot],
+        ins: &mut InstructionList<T>,
+        external_functions: &mut Vec<ExternalFunctionContainer<T>>,
+        next_label: &mut usize,
+        import_scalar_constant: impl FnMut(&mut InstructionList<T>, T) -> Slot,
+    ) -> Vec<Slot> {
+        let (constants, functions) =
+            self.import_context(ins, external_functions, import_scalar_constant);
+        let mut slots = args.to_vec();
+        slots.extend(constants);
+        slots.resize(self.stack.len(), Slot::Temp(0));
         let mut labels = HashMap::default();
         for (instr, _) in &self.instructions {
             if let Instr::Label(label) = instr {
@@ -627,6 +658,17 @@ impl<T> InstructionList<T> {
     pub fn add(&mut self, instr: VectorInstruction) -> Slot {
         self.instructions.push(instr);
         Slot::Temp(self.instructions.len() - 1)
+    }
+}
+
+impl<T: Default> InstructionList<T> {
+    /// Append a scalar in its own vector-sized group without interning it.
+    pub(super) fn push_scalar_constant(&mut self, value: T) -> Slot {
+        let slot = Slot::Const(self.constants.len());
+        self.constants.push(value);
+        self.constants.extend((1..self.dim).map(|_| T::default()));
+        self.unknown_constants.push(false);
+        slot
     }
 }
 

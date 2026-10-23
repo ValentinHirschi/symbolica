@@ -161,6 +161,37 @@ pub trait Ring:
     fn zero(&self) -> Self::Element;
     /// Return the multiplicative identity `1`.
     fn one(&self) -> Self::Element;
+
+    /// Add owned elements, returning zero for an empty iterator.
+    fn sum<I>(&self, elements: I) -> Self::Element
+    where
+        I: IntoIterator<Item = Self::Element>,
+    {
+        let mut elements = elements.into_iter();
+        let Some(mut sum) = elements.next() else {
+            return self.zero();
+        };
+        for element in elements {
+            self.add_assign(&mut sum, element);
+        }
+        sum
+    }
+
+    /// Multiply owned elements, returning one for an empty iterator.
+    fn product<I>(&self, elements: I) -> Self::Element
+    where
+        I: IntoIterator<Item = Self::Element>,
+    {
+        let mut elements = elements.into_iter();
+        let Some(mut product) = elements.next() else {
+            return self.one();
+        };
+        for element in elements {
+            self.mul_assign(&mut product, element);
+        }
+        product
+    }
+
     /// Embed the integer `n` as `n * 1`.
     ///
     /// In a field extension, the result lies in its prime subfield.
@@ -239,6 +270,21 @@ pub trait Ring:
         RingKernels::empty()
     }
 
+    /// Add several coefficient products to one accumulator.
+    ///
+    /// Domains can override this to amortize reduction or representation changes
+    /// over the complete chain. An empty chain leaves the accumulator unchanged.
+    #[inline]
+    fn add_mul_assign_many<'a, I>(&self, accumulator: &mut Self::Element, products: I)
+    where
+        Self::Element: 'a,
+        I: IntoIterator<Item = (&'a Self::Element, &'a Self::Element)>,
+    {
+        for (left, right) in products {
+            self.add_mul_assign(accumulator, left, right);
+        }
+    }
+
     /// Subtract several coefficient products from one accumulator.
     ///
     /// Domains with tagged or multiprecision elements can override this to select the
@@ -262,6 +308,18 @@ pub trait Ring:
         state: PrintState,
         f: &mut W,
     ) -> Result<bool, Error>;
+
+    /// Format a coefficient as a MathML fragment. Structural domains can
+    /// override this; the default safely preserves the exact domain notation.
+    fn format_mathml<W: std::fmt::Write>(
+        &self,
+        element: &Self::Element,
+        opts: &PrintOptions,
+        state: PrintState,
+        f: &mut W,
+    ) -> Result<bool, Error> {
+        crate::printer::mathml::coefficient(self, element, opts, state, f)
+    }
 
     /// Whether the ring does not contain additional information
     /// that cannot be inferred from any element of the ring.
@@ -742,8 +800,20 @@ mod tests {
     use crate::domains::{
         Field, Ring, SampleableRing,
         integer::{Integer, Z},
-        rational::Q,
+        rational::{Q, Rational},
     };
+
+    #[test]
+    fn ring_sum_and_product_use_their_identities_and_owned_elements() {
+        assert_eq!(Z.sum([]), Integer::from(0));
+        assert_eq!(Z.product([]), Integer::from(1));
+        assert_eq!(Z.sum([Integer::from(7)]), Integer::from(7));
+        assert_eq!(Z.product([Integer::from(7)]), Integer::from(7));
+        let values = [(1, 2), (2, 3), (3, 4)].map(Rational::from);
+        assert_eq!(Q.sum(values.clone()), Rational::from((23, 12)));
+        assert_eq!(Q.product(values), Rational::from((1, 4)));
+        assert_eq!(Z.product([1.into(), 0.into(), 3.into()]), Integer::from(0));
+    }
 
     #[test]
     fn small_integer_sampling_is_available_for_every_ring() {
