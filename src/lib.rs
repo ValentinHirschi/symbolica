@@ -128,9 +128,9 @@ pub mod prelude {
         JITCompilationSettings,
     };
     pub use crate::evaluate::{
-        ComposeError, Dualizer, EvaluationDomain, EvaluationFn, EvaluatorBuilder,
+        ComposeError, ComposerSlot, Dualizer, EvaluationDomain, EvaluationFn, EvaluatorBuilder,
         EvaluatorComposer, ExportedInstructions, ExportedSubEvaluator, ExpressionEvaluator,
-        ExternalFunction, FunctionMap, Instruction, OperationCount, OptimizationSettings, Value,
+        ExternalFunction, FunctionMap, Instruction, OperationCount, OptimizationSettings,
         Vectorize,
     };
 

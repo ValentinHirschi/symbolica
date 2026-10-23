@@ -1,12 +1,12 @@
 use super::*;
 mod optimize;
 
-/// A value created by one [`EvaluatorComposer`].
+/// An opaque slot belonging to one [`EvaluatorComposer`].
 ///
 /// Handles remain valid when inputs are added or constants are deduplicated.
 /// A handle from another composer is rejected, even if its index happens to match.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Value {
+pub struct ComposerSlot {
     owner: usize,
     index: usize,
 }
@@ -17,7 +17,7 @@ pub enum ComposeError {
     /// The evaluator's input count differs from the number of bindings.
     ArityMismatch { expected: usize, actual: usize },
     /// A binding or selected output belongs to another composer.
-    ForeignValue,
+    ForeignSlot,
     /// Two evaluators define different functions with the same exported name.
     ConflictingFunction { symbol: Symbol },
 }
@@ -28,7 +28,7 @@ impl std::fmt::Display for ComposeError {
             Self::ArityMismatch { expected, actual } => {
                 write!(f, "Expected {expected} bindings, received {actual}")
             }
-            Self::ForeignValue => write!(f, "Value belongs to another evaluator composer"),
+            Self::ForeignSlot => write!(f, "Slot belongs to another evaluator composer"),
             Self::ConflictingFunction { symbol } => {
                 write!(f, "Conflicting definitions for function '{symbol}'")
             }
@@ -50,8 +50,8 @@ impl std::error::Error for ComposeError {}
 /// let map = parse!("x+y").evaluator(&[parse!("x"), parse!("y")]).build().unwrap();
 /// let function = parse!("z^2").evaluator(&[parse!("z")]).build().unwrap();
 /// let (mut composer, inputs) = EvaluatorComposer::new_with_inputs(2);
-/// let mapped = composer.apply(&map, &inputs).unwrap();
-/// let outputs = composer.apply(&function, &mapped).unwrap();
+/// let mapped = composer.add(&map, &inputs).unwrap();
+/// let outputs = composer.add(&function, &mapped).unwrap();
 /// composer.deduplicate_constants(); // optional; requires exact-value Eq + Hash
 /// let mut evaluator = composer.finish(&outputs, OptimizationSettings::default())
 ///     .unwrap().map_coeff(&|c| c.re.to_f64());
@@ -98,14 +98,14 @@ impl<T: Default + Clone> EvaluatorComposer<T> {
     }
 
     /// Start a program and return its inputs in parameter order.
-    pub fn new_with_inputs(count: usize) -> (Self, Vec<Value>) {
+    pub fn new_with_inputs(count: usize) -> (Self, Vec<ComposerSlot>) {
         let mut composer = Self::new();
         let inputs = (0..count).map(|_| composer.add_input()).collect();
         (composer, inputs)
     }
 
-    fn value(&mut self, slot: Slot) -> Value {
-        let value = Value {
+    fn value(&mut self, slot: Slot) -> ComposerSlot {
+        let value = ComposerSlot {
             owner: self.owner,
             index: self.values.len(),
         };
@@ -113,12 +113,12 @@ impl<T: Default + Clone> EvaluatorComposer<T> {
         value
     }
 
-    fn slots(&self, values: &[Value]) -> Result<Vec<Slot>, ComposeError> {
+    fn slots(&self, values: &[ComposerSlot]) -> Result<Vec<Slot>, ComposeError> {
         values
             .iter()
             .map(|value| {
                 if value.owner != self.owner {
-                    return Err(ComposeError::ForeignValue);
+                    return Err(ComposeError::ForeignSlot);
                 }
                 Ok(self.values[value.index])
             })
@@ -126,31 +126,31 @@ impl<T: Default + Clone> EvaluatorComposer<T> {
     }
 
     /// Declare the next input. Its position is the number of inputs already created.
-    pub fn add_input(&mut self) -> Value {
+    pub fn add_input(&mut self) -> ComposerSlot {
         let slot = Slot::Param(self.parameters);
         self.parameters += 1;
         self.value(slot)
     }
 
     /// Create a literal constant, without imposing an equality policy on `T`.
-    pub fn constant(&mut self, value: T) -> Value {
+    pub fn constant(&mut self, value: T) -> ComposerSlot {
         let slot = Slot::Const(self.instructions.constants.len());
         self.instructions.constants.push(value);
         self.instructions.unknown_constants.push(false);
         self.value(slot)
     }
 
-    /// Apply an evaluator to existing values, returning its outputs in order.
+    /// Add an evaluator bound to existing values, returning its outputs in order.
     ///
     /// The evaluator is borrowed and retains its original instructions and function
     /// bodies. Invalid bindings and conflicting function definitions leave the
     /// composer unchanged. Function bodies and their transitive callees are imported
     /// with remapped indices, preserving shared calls rather than inlining bodies.
-    pub fn apply(
+    pub fn add(
         &mut self,
         evaluator: &ExpressionEvaluator<T>,
-        inputs: &[Value],
-    ) -> Result<Vec<Value>, ComposeError> {
+        inputs: &[ComposerSlot],
+    ) -> Result<Vec<ComposerSlot>, ComposeError> {
         if evaluator.param_count != inputs.len() {
             return Err(ComposeError::ArityMismatch {
                 expected: evaluator.param_count,
@@ -207,7 +207,7 @@ impl<T: Default + Clone> EvaluatorComposer<T> {
     /// [`Self::deduplicate_constants`] first when `T` supports exact equality.
     pub fn finish(
         mut self,
-        outputs: &[Value],
+        outputs: &[ComposerSlot],
         settings: OptimizationSettings,
     ) -> Result<ExpressionEvaluator<T>, ComposeError> {
         let rounds = settings.cpe_iterations;

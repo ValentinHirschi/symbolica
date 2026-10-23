@@ -47,10 +47,10 @@ fn composition_preserves_native_control_flow_callbacks_and_admission() {
         .build()
         .unwrap();
     let (mut c, inputs) = EvaluatorComposer::new_with_inputs(2);
-    let a = c.apply(&p, &inputs).unwrap();
+    let a = c.add(&p, &inputs).unwrap();
     // Invalid work after valid work must preserve labels, constants and outputs.
     assert_eq!(
-        c.apply(&p, &[]),
+        c.add(&p, &[]),
         Err(ComposeError::ArityMismatch {
             expected: 2,
             actual: 0
@@ -59,14 +59,14 @@ fn composition_preserves_native_control_flow_callbacks_and_admission() {
     let mut foreign = EvaluatorComposer::<Complex<Rational>>::new();
     let other = foreign.add_input();
     assert_eq!(
-        c.apply(&p, &[other, inputs[0]]),
-        Err(ComposeError::ForeignValue)
+        c.add(&p, &[other, inputs[0]]),
+        Err(ComposeError::ForeignSlot)
     );
     // Registered function bodies are now accepted and remain shared.
-    c.apply(&body, &[inputs[0]]).unwrap();
-    let b = c.apply(&p, &[inputs[1], inputs[0]]).unwrap();
-    let k = c.apply(&constant, &[]).unwrap();
-    let d = c.apply(&dependent, &[a[1], b[1], a[2]]).unwrap();
+    c.add(&body, &[inputs[0]]).unwrap();
+    let b = c.add(&p, &[inputs[1], inputs[0]]).unwrap();
+    let k = c.add(&constant, &[]).unwrap();
+    let d = c.add(&dependent, &[a[1], b[1], a[2]]).unwrap();
     let selected = vec![
         d[0], a[0], b[0], a[1], b[1], a[2], b[2], k[0], k[1], inputs[1], d[0],
     ];
@@ -131,7 +131,7 @@ fn composition_preserves_native_control_flow_callbacks_and_admission() {
         EvaluatorComposer::<Complex<Rational>>::new()
             .finish(&[other], settings.clone())
             .err(),
-        Some(ComposeError::ForeignValue)
+        Some(ComposeError::ForeignSlot)
     );
     let mut empty = EvaluatorComposer::<Complex<Rational>>::new()
         .finish(&[], settings)
@@ -176,8 +176,8 @@ fn selected_outputs_prune_dead_jets_and_callbacks_before_optimization() {
     .build()
     .unwrap();
     let (mut composed, inputs) = EvaluatorComposer::new_with_inputs(1);
-    let input = composed.apply(&seed, &inputs).unwrap();
-    let output = composed.apply(&lowered, &input).unwrap();
+    let input = composed.add(&seed, &inputs).unwrap();
+    let output = composed.add(&lowered, &input).unwrap();
     let exact = composed
         .finish(&[output[0], output[1]], settings.clone())
         .unwrap();
@@ -204,7 +204,7 @@ fn selected_outputs_prune_dead_jets_and_callbacks_before_optimization() {
         .build()
         .unwrap();
     let (mut unused, inputs) = EvaluatorComposer::new_with_inputs(1);
-    unused.apply(&callback, &[]).unwrap();
+    unused.add(&callback, &[]).unwrap();
     let passthrough = unused.finish(&inputs, settings).unwrap();
     let exported = passthrough.export_instructions();
     assert!(exported.instructions.iter().all(|instruction| matches!(
@@ -229,10 +229,10 @@ fn dynamic_inputs_float_constants_and_stable_handles() {
     let mut c = EvaluatorComposer::default();
     let x = c.add_input();
     let two = c.constant(2.);
-    let first = c.apply(&sum, &[x, two]).unwrap();
+    let first = c.add(&sum, &[x, two]).unwrap();
     let y = c.add_input(); // Inputs may be added after constants and applications.
     let _unused = c.add_input();
-    let second = c.apply(&sum, &[first[0], y]).unwrap();
+    let second = c.add(&sum, &[first[0], y]).unwrap();
     let negative_zero = c.constant(-0.0);
     let nan = c.constant(f64::NAN);
     let mut e = c
@@ -274,13 +274,13 @@ fn foreign_results_and_constants_cannot_alias_local_values() {
         .unwrap();
     let (mut c, local) = EvaluatorComposer::new_with_inputs(2);
     let (mut foreign, other) = EvaluatorComposer::new_with_inputs(2);
-    let local_result = c.apply(&sum, &local).unwrap();
-    let foreign_result = foreign.apply(&sum, &other).unwrap();
+    let local_result = c.add(&sum, &local).unwrap();
+    let foreign_result = foreign.add(&sum, &other).unwrap();
     let foreign_constant = foreign.constant(Complex::<Rational>::default());
     for value in [other[0], foreign_result[0], foreign_constant] {
         assert_eq!(
-            c.apply(&sum, &[local[0], value]),
-            Err(ComposeError::ForeignValue)
+            c.add(&sum, &[local[0], value]),
+            Err(ComposeError::ForeignSlot)
         );
     }
     let mut e = c
@@ -290,7 +290,7 @@ fn foreign_results_and_constants_cannot_alias_local_values() {
     assert_eq!(e.evaluate_single(&[2., 3.]), 5.);
     assert_eq!(
         foreign.finish(&local_result, settings()).err(),
-        Some(ComposeError::ForeignValue)
+        Some(ComposeError::ForeignSlot)
     );
 }
 
@@ -308,8 +308,8 @@ fn pruning_removes_dead_branches_beside_live_nested_branches() {
     .build()
     .unwrap();
     let (mut c, inputs) = EvaluatorComposer::new_with_inputs(2);
-    let out = c.apply(&program, &inputs).unwrap();
-    c.apply(&program, &[inputs[1], inputs[0]]).unwrap();
+    let out = c.add(&program, &inputs).unwrap();
+    c.add(&program, &[inputs[1], inputs[0]]).unwrap();
     let e = c.finish(&[out[0]], settings()).unwrap();
     assert!(e.external_fns.is_empty());
     assert!(e.export_instructions().constant_functions.is_empty());
@@ -348,7 +348,7 @@ fn pruning_removes_dead_branches_beside_live_nested_branches() {
     // Selecting a branch-independent result removes every branch, including its
     // callbacks and precision-dependent constants from the same application.
     let (mut c, inputs) = EvaluatorComposer::new_with_inputs(2);
-    let out = c.apply(&program, &inputs).unwrap();
+    let out = c.add(&program, &inputs).unwrap();
     let e = c.finish(&[out[2]], settings()).unwrap();
     assert!(e.external_fns.is_empty());
     assert!(
@@ -397,13 +397,13 @@ fn shared_functions_remap_transitive_calls_and_reject_conflicts_atomically() {
         .build()
         .unwrap();
     let (mut c, inputs) = EvaluatorComposer::new_with_inputs(2);
-    c.apply(&dead, &[inputs[0]]).unwrap(); // Force live function-table indices to move.
-    let a = c.apply(&original, &inputs).unwrap();
+    c.add(&dead, &[inputs[0]]).unwrap(); // Force live function-table indices to move.
+    let a = c.add(&original, &inputs).unwrap();
     assert!(matches!(
-        c.apply(&conflicting, &inputs),
+        c.add(&conflicting, &inputs),
         Err(ComposeError::ConflictingFunction { .. })
     ));
-    let b = c.apply(&original, &[inputs[1], inputs[0]]).unwrap();
+    let b = c.add(&original, &[inputs[1], inputs[0]]).unwrap();
     let root_instructions = original.instructions.clone();
     let original_bodies: Vec<_> = original
         .external_fns
@@ -475,9 +475,9 @@ fn finish_eliminates_common_instructions_and_pairs_across_applications() {
         .unwrap();
     let compose = |rounds| {
         let (mut c, inputs) = EvaluatorComposer::new_with_inputs(4);
-        let a = c.apply(&first, &inputs).unwrap();
-        let duplicate = c.apply(&first, &inputs).unwrap();
-        let b = c.apply(&second, &inputs).unwrap();
+        let a = c.add(&first, &inputs).unwrap();
+        let duplicate = c.add(&first, &inputs).unwrap();
+        let b = c.add(&second, &inputs).unwrap();
         c.finish(
             &[a[0], duplicate[0], b[0]],
             settings().cpe_iterations(rounds),
@@ -520,7 +520,7 @@ fn pruning_preserves_lazy_callbacks_in_live_branches() {
         2. * args[0]
     }));
     let (mut c, inputs) = EvaluatorComposer::new_with_inputs(2);
-    let out = c.apply(&original, &inputs).unwrap();
+    let out = c.add(&original, &inputs).unwrap();
     let mut e = c.finish(&out, settings()).unwrap();
     assert_eq!(e.evaluate_single(&[0., -100.]), 7.);
     assert_eq!(calls.load(Ordering::Relaxed), 0);
