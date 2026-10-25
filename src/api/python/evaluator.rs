@@ -364,6 +364,33 @@ impl PythonEvaluatorInstructions {
             .collect()
     }
 
+    /// Registered constants and fixed-argument functions (such as `pi`) held in
+    /// `('const', index)` slots, as `(index, function, tags, arguments)`. The exact
+    /// `constants` cannot represent their values and hold placeholders at these
+    /// indices: evaluate `function` with its `tags` at the exact `arguments` (empty
+    /// for a constant) in the target precision before using such a slot.
+    #[getter]
+    fn constant_functions(
+        &self,
+    ) -> Vec<(usize, PythonExpression, Vec<String>, Vec<PythonExpression>)> {
+        self.exported
+            .constant_functions
+            .iter()
+            .map(|constant| {
+                (
+                    constant.index,
+                    Atom::var(constant.symbol).into(),
+                    constant.tags.clone(),
+                    constant
+                        .fixed_args
+                        .iter()
+                        .map(|argument| Atom::num(argument.clone()).into())
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
     /// Non-inlined function bodies referenced by `fun` instructions in this stream.
     #[getter]
     fn sub_evaluators(&self) -> Vec<PythonEvaluatorFunction> {

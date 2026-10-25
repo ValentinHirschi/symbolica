@@ -11301,6 +11301,14 @@ class EvaluatorInstructions:
         """Exact constants referenced by `('const', index)` slots."""
 
     @property
+    def constant_functions(self) -> list[tuple[int, Expression, list[str], list[Expression]]]:
+        """Registered constants and fixed-argument functions (such as `pi`) held in
+        `('const', index)` slots, as `(index, function, tags, arguments)`. The exact
+        `constants` cannot represent their values and hold placeholders at these
+        indices: evaluate `function` with its `tags` at the exact `arguments` (empty
+        for a constant) in the target precision before using such a slot."""
+
+    @property
     def sub_evaluators(self) -> list[EvaluatorFunction]:
         """Non-inlined function bodies referenced by `fun` instructions in this stream."""
 
