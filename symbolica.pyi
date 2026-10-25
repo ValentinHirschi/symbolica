@@ -11326,6 +11326,15 @@ class EvaluatorFunction:
 class Evaluator:
     """An optimized evaluator of an expression."""
 
+    @classmethod
+    def from_instructions(cls, instructions: EvaluatorInstructions) -> Evaluator:
+        """Create an evaluator from the output of `get_instructions()`.
+
+        Retained function bodies and registered constant definitions are preserved.
+        External functions must still be registered on their symbols. JIT compilation
+        can be enabled afterwards with `jit_compile(True)`.
+        """
+
     def __copy__(self) -> Evaluator:
         """
         Copy the evaluator.

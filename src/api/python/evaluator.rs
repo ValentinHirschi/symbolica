@@ -564,6 +564,36 @@ fn reshape_evaluator_inputs<T: Clone>(
 #[cfg_attr(not(feature = "python_stubgen"), remove_gen_stub)]
 #[pymethods]
 impl PythonExpressionEvaluator {
+    /// Create an evaluator from the output of `get_instructions()`.
+    ///
+    /// Retained function bodies and registered constant definitions are preserved.
+    /// External functions must still be registered on their symbols. JIT compilation
+    /// can be enabled afterwards with `jit_compile(True)`.
+    #[classmethod]
+    fn from_instructions(
+        _cls: &Bound<'_, PyType>,
+        instructions: &PythonEvaluatorInstructions,
+    ) -> PyResult<Self> {
+        let eval = ExpressionEvaluator::from_instructions(&instructions.exported)
+            .map_err(exceptions::PyValueError::new_err)?;
+        Ok(Self {
+            rational_constants: eval.get_constants().to_vec(),
+            eval_complex: eval.map_coeff(&|c| Complex::new(c.re.to_f64(), c.im.to_f64())),
+            eval_real: None,
+            #[cfg(feature = "native_code_generation")]
+            jit_real: None,
+            #[cfg(feature = "native_code_generation")]
+            jit_complex: None,
+            eval_double_float: None,
+            eval_double_float_complex: None,
+            eval_arb_prec: None,
+            eval_arb_prec_complex: None,
+            jit_compile: false,
+            #[cfg(feature = "native_code_generation")]
+            jit_settings: JITCompilationSettings::default(),
+        })
+    }
+
     /// Copy the evaluator.
     pub fn __copy__(&self) -> PythonExpressionEvaluator {
         PythonExpressionEvaluator {
