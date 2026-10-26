@@ -1,8 +1,10 @@
 use super::{ExportedInstructions, ExportedSubEvaluator, Instruction, Slot};
 use crate::{
     atom::{Atom, AtomCore, EvaluationInfo, Symbol},
+    coefficient::Coefficient,
     domains::{
         dual::HyperDual,
+        finite_field::{FiniteFieldCore, Zp64},
         float::{Complex, Float, RealLike},
         rational::Rational,
     },
@@ -12,6 +14,18 @@ use crate::{
     parse, symbol,
 };
 use std::sync::Arc;
+
+fn expression_tags() -> Vec<Atom> {
+    let field = Zp64::new(17);
+    let value = field.to_element(5);
+    vec![
+        Atom::num(2),
+        parse!("symbolica::import_test::tag"),
+        parse!("symbolica::import_test::tag + 1"),
+        // This coefficient's domain cannot be preserved by parsing its printed value.
+        Atom::num(Coefficient::from_finite_field(field, value)),
+    ]
+}
 
 fn instructions(
     input_count: usize,
@@ -157,28 +171,120 @@ fn import_preserves_lazy_control_flow_and_branch_local_values() {
 }
 
 #[test]
-fn import_resolves_symbolic_tags_for_registered_functions() {
-    let _tagged = symbol!(
+fn import_preserves_expression_tags_for_registered_functions() {
+    let tags = expression_tags();
+    let expected = tags.clone();
+    let tagged = symbol!(
         "symbolica::import_test::tagged",
-        eval = EvaluationInfo::new().with_tags(2).register_tagged(|tags| {
-            assert_eq!(tags[0], parse!("symbolica::import_test::tag").as_view());
-            let scale = if tags[1] == 2 { 3. } else { 11. };
-            Box::new(move |args: &[f64]| scale * args[0])
-        })
+        eval = EvaluationInfo::new()
+            .with_tags(4)
+            .register_tagged(move |tags| {
+                assert_eq!(
+                    tags[1..]
+                        .iter()
+                        .map(|tag| tag.to_owned())
+                        .collect::<Vec<_>>(),
+                    expected[1..],
+                );
+                let scale = if tags[0] == 2 { 3. } else { 11. };
+                Box::new(move |args: &[f64]| scale * args[0])
+            })
     );
-    let expressions = [
-        parse!("symbolica::import_test::tagged(symbolica::import_test::tag, 2, x)"),
-        parse!("symbolica::import_test::tagged(symbolica::import_test::tag, 3, x)"),
-    ];
-    let original = Atom::evaluator_multiple(&expressions, &[parse!("x")])
+    let mut arguments = tags.clone();
+    arguments.push(parse!("x"));
+    let first = tagged.call(&arguments);
+    arguments[0] = Atom::num(3);
+    let expressions = [first, tagged.call(&arguments)];
+    for direct in [false, true] {
+        let original = Atom::evaluator_multiple(&expressions, &[parse!("x")])
+            .direct_translation(direct)
+            .build()
+            .unwrap()
+            .map_coeff(&|c| c.re.to_f64());
+        let mut exported = original.export_instructions();
+        let mut imported = ExpressionEvaluator::from_instructions(&exported).unwrap();
+        let mut output = [0.; 2];
+        imported.evaluate(&[2.], &mut output);
+        assert_eq!(output, [6., 22.]);
+        assert!(
+            imported
+                .export_instructions()
+                .instructions
+                .iter()
+                .any(|instruction| {
+                    matches!(instruction, Instruction::Fun(_, call, _) if call.1 == tags)
+                })
+        );
+
+        let call = exported
+            .instructions
+            .iter_mut()
+            .find_map(|instruction| {
+                if let Instruction::Fun(_, call, _) = instruction {
+                    Some(call)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        call.1.pop();
+        assert!(ExpressionEvaluator::from_instructions(&exported).is_err());
+    }
+}
+
+#[test]
+fn import_dispatches_retained_bodies_by_expression_tags() {
+    let function = symbol!("symbolica::import_test::tagged_body");
+    let x = symbol!("x");
+    let y = symbol!("y");
+    let first_tags = expression_tags();
+    let mut second_tags = first_tags.clone();
+    second_tags[0] = Atom::num(3);
+    let mut functions = FunctionMap::new();
+    for (tags, body) in [
+        (first_tags.clone(), parse!("y^2")),
+        (second_tags.clone(), parse!("y + 7")),
+    ] {
+        functions
+            .add_tagged_function_with_options(
+                function,
+                tags,
+                vec![y],
+                body,
+                FunctionRegistrationOptions::new().inlining(InliningPolicy::Never),
+            )
+            .unwrap();
+    }
+    let expressions = [first_tags.clone(), second_tags.clone()].map(|mut tags| {
+        tags.push(x.to_atom());
+        function.call(&tags)
+    });
+    let original = Atom::evaluator_multiple(&expressions, &[x.to_atom()])
+        .function_map(functions)
         .build()
+        .unwrap();
+    let exported = original.export_instructions();
+    assert_eq!(exported.sub_evaluators.len(), 2);
+    let imported = ExpressionEvaluator::from_instructions(&exported).unwrap();
+    let reexported = imported.export_instructions();
+    assert!(
+        reexported
+            .sub_evaluators
+            .iter()
+            .any(|body| body.tags == first_tags)
+    );
+    assert!(
+        reexported
+            .sub_evaluators
+            .iter()
+            .any(|body| body.tags == second_tags)
+    );
+    let mut restored = ExpressionEvaluator::from_instructions(&reexported)
         .unwrap()
         .map_coeff(&|c| c.re.to_f64());
-    let mut imported =
-        ExpressionEvaluator::from_instructions(&original.export_instructions()).unwrap();
     let mut output = [0.; 2];
-    imported.evaluate(&[2.], &mut output);
-    assert_eq!(output, [6., 22.]);
+    restored.evaluate(&[3.], &mut output);
+    assert_eq!(output, [9., 10.]);
 }
 
 #[test]
@@ -253,32 +359,71 @@ fn import_nested_shared_function_bodies_with_captures_and_branches() {
 
 #[test]
 fn import_retains_external_constants_and_fixed_arguments_at_target_precision() {
-    let _constant = symbol!(
+    let tags = expression_tags();
+    let expected = tags.clone();
+    let constant = symbol!(
         "symbolica::import_test::precision",
         // Encode the requested precision in the value to detect eager resolution
         // or loss of the definition during an exact or numeric round trip.
-        eval = EvaluationInfo::constant(|_, precision| {
+        eval = EvaluationInfo::constant(move |tags, precision| {
+            assert_eq!(
+                tags.iter().map(|tag| tag.to_owned()).collect::<Vec<_>>(),
+                expected,
+            );
             Ok(Float::with_val(precision, precision).into())
         })
+        .with_tags(4)
     );
-    let _square = symbol!(
+    let expected_complex = tags.clone();
+    let expected_real = tags.clone();
+    let square = symbol!(
         "symbolica::import_test::square",
         eval = EvaluationInfo::new()
-            .register(|args: &[Complex<Float>]| args[0].clone() * &args[0])
-            .register(|args: &[f64]| args[0] * args[0])
+            .with_tags(4)
+            .register_tagged(move |tags| {
+                assert_eq!(
+                    tags.iter().map(|tag| tag.to_owned()).collect::<Vec<_>>(),
+                    expected_complex,
+                );
+                Box::new(|args: &[Complex<Float>]| args[0].clone() * &args[0])
+            })
+            .register_tagged(move |tags| {
+                assert_eq!(
+                    tags.iter().map(|tag| tag.to_owned()).collect::<Vec<_>>(),
+                    expected_real,
+                );
+                Box::new(|args: &[f64]| args[0] * args[0])
+            })
     );
-    let exact =
-        parse!("symbolica::import_test::precision + symbolica::import_test::square(3/2) + 1")
-            .evaluator::<Atom>(&[])
-            .build()
-            .unwrap();
+    let mut fixed_arguments = tags.clone();
+    fixed_arguments.push(parse!("3/2"));
+    let exact = (constant.call(&tags) + square.call(&fixed_arguments) + 1)
+        .evaluator::<Atom>(&[])
+        .build()
+        .unwrap();
     let exported = exact.export_instructions();
     assert_eq!(exported.constant_functions.len(), 2);
+    assert!(
+        exported
+            .constant_functions
+            .iter()
+            .all(|constant| constant.tags == tags)
+    );
     assert!(exported.constant_functions.iter().any(|constant| {
         constant.symbol == symbol!("symbolica::import_test::square")
             && constant.fixed_args == vec![Complex::new(Rational::from((3, 2)), Rational::from(0))]
     }));
     let imported = ExpressionEvaluator::from_instructions(&exported).unwrap();
+    assert!(
+        imported
+            .export_instructions()
+            .constant_functions
+            .iter()
+            .all(|constant| constant.tags == tags)
+    );
+    let mut invalid = exported.clone();
+    invalid.constant_functions[0].tags.pop();
+    assert!(ExpressionEvaluator::from_instructions(&invalid).is_err());
     for precision in [64, 128] {
         let mut mapped = imported.clone().map_coeff_with_prec(
             &|c| {

@@ -11302,16 +11302,41 @@ class EvaluatorInstructions:
         """Exact constants referenced by `('const', index)` slots."""
 
     @property
-    def constant_functions(self) -> list[tuple[int, Expression, list[str], list[Expression]]]:
+    def constant_functions(self) -> list[EvaluatorConstantFunction]:
         """Registered constants and fixed-argument functions (such as `pi`) held in
-        `('const', index)` slots, as `(index, function, tags, arguments)`. The exact
-        `constants` cannot represent their values and hold placeholders at these
-        indices: evaluate `function` with its `tags` at the exact `arguments` (empty
-        for a constant) in the target precision before using such a slot."""
+        `('const', index)` slots. Each entry exposes `index`, `function`, `tags`,
+        and `arguments`. The exact `constants` hold placeholders at these indices:
+        evaluate `function` with its `tags` at the exact `arguments` in the target
+        precision before using such a slot."""
 
     @property
     def sub_evaluators(self) -> list[EvaluatorFunction]:
         """Non-inlined function bodies referenced by `fun` instructions in this stream."""
+
+    def __repr__(self) -> str: ...
+
+class EvaluatorConstantFunction:
+    """A registered constant or fixed-argument function in an evaluator constant slot.
+
+    Returned by `EvaluatorInstructions.constant_functions`. Its properties are
+    read-only; function names, tags, and arguments are `Expression` objects.
+    """
+
+    @property
+    def index(self) -> int:
+        """The index of the corresponding slot in `EvaluatorInstructions.constants`."""
+
+    @property
+    def function(self) -> Expression:
+        """The registered function or constant symbol."""
+
+    @property
+    def tags(self) -> list[Expression]:
+        """The expression tags used to distinguish this function implementation."""
+
+    @property
+    def arguments(self) -> list[Expression]:
+        """The exact numerical arguments, empty for a registered constant such as `pi`."""
 
     def __repr__(self) -> str: ...
 

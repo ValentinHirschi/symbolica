@@ -1,13 +1,14 @@
 use super::*;
 
 impl<T: FloatLike + EvaluationDomain> ExpressionEvaluator<T> {
-    /// Load an evaluator from its portable instruction representation.
+    /// Load an evaluator from its structured instruction representation.
     ///
     /// Constants retain their exported values and precision. Registered constant
     /// definitions are retained as well, so a later [`Self::map_coeff_with_prec`]
     /// resolves them at the requested precision. External callbacks are looked up
     /// in their symbols' registered evaluation information, just as when loading
     /// a serialized evaluator; an unavailable callback remains unresolved.
+    /// Function tags retain their original symbolic expressions.
     ///
     /// Invalid slots, instructions, control flow, and function signatures return
     /// an error. Jumps must be forward, and every read and output must be defined
@@ -47,16 +48,6 @@ impl<T: FloatLike + EvaluationDomain> ExpressionEvaluator<T> {
             settings: OptimizationSettings::default(),
         })
     }
-}
-
-// Canonical exported strings carry their own namespaces.
-fn import_tags(tags: &[String]) -> Result<Vec<Atom>, String> {
-    tags.iter()
-        .map(|tag| {
-            Atom::parse(tag, "symbolica", Default::default())
-                .map_err(|error| format!("Invalid function tag {tag:?}: {error}"))
-        })
-        .collect()
 }
 
 type Signature = (Symbol, Vec<Atom>);
@@ -213,7 +204,7 @@ impl<T: EvaluationDomain> Importer<T> {
                     constant.index
                 ));
             }
-            let tags = import_tags(&constant.tags)?;
+            let tags = constant.tags.clone();
             Self::check_tags(constant.symbol, &tags)?;
             let mut external = Self::container(constant.symbol, tags, constant.fixed_args.clone())?;
             external.constant_index = Some(constant.index);
@@ -223,7 +214,7 @@ impl<T: EvaluationDomain> Importer<T> {
 
         let mut local_functions = HashMap::default();
         for sub in &exported.sub_evaluators {
-            let tags = import_tags(&sub.tags)?;
+            let tags = sub.tags.clone();
             let signature = (sub.symbol, tags.clone());
             if local_functions.contains_key(&signature) {
                 return Err(format!(
@@ -302,14 +293,13 @@ impl<T: EvaluationDomain> Importer<T> {
                 ),
                 Instruction::Fun(output, function, real) => {
                     let (symbol, tags, arguments) = &**function;
-                    let tags = import_tags(tags)?;
                     let args = arguments
                         .iter()
                         .copied()
                         .map(slot)
                         .collect::<Result<Vec<_>, _>>()?;
                     let output = destination(*output)?;
-                    let signature = (*symbol, tags);
+                    let signature = (*symbol, tags.clone());
                     let instruction =
                         if let Some((index, input_count)) = local_functions.get(&signature) {
                             if args.len() != *input_count {

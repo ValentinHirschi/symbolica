@@ -1,5 +1,5 @@
 use super::*;
-use crate::evaluate::{FunctionRegistrationOptions, InliningPolicy};
+use crate::evaluate::{ExportedConstantFunction, FunctionRegistrationOptions, InliningPolicy};
 use crate::state::StateMap;
 
 // The final byte versions the state-aware evaluator envelope.
@@ -312,6 +312,18 @@ pub struct PythonEvaluatorInstructions {
     exported: Arc<ExportedInstructions<Complex<Rational>>>,
 }
 
+/// A registered constant or fixed-argument function in an instruction stream's constant slots.
+#[cfg_attr(feature = "python_stubgen", gen_stub_pyclass)]
+#[pyclass(
+    from_py_object,
+    name = "EvaluatorConstantFunction",
+    module = "symbolica.core"
+)]
+#[derive(Clone)]
+pub struct PythonEvaluatorConstantFunction {
+    constant: ExportedConstantFunction,
+}
+
 /// A non-inlined function evaluator referenced by an instruction stream.
 #[cfg_attr(feature = "python_stubgen", gen_stub_pyclass)]
 #[pyclass(from_py_object, name = "EvaluatorFunction", module = "symbolica.core")]
@@ -326,6 +338,14 @@ impl From<ExportedInstructions<Complex<Rational>>> for PythonEvaluatorInstructio
     fn from(exported: ExportedInstructions<Complex<Rational>>) -> Self {
         Self {
             exported: Arc::new(exported),
+        }
+    }
+}
+
+impl From<&ExportedConstantFunction> for PythonEvaluatorConstantFunction {
+    fn from(constant: &ExportedConstantFunction) -> Self {
+        Self {
+            constant: constant.clone(),
         }
     }
 }
@@ -521,30 +541,17 @@ impl PythonEvaluatorInstructions {
             .collect()
     }
 
-    /// Registered constants and fixed-argument functions (such as `pi`) held in
-    /// `('const', index)` slots, as `(index, function, tags, arguments)`. The exact
-    /// `constants` cannot represent their values and hold placeholders at these
-    /// indices: evaluate `function` with its `tags` at the exact `arguments` (empty
-    /// for a constant) in the target precision before using such a slot.
+    /// Symbolic definitions of constant slots held by registered constants or
+    /// fixed-argument functions, such as `pi` or `exp(1)`.
+    /// The exact `constants` contain placeholders at each entry's `index`.
+    /// Evaluate its `function` with its `tags` and exact `arguments` at the target
+    /// precision before using that slot.
     #[getter]
-    fn constant_functions(
-        &self,
-    ) -> Vec<(usize, PythonExpression, Vec<String>, Vec<PythonExpression>)> {
+    fn constant_functions(&self) -> Vec<PythonEvaluatorConstantFunction> {
         self.exported
             .constant_functions
             .iter()
-            .map(|constant| {
-                (
-                    constant.index,
-                    Atom::var(constant.symbol).into(),
-                    constant.tags.clone(),
-                    constant
-                        .fixed_args
-                        .iter()
-                        .map(|argument| Atom::num(argument.clone()).into())
-                        .collect(),
-                )
-            })
+            .map(PythonEvaluatorConstantFunction::from)
             .collect()
     }
 
@@ -560,13 +567,66 @@ impl PythonEvaluatorInstructions {
 
     fn __repr__(&self) -> String {
         format!(
-            "EvaluatorInstructions(input_count={}, output_count={}, instructions={}, temporary_count={}, constants={}, sub_evaluators={})",
+            "EvaluatorInstructions(input_count={}, output_count={}, instructions={}, temporary_count={}, constants={}, constant_functions={}, sub_evaluators={})",
             self.exported.input_count,
             self.exported.output_count,
             self.exported.instructions.len(),
             self.exported.temporary_count,
             self.exported.constants.len(),
+            self.exported.constant_functions.len(),
             self.exported.sub_evaluators.len()
+        )
+    }
+}
+
+#[cfg_attr(feature = "python_stubgen", gen_stub_pymethods)]
+#[cfg_attr(not(feature = "python_stubgen"), remove_gen_stub)]
+#[pymethods]
+impl PythonEvaluatorConstantFunction {
+    /// The index of the `('const', index)` slot in `EvaluatorInstructions.constants`.
+    #[getter]
+    fn index(&self) -> usize {
+        self.constant.index
+    }
+
+    /// The registered constant or function symbol, as an `Expression`.
+    #[getter]
+    fn function(&self) -> PythonExpression {
+        Atom::var(self.constant.symbol).into()
+    }
+
+    /// The expression tags used to distinguish this function implementation.
+    #[getter]
+    fn tags(&self) -> Vec<PythonExpression> {
+        self.constant
+            .tags
+            .iter()
+            .cloned()
+            .map(PythonExpression::from)
+            .collect()
+    }
+
+    /// The exact numerical arguments, as expressions; empty for a registered constant.
+    #[getter]
+    fn arguments(&self) -> Vec<PythonExpression> {
+        self.constant
+            .fixed_args
+            .iter()
+            .map(|argument| Atom::num(argument.clone()).into())
+            .collect()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "EvaluatorConstantFunction(index={}, function={}, tags={:?}, arguments={:?})",
+            self.constant.index,
+            Atom::var(self.constant.symbol),
+            self.constant.tags,
+            self.constant
+                .fixed_args
+                .iter()
+                .map(|argument| Atom::num(argument.clone()))
+                .collect::<Vec<_>>()
         )
     }
 }
