@@ -9,6 +9,7 @@ pub(super) fn wrapping_mathml(html: &str) -> Option<String> {
     let mut start = 0;
     let mut attributes = 0;
     let mut root_attributes = String::new();
+    let mut displaystyle = None;
     let mut row_attributes = "";
     let mut style = "";
     let mut term = (0, 0, false);
@@ -30,7 +31,10 @@ pub(super) fn wrapping_mathml(html: &str) -> Option<String> {
             Token::Attribute {
                 local, value, span, ..
             } => {
-                if depth == 0 && local.as_str() != "xmlns" {
+                if depth == 0 && local.as_str() == "displaystyle" {
+                    displaystyle = Some(span.as_str());
+                }
+                if depth == 0 && !matches!(local.as_str(), "xmlns" | "displaystyle") {
                     root_attributes.push(' ');
                     root_attributes.push_str(span.as_str());
                 }
@@ -91,13 +95,17 @@ pub(super) fn wrapping_mathml(html: &str) -> Option<String> {
         "<div class=\"symbolica-math-flow\"{root_attributes}><style>.symbolica-math-flow>div{{max-width:100%!important}}.symbolica-math-flow>div>math{{font:inherit;font-synthesis:none;flex:none}}</style><div{row_attributes}>"
     );
     for (whole, content, row) in terms {
+        result.push_str("<math");
+        if let Some(displaystyle) = displaystyle {
+            result.push(' ');
+            result.push_str(displaystyle);
+        }
         if row {
             // Replace the term wrapper rather than adding a second one.
-            result.push_str("<math");
             result.push_str(&html[whole.start + "<mrow".len()..content.start]);
             result.push_str(&html[content]);
         } else {
-            result.push_str("<math>");
+            result.push('>');
             result.push_str(&html[whole]);
         }
         result.push_str("</math>");
@@ -130,6 +138,24 @@ mod tests {
             "<math>",
         ] {
             assert!(wrapping_mathml(html).is_none(), "{html}");
+        }
+    }
+
+    #[test]
+    fn static_flow_keeps_displaystyle_on_each_math_root() {
+        for displaystyle in ["true", "false"] {
+            let input = format!(
+                "<math displaystyle=\"{displaystyle}\"><mrow style=\"display:flex;flex-wrap:wrap\"><mrow><mfrac><mi>x</mi><mn>8</mn></mfrac></mrow><mo>+</mo><mrow><mi>y</mi></mrow></mrow></math>"
+            );
+            let html = wrapping_mathml(&input).unwrap();
+            assert_eq!(
+                html.matches(&format!("<math displaystyle=\"{displaystyle}\""))
+                    .count(),
+                3
+            );
+            assert!(!html.contains(&format!(
+                "class=\"symbolica-math-flow\" displaystyle=\"{displaystyle}\""
+            )));
         }
     }
 }

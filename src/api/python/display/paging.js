@@ -302,6 +302,8 @@ function render({ model, el }) {
       }
       for (const child of [...row.children]) {
         const term = doc.createElementNS(math.namespaceURI, 'math');
+        const displaystyle = math.getAttribute('displaystyle');
+        if (displaystyle !== null) term.setAttribute('displaystyle', displaystyle);
         if (child.localName === 'mrow') {
           for (const { name, value } of child.attributes) term.setAttribute(name, value);
           term.append(...child.childNodes);
