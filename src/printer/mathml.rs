@@ -1,6 +1,7 @@
 //! Bounded native MathML presentation. Omitted subtrees are display metadata,
 //! never substitutions in the underlying expression.
 use super::*;
+mod compact;
 mod cursor;
 mod structured;
 use cursor::MathMlChildren;
@@ -89,6 +90,8 @@ struct Renderer<'a, 'r> {
     multiline_sums: bool,
     markers: Vec<MathMlMarker>,
     semantic: Option<&'r mut SemanticPrinter<'r>>,
+    probing_compact_tail: bool,
+    compact_probe_remaining: usize,
     failed: bool,
 }
 
@@ -333,6 +336,59 @@ impl Renderer<'_, '_> {
         total - start
     }
 
+    // Probe only after rendering the retained prefix: scoped formatters may
+    // allocate index aliases in visitation order. Keep the rendered fragments
+    // and their budget charges on success, so callbacks are never repeated.
+    // The few-glyph allowance favors readable notation; the browser still
+    // selects the responsive layout using actual measured widths.
+    fn compact_semantic_tail(
+        &mut self,
+        atom: AtomView<'_>,
+        path: &mut Vec<usize>,
+        depth: usize,
+        start: usize,
+        state: PrintState,
+    ) -> Vec<(String, Option<FractionParts>)> {
+        let total = atom.mathml_child_count();
+        if self.semantic.is_none()
+            || self.probing_compact_tail
+            || self.compact_probe_remaining == 0
+            || self.failed
+            || self.budget_exhausted
+            || depth == 0
+            || total.saturating_sub(start) > 4
+            || self.hard_limit(atom, depth)
+        {
+            return vec![];
+        }
+        let checkpoint = self.checkpoint();
+        self.probing_compact_tail = true;
+        let mut tail = Vec::new();
+        let mut visible = String::new();
+        for (i, child) in MathMlChildren::new(atom, start, self.cursors) {
+            path.push(i);
+            let mut parts = None;
+            let html = self.render_factor(child, path, depth + 1, &mut parts, state);
+            path.pop();
+            if !tail.is_empty() {
+                visible.push_str("<mo>,</mo>");
+            }
+            visible.push_str(&html);
+            if self.failed
+                || self.budget_exhausted
+                || self.markers.len() != checkpoint.2
+                || !compact::fits(&visible, 4)
+            {
+                self.restore(checkpoint);
+                self.probing_compact_tail = false;
+                return vec![];
+            }
+            tail.push((html, parts));
+        }
+        self.probing_compact_tail = false;
+        tail
+    }
+
     fn hole(&mut self, atom: AtomView<'_>, path: &[usize]) -> String {
         let marker = self.hole_at(atom, path, 0);
         // A collapsed call still exposes its head, while the marker opens its
@@ -495,6 +551,13 @@ impl Renderer<'_, '_> {
         if self.failed {
             return String::new();
         }
+        if self.probing_compact_tail {
+            // Rejected probes restore output budgets, but must not refund work.
+            if self.compact_probe_remaining == 0 {
+                return self.hole(atom, path);
+            }
+            self.compact_probe_remaining -= 1;
+        }
         // Explicit expansion reveals a little more depth along this branch.
         // Both the absolute depth and the existing node/text budgets still apply.
         let depth_limit = self
@@ -510,6 +573,15 @@ impl Renderer<'_, '_> {
         }
         if let Some(custom) = self.semantic(atom, path, state) {
             return custom;
+        }
+        // A tail probe may render an opaque semantic leaf or a small native
+        // expression, including powers of semantic leaves. Never walk a large
+        // native subtree merely to decide whether its marker saves space.
+        if self.probing_compact_tail
+            && !matches!(atom, AtomView::Pow(_))
+            && self.compact_cost(atom, 4).is_none()
+        {
+            return self.hole(atom, path);
         }
         if depth >= depth_limit
             && (atom.mathml_child_count() > 0)
@@ -803,19 +875,34 @@ impl Renderer<'_, '_> {
         };
         let mut end = start;
         let total = atom.mathml_child_count();
-        for (i, child) in MathMlChildren::new(atom, start, self.cursors).take(limit) {
+        let mut tail = vec![].into_iter();
+        for (i, child) in MathMlChildren::new(atom, start, self.cursors).take(limit + 4) {
             if self.failed {
                 break;
             }
+            if i == start + limit {
+                tail = self
+                    .compact_semantic_tail(atom, path, depth, i, self.state_at(depth + 1))
+                    .into_iter();
+            }
+            let preview = if i >= start + limit {
+                let Some((html, _)) = tail.next() else {
+                    break;
+                };
+                Some(html)
+            } else {
+                None
+            };
             // Stop a page before the budget runs out. Nested lists become one
             // navigable omission instead of emitting an unbounded set of markers.
-            if end > start && (self.nodes == 0 || self.bytes < MAX_LEAF_BYTES) {
+            if preview.is_none() && end > start && (self.nodes == 0 || self.bytes < MAX_LEAF_BYTES)
+            {
                 self.budget_exhausted = true;
                 break;
             }
             let checkpoint = self.checkpoint();
             path.push(i);
-            let mut fragment = self.render(child, path, depth + 1);
+            let mut fragment = preview.unwrap_or_else(|| self.render(child, path, depth + 1));
             // The first item already contains bounded, navigable omissions.
             // Keep that preview; later items can start on a fresh page budget.
             if depth == 0 && self.budget_exhausted && end > start {
@@ -953,8 +1040,31 @@ impl Renderer<'_, '_> {
         let mut denominator = Vec::new();
         let mut negative = false;
         let mut end = start;
-        for (i, child) in MathMlChildren::new(atom, start, self.cursors).take(limit) {
-            if end > start && (self.nodes == 0 || self.bytes < MAX_LEAF_BYTES) {
+        let state = PrintState {
+            in_product: true,
+            suppress_one: true,
+            ..self.state_at(depth + 1)
+        };
+        let mut tail = vec![].into_iter();
+        for (i, child) in MathMlChildren::new(atom, start, self.cursors).take(limit + 4) {
+            if self.failed {
+                break;
+            }
+            if i == start + limit {
+                tail = self
+                    .compact_semantic_tail(atom, path, depth, i, state)
+                    .into_iter();
+            }
+            let preview = if i >= start + limit {
+                let Some(fragment) = tail.next() else {
+                    break;
+                };
+                Some(fragment)
+            } else {
+                None
+            };
+            if preview.is_none() && end > start && (self.nodes == 0 || self.bytes < MAX_LEAF_BYTES)
+            {
                 self.budget_exhausted = true;
                 break;
             }
@@ -962,17 +1072,12 @@ impl Renderer<'_, '_> {
             let mut parts = None;
             let previous_multiline_sums = self.multiline_sums;
             self.multiline_sums |= multiline;
-            let mut html = self.render_factor(
-                child,
-                path,
-                depth + 1,
-                &mut parts,
-                PrintState {
-                    in_product: true,
-                    suppress_one: true,
-                    ..self.state_at(depth + 1)
-                },
-            );
+            let mut html = if let Some((html, preview_parts)) = preview {
+                parts = preview_parts;
+                html
+            } else {
+                self.render_factor(child, path, depth + 1, &mut parts, state)
+            };
             self.multiline_sums = previous_multiline_sums;
             path.pop();
             if let Some(parts) = parts {
@@ -1282,6 +1387,8 @@ impl<'a> AtomView<'a> {
             multiline_sums: false,
             markers: vec![],
             semantic,
+            probing_compact_tail: false,
+            compact_probe_remaining: MAX_NODES,
             failed: false,
         };
         let sequence = matches!(atom, AtomView::Add(_) | AtomView::Mul(_) | AtomView::Fun(_));
@@ -1401,6 +1508,231 @@ mod tests {
     }
 
     #[test]
+    fn compact_tails_use_tensor_notation_and_preserve_callback_order() {
+        let metric = crate::symbol!("mathml_compact::metric");
+        let fragment = concat!(
+            "<mmultiscripts><mi>g</mi><none/>",
+            "<msub><mi>ρ</mi><mn>2</mn></msub><none/>",
+            "<msub><mi>ν</mi><mn>2</mn></msub></mmultiscripts>"
+        );
+        for input in [
+            "a*b*mathml_compact::metric(mink(4,rho),mink(4,nu)) + c*d*mathml_compact::metric(mink(4,rho),mink(4,nu))",
+            "outer(inner(a,b,mathml_compact::metric(mink(4,rho),mink(4,nu))))",
+            "outer(a+b+mathml_compact::metric(mink(4,rho),mink(4,nu)))",
+        ] {
+            let mut full_order = Vec::new();
+            let mut full = |atom: AtomView<'_>, _: &PrintOptions, state: &PrintState| {
+                full_order.push((atom.get_symbol().unwrap(), state.level, state.in_product));
+                Ok((atom.get_symbol() == Some(metric)).then(|| fragment.to_owned()))
+            };
+            let expected = scoped_page(input, 0, &mut full).unwrap();
+            assert!(expected.markers.is_empty());
+            let mut compact_order = Vec::new();
+            let mut semantic = |atom: AtomView<'_>, _: &PrintOptions, state: &PrintState| {
+                compact_order.push((atom.get_symbol().unwrap(), state.level, state.in_product));
+                Ok((atom.get_symbol() == Some(metric)).then(|| fragment.to_owned()))
+            };
+            let actual = scoped_page(input, 5, &mut semantic).unwrap();
+            assert!(actual.markers.is_empty(), "{}", actual.html);
+            assert!(actual.html.contains(fragment));
+            assert_eq!(compact_order, full_order);
+        }
+    }
+
+    #[test]
+    fn compact_semantic_powers_keep_context_and_fraction_parts() {
+        let casimir = crate::symbol!("mathml_compact_power::casimir");
+        let fragment = "<msub><mi>C</mi><mi>A</mi></msub>";
+        for exponent in ["2", "-1"] {
+            let input = format!("outer(a*b*mathml_compact_power::casimir(adj(8))^{exponent})");
+            let mut states = Vec::new();
+            let mut semantic = |atom: AtomView<'_>, _: &PrintOptions, state: &PrintState| {
+                if atom.get_symbol() == Some(casimir) {
+                    states.push(*state);
+                    Ok(Some(fragment.to_owned()))
+                } else {
+                    Ok(None)
+                }
+            };
+            let actual = scoped_page(&input, 5, &mut semantic).unwrap();
+            assert!(actual.markers.is_empty(), "{}", actual.html);
+            assert!(actual.html.contains(fragment));
+            assert_eq!(states.len(), 1);
+            assert!(states[0].in_exp_base);
+            if exponent == "-1" {
+                assert_eq!(actual.html.matches("<mfrac>").count(), 1);
+                assert!(!actual.html.contains("<mn>1</mn>"));
+            }
+        }
+    }
+
+    #[test]
+    fn semantic_tail_probes_reject_wide_partial_and_oversized_fragments() {
+        let target = crate::symbol!("mathml_compact_reject::target");
+        for fragment in [
+            "<mi>long_visible_name</mi>".to_owned(),
+            format!("<mi>{}</mi>", "x".repeat(MAX_LEAF_BYTES)),
+            format!(
+                "{}<mi>g</mi>{}",
+                "<mrow>".repeat(500),
+                "</mrow>".repeat(500)
+            ),
+        ] {
+            let mut semantic = |atom: AtomView<'_>, _: &PrintOptions, _: &PrintState| {
+                Ok((atom.get_symbol() == Some(target)).then(|| fragment.clone()))
+            };
+            let actual = scoped_page(
+                "outer(a*b*mathml_compact_reject::target(a,b,c,d,e))",
+                5,
+                &mut semantic,
+            )
+            .unwrap();
+            assert_eq!(actual.markers.len(), 1);
+            assert_eq!(actual.markers[0].start, 2);
+            assert_eq!(actual.markers[0].path, [0]);
+            assert!(!actual.html.contains(&fragment));
+        }
+
+        let mut calls = 0;
+        let mut failing = |atom: AtomView<'_>, _: &PrintOptions, _: &PrintState| {
+            if atom.get_symbol() == Some(target) {
+                calls += 1;
+                Err(())
+            } else {
+                Ok(None)
+            }
+        };
+        assert!(
+            scoped_page(
+                "outer(a*b*mathml_compact_reject::target(a,b,c,d,e))",
+                5,
+                &mut failing
+            )
+            .is_err()
+        );
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn semantic_tail_probes_restore_output_but_bound_speculative_work() {
+        let target = crate::symbol!("mathml_compact_budget::target");
+        let expression = parse!("f(mathml_compact_budget::target(a,b,c,d,e))");
+        let options = PrintOptions::new();
+        let mut calls = 0;
+        let fragment = "<msup><mi>g</mi><mi>μ</mi></msup>";
+        let mut semantic = |atom: AtomView<'_>, _: &PrintOptions, _: &PrintState| {
+            assert_eq!(atom.get_symbol(), Some(target));
+            calls += 1;
+            Ok(Some(fragment.to_owned()))
+        };
+        let mut renderer = Renderer {
+            opts: &options,
+            state: PrintState::new(),
+            cursors: None,
+            nodes: 2,
+            bytes: MAX_TEXT_BYTES,
+            budget_exhausted: false,
+            nested_limit: 2,
+            depth_limit: MAX_DEPTH,
+            expansions: &[],
+            multiline_sums: false,
+            markers: vec![],
+            semantic: Some(&mut semantic),
+            probing_compact_tail: false,
+            compact_probe_remaining: 2,
+            failed: false,
+        };
+        let before = renderer.checkpoint();
+        for _ in 0..3 {
+            assert!(
+                renderer
+                    .compact_semantic_tail(
+                        expression.as_view(),
+                        &mut vec![],
+                        1,
+                        0,
+                        PrintState::new(),
+                    )
+                    .is_empty()
+            );
+            assert_eq!(renderer.checkpoint(), before);
+        }
+        assert_eq!(renderer.compact_probe_remaining, 0);
+        drop(renderer);
+        assert_eq!(calls, 2);
+
+        // If a later sibling is too wide, the earlier accepted fragment must
+        // not consume output budget or leave a stray marker behind.
+        let expression =
+            parse!("f(mathml_compact_budget::target(a),mathml_compact_budget::target(b))");
+        let mut calls = 0;
+        let mut semantic = |_: AtomView<'_>, _: &PrintOptions, _: &PrintState| {
+            calls += 1;
+            Ok(Some(
+                if calls == 1 {
+                    fragment
+                } else {
+                    "<mi>very_wide</mi>"
+                }
+                .to_owned(),
+            ))
+        };
+        let mut renderer = Renderer {
+            opts: &options,
+            state: PrintState::new(),
+            cursors: None,
+            nodes: MAX_NODES,
+            bytes: MAX_TEXT_BYTES,
+            budget_exhausted: false,
+            nested_limit: 2,
+            depth_limit: MAX_DEPTH,
+            expansions: &[],
+            multiline_sums: false,
+            markers: vec![],
+            semantic: Some(&mut semantic),
+            probing_compact_tail: false,
+            compact_probe_remaining: MAX_NODES,
+            failed: false,
+        };
+        let before = renderer.checkpoint();
+        assert!(
+            renderer
+                .compact_semantic_tail(expression.as_view(), &mut vec![], 1, 0, PrintState::new(),)
+                .is_empty()
+        );
+        assert_eq!(renderer.checkpoint(), before);
+        assert_eq!(renderer.compact_probe_remaining, MAX_NODES - 2);
+    }
+
+    #[test]
+    fn compact_semantic_tails_preserve_explicit_root_page_sizes() {
+        let target = crate::symbol!("mathml_compact_root::target");
+        let expression = parse!("a*b*mathml_compact_root::target(a,b,c,d,e)");
+        let cursors = MathMlCursorCache::new(expression.as_view());
+        let mut semantic = |atom: AtomView<'_>, _: &PrintOptions, _: &PrintState| {
+            assert_ne!(atom.get_symbol(), Some(target));
+            Ok(None)
+        };
+        for layout in 0..LAYOUTS.len() {
+            let page = expression
+                .as_view()
+                .render_mathml_layout_cached(
+                    &PrintOptions::new(),
+                    0,
+                    1,
+                    layout,
+                    &[],
+                    &cursors,
+                    Some(&mut semantic),
+                )
+                .unwrap();
+            assert_eq!((page.start, page.end, page.total), (0, 1, 3));
+            assert_eq!(page.markers.len(), 1);
+            assert_eq!(page.markers[0].start, 1);
+        }
+    }
+
+    #[test]
     fn scoped_errors_stop_dispatch_and_hard_guards_precede_callbacks() {
         let mut calls = 0;
         let mut fail = |_: AtomView<'_>, _: &PrintOptions, _: &PrintState| {
@@ -1506,6 +1838,8 @@ mod tests {
             multiline_sums: false,
             markers: vec![],
             semantic: None,
+            probing_compact_tail: false,
+            compact_probe_remaining: MAX_NODES,
             failed: false,
         };
         let before = renderer.checkpoint();
