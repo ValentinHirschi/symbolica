@@ -269,6 +269,23 @@ class MathMLWrappingTests(unittest.IsolatedAsyncioTestCase):
             await self.settle(page)
             await self.assert_fits(page, ".math-content")
 
+        # Repacking a sum into separate math roots must keep fraction sizing.
+        for wrapped in (False, True):
+            fraction = '<mrow><mfrac><mi>x</mi><mn>8</mn></mfrac></mrow>'
+            body = ('<mrow style="display:inline-flex;flex-wrap:wrap">'
+                    + fraction + '<mrow><mo>+</mo><mi>y</mi></mrow></mrow>'
+                    if wrapped else fraction)
+            fixture = dict(sum_page(), markers=[], marker_ids=[], marker_starts=[],
+                           next=None, html='<math displaystyle="true" '
+                           'style="font-size:21px">' + body + '</math>')
+            await page.evaluate("fixture => viewer.update(['page', fixture])", fixture)
+            await self.settle(page)
+            sizes = await page.locator('.math-content mn').evaluate("""node => ({
+              denominator:getComputedStyle(node).fontSize,
+              root:getComputedStyle(node.closest('math')).fontSize
+            })""")
+            self.assertEqual(sizes['denominator'], sizes['root'], (wrapped, sizes))
+
         # A nested sum used as a power base must remain one fenced math tree.
         nested = dict(sum_page(), markers=[], marker_ids=[], marker_starts=[])
         nested['html'] = ('<math xmlns="http://www.w3.org/1998/Math/MathML">'
