@@ -958,7 +958,6 @@ impl Renderer<'_, '_> {
                 self.budget_exhausted = true;
                 break;
             }
-            let checkpoint = self.checkpoint();
             path.push(i);
             let mut parts = None;
             let previous_multiline_sums = self.multiline_sums;
@@ -975,13 +974,6 @@ impl Renderer<'_, '_> {
                 },
             );
             self.multiline_sums = previous_multiline_sums;
-            // Retain the bounded first factor, including its fraction parts
-            // and nested markers. Only subsequent factors need a fresh page.
-            if depth == 0 && self.budget_exhausted && end > start {
-                self.restore(checkpoint);
-                path.pop();
-                break;
-            }
             path.pop();
             if let Some(parts) = parts {
                 let n = Self::product_sign(child, parts.numerator, &mut negative);
@@ -1003,6 +995,12 @@ impl Renderer<'_, '_> {
                 }
             }
             end = i + 1;
+            // A factor may have used the remaining budget to show part of a
+            // large sum. Keep that bounded preview, fraction parts and markers;
+            // only the following factors need a fresh page budget.
+            if depth == 0 && self.budget_exhausted {
+                break;
+            }
         }
         self.nested_limit = previous_nested_limit;
         let mut omission = (end < atom.mathml_child_count()).then(|| self.hole_at(atom, path, end));
@@ -1538,6 +1536,103 @@ mod tests {
             .as_view()
             .render_mathml_page(&PrintOptions::new(), 0, 25)
             .html
+    }
+
+    #[test]
+    fn large_sum_after_small_factor_keeps_its_preview() {
+        let sum = parse!("(x+y+z+w)^20").expand();
+        let expression = &sum * parse!("1+x");
+        let before = expression.clone();
+        let cursors = MathMlCursorCache::new(expression.as_view());
+        let page = expression
+            .as_view()
+            .render_mathml_page(&PrintOptions::new(), 0, 25);
+
+        assert_eq!((page.end, page.total), (2, 2));
+        assert_eq!(page.html.matches("data-symbolica-factor").count(), 2);
+        for name in ["x", "y", "z", "w"] {
+            assert!(page.html.contains(&format!("<mi>{name}</mi>")));
+        }
+        assert!(page.markers.iter().all(|marker| !marker.path.is_empty()));
+        let omission = page
+            .markers
+            .iter()
+            .find(|marker| marker.path == [1])
+            .expect("the omitted terms belong to the large sum, not the product");
+        assert!(omission.start > 0);
+        let target = cursors.locate(&omission.path).unwrap();
+        assert_eq!(target, sum.as_view());
+        let next = target.render_mathml_page(&PrintOptions::new(), omission.start, 25);
+        assert_eq!(next.start, omission.start);
+        assert_eq!(next.end, omission.start + 25);
+        assert_eq!(next.total, 1771);
+        assert_eq!(expression, before);
+    }
+
+    #[test]
+    fn later_factor_previews_respect_budgets_and_keep_remaining_factors_navigable() {
+        // Powers exhaust the node budget; long identifiers exhaust the text budget.
+        for prefix in ["x".to_owned(), "long".repeat(20)] {
+            let sum = (0..400)
+                .map(|i| format!("{prefix}{i}^2"))
+                .collect::<Vec<_>>()
+                .join("+");
+            for (input, fraction) in [
+                (format!("(a+b)*({sum})*({sum}+1)"), false),
+                (format!("-2*(a+b)/({sum})"), true),
+            ] {
+                let expression = parse!(&input);
+                let cursors = MathMlCursorCache::new(expression.as_view());
+                let mut nodes = 0;
+                let mut bytes = 0;
+                let mut observe = |atom: AtomView<'_>, opts: &PrintOptions, _: &PrintState| {
+                    nodes += 1;
+                    bytes += symbol_html(atom.get_symbol().unwrap(), opts).len();
+                    Ok(None)
+                };
+                let page = expression
+                    .as_view()
+                    .render_mathml_layout_cached(
+                        &PrintOptions::new(),
+                        0,
+                        25,
+                        0,
+                        &[],
+                        &cursors,
+                        Some(&mut observe),
+                    )
+                    .unwrap();
+                assert!(nodes <= MAX_NODES);
+                assert!(bytes <= MAX_TEXT_BYTES);
+                assert_eq!(page.total, 3);
+                assert_eq!(page.end, if fraction { 3 } else { 2 });
+                assert!(page.html.contains(&format!("<mi>{prefix}")));
+                assert_eq!(page.html.contains("<mfrac>"), fraction);
+                if fraction {
+                    assert!(page.html.contains("<mo>−</mo>"));
+                } else {
+                    assert!(
+                        page.markers
+                            .iter()
+                            .any(|m| m.path.is_empty() && m.start == 2)
+                    );
+                }
+                let path = if fraction { vec![2, 0] } else { vec![1] };
+                assert!(page.markers.iter().any(|m| m.path == path && m.start > 0));
+                for marker in &page.markers {
+                    let target = cursors.locate(&marker.path).unwrap();
+                    let next = target.render_mathml_page(&PrintOptions::new(), marker.start, 25);
+                    assert!(next.end > next.start);
+                    assert!(next.html.contains("<mi>") || next.html.contains("<mn>"));
+                    assert!(
+                        !next
+                            .markers
+                            .iter()
+                            .any(|m| m.path.is_empty() && m.start == 0)
+                    );
+                }
+            }
+        }
     }
 
     #[test]
