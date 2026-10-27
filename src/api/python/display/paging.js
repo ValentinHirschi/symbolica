@@ -71,6 +71,7 @@ function render({ model, el }) {
     /* MathML Core uses CSS alignment; columnalign alone is not portable. */
     mtable[data-symbolica-product] > mtr > mtd,
     mtable[data-symbolica-sum] > mtr > mtd { text-align:left; }
+    [data-symbolica-continuation-separator] { display:none; }
     .zoom-feedback {
       position:absolute; top:4px; right:4px; padding:3px 8px; border-radius:4px;
       background:var(--background,var(--jp-layout-color1,#fff));
@@ -317,13 +318,28 @@ function render({ model, el }) {
     // The kernel's product rows are a static fallback. Fit the final notation,
     // including decorated omissions, using the font actually loaded here.
     // Nested sums in a long factor use the same measured packing policy.
-    for (const table of [...container.querySelectorAll('mtable[data-symbolica-product],mtable[data-symbolica-sum]')].reverse()) {
+    const tables = 'mtable[data-symbolica-product],mtable[data-symbolica-sum]';
+    const refitted = new Map();
+    function fitTable(table) {
       const cell = table.closest('[data-symbolica-cell]');
-      if (cell && cell !== container) continue;
+      if (cell && cell !== container) return;
+      const product = table.hasAttribute('data-symbolica-product');
       const rows = [...table.children].map(row => {
         const cell = row.children.length === 1 ? row.firstElementChild : null;
         const body = cell?.localName === 'mtd' && cell.children.length === 1
           ? cell.firstElementChild : null;
+        if (body?.localName === 'mrow') {
+          // Previous line starts can become inline factors after a resize.
+          // Restore their original separators before measuring the new rows.
+          for (const child of [...body.children]) {
+            if (child.hasAttribute('data-symbolica-continuation')) child.remove();
+            if (child.hasAttribute('data-symbolica-factor')) {
+              for (const separator of child.children) {
+                separator.removeAttribute('data-symbolica-continuation-separator');
+              }
+            }
+          }
+        }
         const factors = body?.localName === 'mrow'
           && [...body.childNodes].every(node => node.nodeType === 1
             ? node.hasAttribute('data-symbolica-factor') || node.hasAttribute('data-symbolica-term')
@@ -332,7 +348,7 @@ function render({ model, el }) {
         return { row, factors };
       });
       const factorCount = rows.reduce((n, row) => n + row.factors.length, 0);
-      if (factorCount < 2) continue;
+      if (factorCount < 2) return;
       // Reserve surrounding signs, fences and fraction padding. Products
       // have zero outer cell padding, including after measured row packing.
       // Other table rows and wrapping sums/products do not restrict this table
@@ -343,11 +359,17 @@ function render({ model, el }) {
       let overhead = cellOverhead;
       for (let child = table, parent = child.parentElement;
           parent && parent !== container; child = parent, parent = parent.parentElement) {
-        if (['mtable', 'mtr', 'mtd'].includes(parent.localName)
-            || (['flex', 'inline-flex'].includes(parent.style.display) && parent.style.flexWrap === 'wrap')
-            || (parent.localName === 'mrow'
-              && [...parent.children].some(node => node.hasAttribute('data-symbolica-factor') || node.hasAttribute('data-symbolica-term')))) continue;
         const children = [...parent.children];
+        if (parent.localName === 'mrow'
+            && children.some(node => node.hasAttribute('data-symbolica-factor') || node.hasAttribute('data-symbolica-term'))) {
+          // The surrounding product can move this factor between rows, but
+          // a continuation's fixed prefix still takes space from its children.
+          overhead += children.find(node => node.hasAttribute('data-symbolica-continuation'))
+            ?.getBoundingClientRect().width || 0;
+          continue;
+        }
+        if (['mtable', 'mtr', 'mtd'].includes(parent.localName)
+            || (['flex', 'inline-flex'].includes(parent.style.display) && parent.style.flexWrap === 'wrap')) continue;
         const childWidth = parent.localName === 'mfrac'
           ? Math.max(0, ...children.map(node => node.getBoundingClientRect().width))
           : child.getBoundingClientRect().width;
@@ -355,12 +377,52 @@ function render({ model, el }) {
       }
       const tableLimit = Math.max(0, available - (overhead - cellOverhead));
       let limit = Math.max(0, available - overhead);
+      let continuation, continuationWidth = 0;
+      if (product) {
+        continuation = doc.createElementNS(table.namespaceURI, 'mrow');
+        continuation.setAttribute('data-symbolica-continuation', '');
+        const indent = doc.createElementNS(table.namespaceURI, 'mspace');
+        indent.setAttribute('width', '0.75em');
+        const operator = doc.createElementNS(table.namespaceURI, 'mo');
+        operator.setAttribute('form', 'infix');
+        operator.setAttribute('lspace', '0');
+        operator.setAttribute('rspace', '0');
+        operator.textContent = '×';
+        const gap = doc.createElementNS(table.namespaceURI, 'mspace');
+        gap.setAttribute('width', '0.25em');
+        continuation.append(indent, operator, gap);
+        // Measure in this table's math style, including fraction/script size.
+        rows.find(({ factors }) => factors.length).factors[0].before(continuation);
+        continuationWidth = continuation.getBoundingClientRect().width;
+        continuation.remove();
+      }
+      if (!refitted.has(table)) refitted.set(table, new Set());
+      const descendants = refitted.get(table);
       for (let attempt = 0; attempt < factorCount; attempt++) {
         const measured = rows.map(({ row, factors }) => ({
-          row, factors: factors.map(node => ({ node, width: node.getBoundingClientRect().width }))
+          row, factors: factors.map(node => {
+            // The kernel puts the multiplication separator inside each factor.
+            // A continuation replaces that separator instead of doubling it.
+            const leading = product && node.firstElementChild;
+            const separators = leading?.localName === 'mo' ? [leading] : [];
+            if (leading?.textContent === '\u2062' && leading.nextElementSibling?.localName === 'mspace') {
+              separators.push(leading.nextElementSibling);
+            }
+            for (const separator of separators) separator.removeAttribute('data-symbolica-continuation-separator');
+            return { node, separators };
+          })
         }));
+        const factors = measured.flatMap(row => row.factors);
+        for (const factor of factors) factor.width = factor.node.getBoundingClientRect().width;
+        for (const factor of factors) {
+          for (const separator of factor.separators) separator.setAttribute('data-symbolica-continuation-separator', '');
+        }
+        for (const factor of factors) factor.continuationWidth = factor.node.getBoundingClientRect().width;
+        for (const factor of factors) {
+          for (const separator of factor.separators) separator.removeAttribute('data-symbolica-continuation-separator');
+        }
         const packed = [];
-        let line, lineWidth = 0;
+        let line, lineWidth = 0, seenFactors = 0;
         for (const { row, factors } of measured) {
           if (!factors.length) {
             // In particular, keep a terminal product omission on its own row.
@@ -369,6 +431,7 @@ function render({ model, el }) {
             continue;
           }
           for (const factor of factors) {
+            let factorWidth = factor.width;
             if (!line || lineWidth + factor.width > limit + 0.5) {
               const row = doc.createElementNS(table.namespaceURI, 'mtr');
               const cell = doc.createElementNS(table.namespaceURI, 'mtd');
@@ -377,9 +440,17 @@ function render({ model, el }) {
               row.append(cell);
               packed.push(row);
               lineWidth = 0;
+              if (product && seenFactors) {
+                line.append(continuation.cloneNode(true));
+                for (const separator of factor.separators) separator.setAttribute('data-symbolica-continuation-separator', '');
+                // Include both the indent and operator when fitting this row.
+                lineWidth = continuationWidth;
+                factorWidth = factor.continuationWidth;
+              }
             }
             line.append(factor.node);
-            lineWidth += factor.width;
+            lineWidth += factorWidth;
+            seenFactors++;
           }
         }
         table.replaceChildren(...packed);
@@ -393,6 +464,22 @@ function render({ model, el }) {
             }
           }
         }
+        // An inner product was initially fitted before its outer row existed.
+        // If that factor now starts a continuation, refit its contents with
+        // the newly reserved prefix width. Share the retry sets across this
+        // whole pass: an indivisible wide leaf must not trigger exponentially
+        // many retries through its ancestors. Each ancestor/descendant pair
+        // is retried once, including across recursive calls.
+        for (const row of packed) {
+          if (!row.querySelector(':scope > mtd > mrow > [data-symbolica-continuation]')
+              || row.getBoundingClientRect().width <= tableLimit + .5) continue;
+          for (const nested of [...row.querySelectorAll(tables)].reverse()) {
+            if (!descendants.has(nested)) {
+              descendants.add(nested);
+              fitTable(nested);
+            }
+          }
+        }
         // WebKit can change intrinsic cell widths when factors move between
         // rows. Check the packed table too, and only reduce this pass's budget.
         const overflow = table.getBoundingClientRect().width - tableLimit;
@@ -400,6 +487,7 @@ function render({ model, el }) {
         limit = Math.max(0, limit - overflow);
       }
     }
+    for (const table of [...container.querySelectorAll(tables)].reverse()) fitTable(table);
     // Composite outputs retain a static frame while each value is fitted to
     // its own cell width. Root-flow conversion stays outside nested MathML.
     for (const cell of container.querySelectorAll('[data-symbolica-cell]')) {

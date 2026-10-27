@@ -57,7 +57,187 @@ def sum_page(display="inline-flex", start=0):
                 supports_expansion=True, can_collapse=False)
 
 
+def product_page(location="root", separator="\u2062", omission=False):
+    """Bounded product rows, including products on either side of a fraction."""
+    def table(prefix):
+        factors = []
+        for index in range(16):
+            sign = ''
+            if index:
+                sign = f'<mo>{separator}</mo>'
+                if separator == '\u2062':
+                    sign += '<mspace width="0.167em"/>'
+            factors.append('<mrow data-symbolica-factor="" '
+                           f'data-test-factor="{prefix}{index}">{sign}'
+                           f'<mi>{prefix}{index}</mi></mrow>')
+        rows = '<mtr><mtd style="padding:0"><mrow>' + ''.join(factors) + '</mrow></mtd></mtr>'
+        if omission:
+            rows += ('<mtr><mtd style="padding:0.5em 0 0"><mrow>'
+                     '<mo form="infix">·</mo><mtext data-symbolica-marker="0">[1]</mtext>'
+                     '</mrow></mtd></mtr>')
+        return ('<mtable data-symbolica-product="" data-symbolica-row-gap="0.5em" '
+                'columnalign="left" rowspacing="0">' + rows + '</mtable>')
+
+    if location == 'root':
+        body = table('x')
+    elif location == 'nested':
+        body = ('<mtable data-symbolica-product="" data-symbolica-row-gap="0.5em" '
+                'columnalign="left" rowspacing="0"><mtr><mtd style="padding:0"><mrow>'
+                '<mrow data-symbolica-factor="" data-test-factor="outer0">'
+                '<mi>q</mi><mspace width="80px"/></mrow>'
+                '<mrow data-symbolica-factor="" data-test-factor="outer1">'
+                '<mo>&#x2062;</mo><mspace width="0.167em"/>'
+                '<mrow><mi>f</mi><mo>(</mo>' + table('x') + '<mo>)</mo></mrow>'
+                '</mrow></mrow></mtd></mtr></mtable>')
+    else:
+        numerator = table('x') if location in ('numerator', 'both') else '<mi>a</mi>'
+        denominator = table('y') if location in ('denominator', 'both') else '<mi>b</mi>'
+        body = f'<mfrac><mrow>{numerator}</mrow><mrow>{denominator}</mrow></mfrac>'
+    return dict(html='<math displaystyle="true" style="font-size:21px">'
+                '<mrow><mo>−</mo>' + body + '</mrow></math>',
+                start=0, end=16, total=20 if omission else 16,
+                kind="Product", unit="factors", layout=0,
+                markers=[[[], "Inspect product [1]"]] if omission else [],
+                marker_ids=[0] if omission else [], marker_starts=[16] if omission else [],
+                previous=False, next=16 if omission else None, back=False, page_size=25,
+                supports_expansion=True, can_collapse=False)
+
+
 class MathMLWrappingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_product_continuations_resize_in_each_engine(self):
+        async with async_playwright() as playwright:
+            for engine in ("chromium", "firefox", "webkit"):
+                with self.subTest(engine=engine):
+                    options = {"headless": True}
+                    executable = os.environ.get(f"{engine.upper()}_EXECUTABLE")
+                    if executable:
+                        options["executable_path"] = executable
+                    browser = await getattr(playwright, engine).launch(**options)
+                    try:
+                        await self.check_product_continuations(browser)
+                    finally:
+                        await browser.close()
+
+    async def check_product_continuations(self, browser):
+        page = await browser.new_page(viewport={"width": 1200, "height": 1000})
+        errors = []
+        page.on("pageerror", lambda error: errors.append(str(error)))
+        font = os.environ.get('SYMBOLICA_TEST_FONT')
+        await page.route("https://cdn.jsdelivr.net/**", lambda route:
+                         route.fulfill(path=font, content_type='font/woff2') if font else route.abort())
+        await page.set_content('<div id="host" style="width:900px"></div>')
+        await page.evaluate("""async source => {
+          const url = URL.createObjectURL(new Blob([source], {type:'text/javascript'}));
+          window.mount = (await import(url)).mount;
+          URL.revokeObjectURL(url);
+        }""", JAVASCRIPT)
+        cases = [(location, '\u2062', False)
+                 for location in ('root', 'numerator', 'denominator', 'both', 'nested')]
+        cases.extend([('root', '×', False), ('root', '·', False),
+                      ('root', '\u2062', True), ('root', '·', True)])
+        for location, separator, omission in cases:
+            with self.subTest(location=location, separator=separator, omission=omission):
+                fixture = product_page(location, separator, omission)
+                await page.evaluate("""fixture => {
+                  window.viewer?.close();
+                  window.fixture = fixture;
+                  window.originalPayload = JSON.stringify(fixture);
+                  window.viewer = mount({el:document.querySelector('#host'),
+                    page:fixture, send:()=>{}});
+                }""", fixture)
+                await page.evaluate('document.fonts.ready')
+                for width, action in ((900, None), (190, None), (190, '='),
+                                      (190, '-'), (190, 'font'), (900, None)):
+                    await page.locator('#host').evaluate('(host,width)=>host.style.width=`${width}px`', width)
+                    if action == 'font':
+                        await page.evaluate("""() => {
+                          const event = new Event('loadingdone');
+                          Object.defineProperty(event,'fontfaces',{value:[{family:'STIX Two Math'}]});
+                          document.fonts.dispatchEvent(event);
+                        }""")
+                    elif action:
+                        await page.locator('.math').press(action)
+                    await self.settle(page)
+                    measured = await page.locator('#host').evaluate("""host => {
+                      const root = host.shadowRoot;
+                      const content = root.querySelector('.math-content');
+                      const visible = node => node.getBoundingClientRect().width > .01
+                        && getComputedStyle(node).visibility !== 'hidden';
+                      return {
+                        viewport: root.querySelector('.math').clientWidth,
+                        scroll: content.scrollWidth,
+                        unchanged: JSON.stringify(fixture) === originalPayload,
+                        fractionChildren: [...content.querySelectorAll('mfrac')].map(n=>n.children.length),
+                        signs: [...content.querySelectorAll('mo')].filter(n=>n.textContent==='−').length,
+                        tables: [...content.querySelectorAll('mtable[data-symbolica-product]')].map(table=>({
+                          factors: [...table.querySelectorAll('[data-test-factor]')]
+                            .filter(n=>n.closest('mtable[data-symbolica-product]')===table).map(n=>n.dataset.testFactor),
+                          rows: [...table.children].map(row=>{
+                            const cell = row.firstElementChild;
+                            const factors = [...row.querySelectorAll('[data-test-factor]')]
+                              .filter(n=>n.closest('mtable[data-symbolica-product]')===table);
+                            const token = factors[0]?.querySelector('mi');
+                            const operators = [...row.querySelectorAll('mo')].filter(visible);
+                            const leading = token ? operators.filter(n=>
+                              n.compareDocumentPosition(token) & Node.DOCUMENT_POSITION_FOLLOWING) : [];
+                            const cross = leading.find(n=>n.textContent==='×');
+                            return {count:factors.length, operators:operators.map(n=>n.textContent),
+                              leading:leading.map(n=>n.textContent),
+                              indent:cross ? cross.getBoundingClientRect().left-cell.getBoundingClientRect().left : 0,
+                              font:parseFloat(getComputedStyle(cell).fontSize),
+                              buttons:row.querySelectorAll('button.omission').length};
+                          })
+                        }))
+                      };
+                    }""")
+                    self.assertTrue(measured['unchanged'], measured)
+                    self.assertEqual(measured['signs'], 1, measured)
+                    self.assertEqual(measured['fractionChildren'], [] if location in ('root', 'nested') else [2])
+                    self.assertLessEqual(measured['scroll'], measured['viewport'] + 2, measured)
+                    prefixes = ('x', 'y') if location == 'both' else ('y',) if location == 'denominator' else ('x',)
+                    expected = [[f'{prefix}{i}' for i in range(16)] for prefix in prefixes]
+                    if location == 'nested':
+                        expected.insert(0, ['outer0', 'outer1'])
+                    self.assertEqual(len(measured['tables']), len(expected))
+                    for table, factors in zip(measured['tables'], expected):
+                        self.assertEqual(table['factors'], factors)
+                        rows = [row for row in table['rows'] if row['count']]
+                        if width == 900:
+                            self.assertEqual(len(rows), 1, measured)
+                        else:
+                            self.assertGreater(len(rows), 1, measured)
+                        for index, row in enumerate(rows):
+                            self.assertEqual(row['leading'], ['×'] if index else [], measured)
+                            if index:
+                                self.assertGreaterEqual(row['indent'], row['font'] * .5, measured)
+                            if separator != '\u2062':
+                                expected = ([separator] * (row['count'] - 1))
+                                if index:
+                                    expected.insert(0, '×')
+                                self.assertEqual(row['operators'], expected, measured)
+                        tails = [row for row in table['rows'] if not row['count']]
+                        self.assertEqual(len(tails), int(omission), measured)
+                        if omission:
+                            self.assertEqual(tails[0]['operators'], ['·'], measured)
+                            self.assertEqual(tails[0]['buttons'], 1, measured)
+
+        # Sum rows keep their ordinary additive signs during the same resizing.
+        terms = ''.join('<mrow data-symbolica-term="">' + ('<mo>+</mo>' if i else '')
+                        + f'<mi>s{i}</mi></mrow>' for i in range(16))
+        fixture = dict(product_page(), kind='Sum', unit='terms', html=(
+            '<math><mtable data-symbolica-sum="" data-symbolica-row-gap="0.5em">'
+            '<mtr><mtd><mrow>' + terms + '</mrow></mtd></mtr></mtable></math>'))
+        await page.evaluate('fixture => viewer.update(["page",fixture])', fixture)
+        for width in (900, 190, 900):
+            await page.locator('#host').evaluate('(host,width)=>host.style.width=`${width}px`', width)
+            await self.settle(page)
+            self.assertEqual(await page.locator('.math-content mi').all_text_contents(),
+                             [f's{i}' for i in range(16)])
+            self.assertEqual(await page.locator('.math-content mo').all_text_contents(), ['+'] * 15)
+        await page.evaluate('viewer.close()')
+        await page.close()
+        self.assertFalse(errors, errors)
+
     async def test_composite_cell_overflow_selects_a_compact_page(self):
         async with async_playwright() as playwright:
             for engine in ("chromium", "firefox", "webkit"):
