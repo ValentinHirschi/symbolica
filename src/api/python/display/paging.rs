@@ -6,7 +6,10 @@ use pyo3::{
     prelude::*,
     types::{PyAnyMethods, PyBool, PyDict, PyDictMethods, PyInt, PyList, PyTuple},
 };
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::{
+    collections::{BTreeMap, HashSet, VecDeque},
+    sync::Arc,
+};
 
 fn invalid(message: &str) -> PyErr {
     PyValueError::new_err(message.to_owned())
@@ -70,7 +73,6 @@ fn offset(message: &Bound<'_, PyDict>, default: usize) -> PyResult<usize> {
     Ok(value)
 }
 
-#[derive(Clone)]
 struct Page {
     value: MathMLPage,
     ids: Vec<usize>,
@@ -224,8 +226,8 @@ impl Page {
 
 #[derive(Clone)]
 struct Pages {
-    main: Page,
-    layouts: Vec<Page>,
+    main: Arc<Page>,
+    layouts: Vec<Arc<Page>>,
 }
 impl Pages {
     fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
@@ -286,7 +288,7 @@ pub(super) struct PythonMathMLViewer {
     layout_count: usize,
     supports_expansion: bool,
     navigation: Navigation,
-    cache: VecDeque<(CacheKey, Page, usize)>,
+    cache: VecDeque<(CacheKey, Arc<Page>, usize)>,
     cache_bytes: usize,
     popups: VecDeque<(String, Popup)>,
     serial: u64,
@@ -304,7 +306,7 @@ impl PythonMathMLViewer {
         size: usize,
         layout: usize,
         expansions: &[(Vec<usize>, usize)],
-    ) -> PyResult<Page> {
+    ) -> PyResult<Arc<Page>> {
         let key = CacheKey {
             path: path.to_vec(),
             start,
@@ -327,10 +329,12 @@ impl PythonMathMLViewer {
             "page",
             (path.to_vec(), start, size, layout, expansions.to_vec()),
         )?;
-        let page = Page::from_python(value.bind(py), size, layout)?;
+        let page = Arc::new(Page::from_python(value.bind(py), size, layout)?);
         // Main pages, hover previews and bounded Show all probes share the same
-        // cache. Retain only successful, validated renders, with both an entry
-        // limit and a byte limit; a large popup cannot multiply retained HTML.
+        // cache. Share immutable pages so hits do not copy their HTML/markers;
+        // response dictionaries remain fresh mutable Python objects. Retain
+        // only successful, validated renders, with both an entry limit and a
+        // byte limit; a large popup cannot multiply retained HTML.
         let bytes = page.value.html.len()
             + page.value.kind.len()
             + page.value.unit.len()
@@ -364,12 +368,11 @@ impl PythonMathMLViewer {
         expansions: &[(Vec<usize>, usize)],
     ) -> PyResult<Pages> {
         let main = self.source_page(py, path, start, size, 0, expansions)?;
-        let mut layouts = Vec::new();
-        let mut previous_html = main.value.html.clone();
+        let mut layouts: Vec<Arc<Page>> = Vec::new();
         for layout in 1..self.layout_count {
             let candidate = self.source_page(py, path, start, size, layout, expansions)?;
-            if candidate.value.html != previous_html {
-                previous_html = candidate.value.html.clone();
+            let previous = layouts.last().unwrap_or(&main);
+            if candidate.value.html != previous.value.html {
                 layouts.push(candidate);
             }
         }
@@ -383,6 +386,39 @@ impl PythonMathMLViewer {
         self.prepare_automatic_preview(py)?;
         let p = self.navigation.position.clone();
         self.pages(py, &p.path, p.start, p.size, &self.expansions())
+    }
+
+    fn current_page(&mut self, py: Python<'_>, layout: usize) -> PyResult<Arc<Page>> {
+        self.prepare_automatic_preview(py)?;
+        let p = self.navigation.position.clone();
+        self.source_page(py, &p.path, p.start, p.size, layout, &self.expansions())
+    }
+
+    fn selected_current_page(&mut self, py: Python<'_>, layout: usize) -> PyResult<Arc<Page>> {
+        if layout >= self.layout_count {
+            return Err(invalid("Unknown layout"));
+        }
+        self.prepare_automatic_preview(py)?;
+        let p = self.navigation.position.clone();
+        let expansions = self.expansions();
+        // Preserve provider visitation order for a cold request: scoped
+        // printers may allocate aliases while producing the earlier layouts.
+        // Later alternatives need not be rendered just to obtain the selected
+        // page's omission capabilities. Warm requests share these cached pages.
+        let mut previous = self.source_page(py, &p.path, p.start, p.size, 0, &expansions)?;
+        if layout == 0 {
+            return Ok(previous);
+        }
+        for index in 1..layout {
+            previous = self.source_page(py, &p.path, p.start, p.size, index, &expansions)?;
+        }
+        let page = self.source_page(py, &p.path, p.start, p.size, layout, &expansions)?;
+        // pages() exposes an alternative only when its HTML differs from the
+        // preceding layout, including runs of identical omitted alternatives.
+        if page.value.html == previous.value.html {
+            return Err(invalid("Unknown layout"));
+        }
+        Ok(page)
     }
 
     fn prepare_automatic_preview(&mut self, py: Python<'_>) -> PyResult<()> {
@@ -479,12 +515,16 @@ impl PythonMathMLViewer {
             .transpose()
     }
 
-    fn selected(&mut self, py: Python<'_>, message: &Bound<'_, PyDict>) -> PyResult<Capability> {
-        let layout = message
+    fn requested_layout(message: &Bound<'_, PyDict>) -> PyResult<usize> {
+        Ok(message
             .get_item("layout")?
             .map(|v| integer(&v, "Unknown layout"))
             .transpose()?
-            .unwrap_or(0);
+            .unwrap_or(0))
+    }
+
+    fn selected(&mut self, py: Python<'_>, message: &Bound<'_, PyDict>) -> PyResult<Capability> {
+        let layout = Self::requested_layout(message)?;
         if let Some(context) = Self::context(message)? {
             let index = self
                 .popups
@@ -520,14 +560,7 @@ impl PythonMathMLViewer {
             }
             Ok(selected)
         } else {
-            let pages = self.current(py)?;
-            let selected = if layout == 0 {
-                Some(&pages.main)
-            } else {
-                pages.layouts.iter().find(|p| p.layout == layout)
-            }
-            .ok_or_else(|| invalid("Unknown layout"))?;
-            Ok(selected.capability())
+            Ok(self.selected_current_page(py, layout)?.capability())
         }
     }
 
@@ -827,7 +860,7 @@ impl PythonMathMLViewer {
             context,
             Popup {
                 main: pages.main.capability(),
-                layouts: pages.layouts.iter().map(Page::capability).collect(),
+                layouts: pages.layouts.iter().map(|p| p.capability()).collect(),
                 origin: Self::context(message)?,
                 root_path: self.navigation.position.path.clone(),
                 root_start: self.navigation.position.start,
@@ -1096,9 +1129,7 @@ impl PythonMathMLViewer {
     }
 
     fn _render_page(&mut self, py: Python<'_>, layout: usize) -> PyResult<Py<PyDict>> {
-        self.prepare_automatic_preview(py)?;
-        let p = self.navigation.position.clone();
-        self.source_page(py, &p.path, p.start, p.size, layout, &self.expansions())?
+        self.current_page(py, layout)?
             .to_dict(py)
             .map(Bound::unbind)
     }
@@ -1108,17 +1139,17 @@ impl PythonMathMLViewer {
         py: Python<'_>,
         message: &Bound<'_, PyDict>,
     ) -> PyResult<Py<PyDict>> {
-        let layout = self.selected(py, message)?.layout;
-        let pages = self.current(py)?;
+        let layout = if Self::context(message)?.is_some() {
+            self.selected(py, message)?.layout
+        } else {
+            Self::requested_layout(message)?
+        };
         if layout == 0 {
             return self._page(py);
         }
-        let page = pages
-            .layouts
-            .iter()
-            .find(|p| p.layout == layout)
-            .ok_or_else(|| invalid("Unknown layout"))?;
-        page.to_dict(py).map(Bound::unbind)
+        self.selected_current_page(py, layout)?
+            .to_dict(py)
+            .map(Bound::unbind)
     }
 
     fn _action(&mut self, py: Python<'_>, message: &Bound<'_, PyDict>) -> PyResult<Py<PyDict>> {
@@ -1222,8 +1253,8 @@ impl PythonMathMLViewer {
     }
 
     fn _repr_html_(&mut self, py: Python<'_>) -> PyResult<String> {
-        let pages = self.current(py)?;
-        let page = &pages.main.value;
+        let current = self.current_page(py, 0)?;
+        let page = &current.value;
         let html = super::scrollable_html(&page.html);
         if page.start == 0 && page.end == page.total && page.markers.is_empty() {
             return Ok(html);

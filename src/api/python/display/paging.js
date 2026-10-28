@@ -320,6 +320,37 @@ function render({ model, el }) {
     displayPreview(model.get('preview'));
   }
   const productPrefactors = new WeakMap();
+  const wrappedWidths = new WeakMap();
+  function wrappingCheckpoint(container) {
+    // Refinement trials are synchronous. Retain the actual nodes and layout
+    // state so a rejected trial can restore a fitted page without measuring
+    // every table again. Node identity preserves inspection handlers/context.
+    const nodes = [container, ...container.querySelectorAll('*')];
+    const saved = nodes.map(node => ({ node, children: [...node.childNodes],
+      attributes:[...node.attributes].map(a => [a.namespaceURI, a.name, a.value]),
+      prefactor: productPrefactors.get(node), width: wrappedWidths.get(node) }));
+    return () => {
+      for (const node of container.querySelectorAll('[data-symbolica-product-prefactor]')) {
+        productPrefactors.delete(node);
+      }
+      for (const { node, children, attributes, prefactor, width } of saved) {
+        const current = node.childNodes;
+        if (current.length !== children.length || children.some((child, i) => current[i] !== child)) {
+          node.replaceChildren(...children);
+        }
+        const actual = [...node.attributes];
+        if (actual.length !== attributes.length || actual.some((a, i) =>
+            a.namespaceURI !== attributes[i][0] || a.name !== attributes[i][1] || a.value !== attributes[i][2])) {
+          for (const attribute of actual) node.removeAttributeNode(attribute);
+          for (const [namespace, name, value] of attributes) node.setAttributeNS(namespace, name, value);
+        }
+        productPrefactors.delete(node);
+        if (prefactor) productPrefactors.set(node, prefactor);
+        if (width === undefined) wrappedWidths.delete(node);
+        else wrappedWidths.set(node, width);
+      }
+    };
+  }
   function restoreProductFraction(numerator) {
     const state = productPrefactors.get(numerator);
     if (!state) return;
@@ -378,6 +409,15 @@ function render({ model, el }) {
     // including decorated omissions, using the font actually loaded here.
     // Nested sums in a long factor use the same measured packing policy.
     const tables = 'mtable[data-symbolica-product],mtable[data-symbolica-sum]';
+    // Descendants must not reserve the previous pass's outer continuation.
+    // Clear stale row starts before measuring any table; recursive fits below
+    // still reserve the continuations created during this pass.
+    for (const node of container.querySelectorAll('[data-symbolica-continuation], [data-symbolica-continuation-separator]')) {
+      const cell = node.closest('[data-symbolica-cell]');
+      if (cell && cell !== container) continue;
+      if (node.hasAttribute('data-symbolica-continuation')) node.remove();
+      else node.removeAttribute('data-symbolica-continuation-separator');
+    }
     const refitted = new Map();
     const tableLimits = new Map();
     function fitTable(table) {
@@ -486,10 +526,6 @@ function render({ model, el }) {
           // The term itself already carries its + or −. Only indent it.
           continuation.setAttribute('data-symbolica-sum-continuation', '');
         }
-        // Measure in this table's math style, including fraction/script size.
-        rows.find(({ factors }) => factors.length).factors[0].before(continuation);
-        continuationWidth = continuation.getBoundingClientRect().width;
-        continuation.remove();
       }
       if (!refitted.has(table)) refitted.set(table, new Set());
       const descendants = refitted.get(table);
@@ -509,10 +545,20 @@ function render({ model, el }) {
         }));
         const factors = measured.flatMap(row => row.factors);
         for (const factor of factors) factor.width = factor.node.getBoundingClientRect().width;
+        if (!attempt) {
+          // Read the original factors before inserting the probe. Removing it
+          // and hiding separators can then share one layout invalidation.
+          // Measure in this table's math style, including fraction/script size.
+          factors[0].node.before(continuation);
+          continuationWidth = continuation.getBoundingClientRect().width;
+          continuation.remove();
+        }
         for (const factor of factors) {
           for (const separator of factor.separators) separator.setAttribute('data-symbolica-continuation-separator', '');
         }
-        for (const factor of factors) factor.continuationWidth = factor.node.getBoundingClientRect().width;
+        for (const factor of factors) {
+          factor.continuationWidth = product ? factor.node.getBoundingClientRect().width : factor.width;
+        }
         for (const factor of factors) {
           for (const separator of factor.separators) separator.removeAttribute('data-symbolica-continuation-separator');
         }
@@ -565,12 +611,14 @@ function render({ model, el }) {
         // whole pass: an indivisible wide leaf must not trigger exponentially
         // many retries through its ancestors. Each ancestor/descendant pair
         // is retried once, including across recursive calls.
+        let nestedRefit = false;
         for (const row of packed) {
           if (!row.querySelector(':scope > mtd > mrow > [data-symbolica-continuation]')
               || row.getBoundingClientRect().width <= tableLimit + .5) continue;
           for (const nested of [...row.querySelectorAll(tables)].reverse()) {
             if (!descendants.has(nested)) {
               descendants.add(nested);
+              nestedRefit = true;
               fitTable(nested);
             }
           }
@@ -578,7 +626,13 @@ function render({ model, el }) {
         // WebKit can change intrinsic cell widths when factors move between
         // rows. Check the packed table too, and only reduce this pass's budget.
         const overflow = table.getBoundingClientRect().width - tableLimit;
-        if (overflow <= 0.5 || limit === 0) break;
+        if (overflow <= 0.5) {
+          // An inner fit can free enough room to combine outer rows. Repack
+          // with those final widths instead of keeping a stale line break.
+          if (nestedRefit && limit !== 0) continue;
+          break;
+        }
+        if (limit === 0) break;
         // A single wide leaf cannot become narrower by moving other terms to
         // another row. In particular, a sum's hanging indent can expose this
         // limit. Avoid retrying every term when no nested table can reflow it.
@@ -691,6 +745,7 @@ function render({ model, el }) {
         setWrapWidth(cell, Number.isFinite(used) ? used + .05 : cell.clientWidth);
       }
     }
+    wrappedWidths.set(container, width);
   }
   function widthWithCells(container, width, available) {
     // A wide term can overlap the next column without overflowing the entire
@@ -1105,6 +1160,8 @@ function render({ model, el }) {
           const original = parts.get(part.dataset.symbolicaPath);
           if (!original) continue;
           if (++attempts > 64) return;
+          const trialWidth = fittingWidth;
+          const rollback = wrappedWidths.get(container) === trialWidth ? wrappingCheckpoint(container) : null;
           const replacement = original.cloneNode(true);
           decorateMarkers(page, replacement, context);
           part.replaceWith(replacement);
@@ -1119,8 +1176,13 @@ function render({ model, el }) {
             changed = true;
             break;
           }
-          replacement.replaceWith(part);
-          setWrapWidth(container, fittingWidth);
+          // A scrollbar can narrow the available width during a trial. Such
+          // a change needs a fresh fit instead of the saved wider arrangement.
+          if (rollback && fittingWidth === trialWidth) rollback();
+          else {
+            replacement.replaceWith(part);
+            setWrapWidth(container, fittingWidth);
+          }
         }
       }
       if (!changed) break;
