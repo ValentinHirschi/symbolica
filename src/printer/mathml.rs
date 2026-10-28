@@ -243,6 +243,23 @@ impl Renderer<'_, '_> {
         while fragment[offset..].starts_with("<mrow>") || fragment[offset..].starts_with("<mrow ") {
             offset += fragment[offset..].find('>')? + 1;
         }
+        if fragment[offset..].starts_with("<mtable data-symbolica-product=\"\"") {
+            // A wrapped product keeps its global sign in its first factor.
+            // Follow only our table structure, not arbitrary nested content:
+            // a custom factor can itself begin with a negative summand.
+            for prefix in [
+                "<mtable data-symbolica-product=\"\"",
+                "<mtr>",
+                "<mtd ",
+                "<mrow>",
+                "<mrow data-symbolica-factor=\"\"",
+            ] {
+                if !fragment[offset..].starts_with(prefix) {
+                    return None;
+                }
+                offset += fragment[offset..].find('>')? + 1;
+            }
+        }
         fragment[offset..]
             .starts_with("<mo>−</mo>")
             .then_some(offset)
@@ -972,12 +989,19 @@ impl Renderer<'_, '_> {
                 if matches!(atom, AtomView::Add(_))
                     && let Some(offset) = Self::leading_minus(child, &fragment)
                 {
-                    body.push_str(if wrap || expanded_sum {
+                    let sign = if wrap || expanded_sum {
                         "<mo form=\"infix\">−</mo>"
                     } else {
                         "<mo>−</mo>"
-                    });
-                    fragment.replace_range(offset..offset + "<mo>−</mo>".len(), "");
+                    };
+                    if fragment[..offset].contains("<mtable data-symbolica-product=") {
+                        // Keep an expanded negative term's sign beside its
+                        // first factor instead of centering it beside the table.
+                        fragment.replace_range(offset..offset + "<mo>−</mo>".len(), sign);
+                    } else {
+                        body.push_str(sign);
+                        fragment.replace_range(offset..offset + "<mo>−</mo>".len(), "");
+                    }
                 } else if !body.ends_with("<mo>−</mo>") {
                     body.push_str(&separator);
                 }
@@ -1204,7 +1228,8 @@ impl Renderer<'_, '_> {
         self.nested_limit = previous_nested_limit;
         let mut omission = (end < atom.mathml_child_count()).then(|| self.hole_at(atom, path, end));
         let fraction = !denominator.is_empty();
-        let join = |factors: Vec<ProductFactor>, tail: Option<String>| {
+        let sign_in_factor = negative && multiline && !fraction;
+        let join = |factors: Vec<ProductFactor>, tail: Option<String>, leading_sign: bool| {
             let mut result = String::new();
             let mut rows = Vec::new();
             let mut row_cost = 0;
@@ -1220,7 +1245,9 @@ impl Renderer<'_, '_> {
                     factor.html
                 };
                 if multiline {
-                    let cost = Self::visible_cost(&factor) + usize::from(i > 0);
+                    let cost = Self::visible_cost(&factor)
+                        + usize::from(i > 0)
+                        + usize::from(leading_sign && i == 0);
                     if !result.is_empty() && row_cost + cost > PRODUCT_ROW_COST {
                         rows.push(std::mem::take(&mut result));
                         row_cost = 0;
@@ -1250,6 +1277,9 @@ impl Renderer<'_, '_> {
                         ));
                     }
                 }
+                if leading_sign && i == 0 {
+                    result.push_str("<mo>−</mo>");
+                }
                 result.push_str(&factor);
                 if multiline {
                     result.push_str("</mrow>");
@@ -1257,13 +1287,17 @@ impl Renderer<'_, '_> {
                 previous_numeric = numeric;
             }
             if result.is_empty() {
-                result.push_str(if multiline && tail.is_some() {
+                if multiline && (tail.is_some() || leading_sign) {
                     // A reciprocal-only prefix still needs a packable
                     // numerator: 1 and the omitted product share a row.
-                    "<mrow data-symbolica-factor=\"\"><mn>1</mn></mrow>"
+                    result.push_str("<mrow data-symbolica-factor=\"\">");
+                    if leading_sign {
+                        result.push_str("<mo>−</mo>");
+                    }
+                    result.push_str("<mn>1</mn></mrow>");
                 } else {
-                    "<mn>1</mn>"
-                });
+                    result.push_str("<mn>1</mn>");
+                }
             }
             if multiline {
                 rows.push(result);
@@ -1307,11 +1341,12 @@ impl Renderer<'_, '_> {
             } else {
                 None
             },
+            sign_in_factor,
         );
         let mut body = if denominator.is_empty() {
             n
         } else {
-            let denominator = join(denominator, None);
+            let denominator = join(denominator, None, false);
             if multiline {
                 // WebKit mislays fractions with direct table arguments. Group
                 // each table without changing the numerator or denominator.
@@ -1326,7 +1361,7 @@ impl Renderer<'_, '_> {
                 format!("<mfrac>{n}{denominator}</mfrac>")
             }
         };
-        if negative {
+        if negative && !sign_in_factor {
             body.insert_str(0, "<mo>−</mo>");
         }
         if start > 0 {
@@ -2651,6 +2686,93 @@ mod tests {
     }
 
     #[test]
+    fn multiline_product_signs_stay_in_the_first_factor() {
+        let product = (0..40)
+            .map(|i| format!("x{i}"))
+            .collect::<Vec<_>>()
+            .join("*");
+        for input in [
+            "-2*x*y".to_owned(),
+            "-sqrt(5)".to_owned(),
+            format!("-1i/16*({product})"),
+        ] {
+            let expression = parse!(&input);
+            let before = expression.clone();
+            let page = expression
+                .as_view()
+                .render_mathml_page(&PrintOptions::new(), 0, 25);
+            let first = page.html.find("<mrow data-symbolica-factor=").unwrap();
+            let content = first + page.html[first..].find('>').unwrap() + 1;
+            assert!(
+                page.html[content..].starts_with("<mo>−</mo>"),
+                "{}",
+                page.html
+            );
+            assert_eq!(page.html.matches("<mo>−</mo>").count(), 1, "{}", page.html);
+            assert!(
+                Renderer::leading_minus(expression.as_view(), &page.fragment()).is_some(),
+                "{}",
+                page.html
+            );
+            assert_eq!(expression, before);
+        }
+        // An explicit one-item page can contain just the negative unit and
+        // the omitted suffix. Its sign must still belong to a packed factor.
+        let tail = parse!("-x")
+            .as_view()
+            .render_mathml_page(&PrintOptions::new(), 0, 1);
+        assert_eq!(tail.end, 1);
+        assert_eq!(tail.markers.len(), 1);
+        assert!(
+            tail.html
+                .contains("<mrow data-symbolica-factor=\"\"><mo>−</mo><mn>1</mn></mrow>")
+        );
+    }
+
+    #[test]
+    fn expanded_negative_products_keep_their_sum_sign_in_the_first_factor() {
+        let expression = parse!("a-2*b*c");
+        let product = expression
+            .as_view()
+            .children()
+            .position(|term| matches!(term, AtomView::Mul(_)))
+            .unwrap();
+        let page = expression.as_view().render_mathml_layout(
+            &PrintOptions::new(),
+            0,
+            25,
+            0,
+            &[(vec![product], 25)],
+        );
+        let first = page.html.find("<mrow data-symbolica-factor=").unwrap();
+        let content = first + page.html[first..].find('>').unwrap() + 1;
+        assert!(
+            page.html[content..].starts_with("<mo form=\"infix\">−</mo>"),
+            "{}",
+            page.html
+        );
+        assert_eq!(page.html.matches("<mo form=\"infix\">−</mo>").count(), 1);
+        assert!(
+            !page.html.contains("<mo form=\"infix\">+</mo>"),
+            "{}",
+            page.html
+        );
+    }
+
+    #[test]
+    fn product_sign_detection_does_not_enter_custom_factor_contents() {
+        let target = crate::symbol!("mathml_product_sign::target");
+        let mut semantic = |atom: AtomView<'_>, _: &PrintOptions, _: &PrintState| {
+            Ok((atom.get_symbol() == Some(target))
+                .then(|| "<mo>−</mo><mi>a</mi><mo>+</mo><mi>b</mi>".to_owned()))
+        };
+        let expression = parse!("mathml_product_sign::target(x)*y");
+        let page = scoped_page("mathml_product_sign::target(x)*y", 0, &mut semantic).unwrap();
+        assert!(page.html.contains("<mo>−</mo>"));
+        assert!(Renderer::leading_minus(expression.as_view(), &page.fragment()).is_none());
+    }
+
+    #[test]
     fn complex_components_keep_their_own_signs() {
         for (input, real, sign, imag) in [
             ("-2-3i", "<mo>−</mo><mn>2</mn>", "−", "3"),
@@ -2745,6 +2867,12 @@ mod tests {
                 html.contains("<mfrac data-symbolica-product-fraction=\"\"><mrow><mtable"),
                 "{input}: {html}"
             );
+            if input.starts_with('-') {
+                assert!(
+                    html.contains("<mo>−</mo><mfrac data-symbolica-product-fraction="),
+                    "{html}"
+                );
+            }
             assert_eq!(html.matches("<mfrac").count(), 1, "{input}: {html}");
             assert_eq!(
                 html.matches("data-symbolica-coefficient").count(),
