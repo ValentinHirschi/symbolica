@@ -183,7 +183,7 @@ class AlgebraicMathMLTests(unittest.TestCase):
                 viewer.handle_message({'action': 'back'})
                 _, page = viewer.handle_message({'action': 'open', 'value': [part]})
                 self.assertEqual(page['total'], total)
-                self.assertEqual(page['end'], 7)
+                self.assertEqual((page['start'], page['end']), (7, 14))
                 self.assertEqual(page['markers'][0][0], [part])
                 while page['next'] is not None:
                     _, page = viewer.handle_message({'action': 'next'})

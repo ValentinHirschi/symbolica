@@ -795,7 +795,7 @@ class MathMLWrappingTests(unittest.IsolatedAsyncioTestCase):
                 if scenario == 'pinned':
                     self.assertTrue(await page.locator('.preview').is_visible())
                     self.assertEqual(await page.evaluate('responses.length'), 1)
-                    self.assertIn('factors 1–5', await page.locator('.preview-heading').text_content())
+                    self.assertIn('factors 9–13', await page.locator('.preview-heading').text_content())
                     continue
                 expected = 1 if scenario == 'pending' else 2
                 await page.wait_for_function('n => responses.length === n', arg=expected)
