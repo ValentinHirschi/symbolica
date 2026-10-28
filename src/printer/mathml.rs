@@ -531,9 +531,13 @@ impl Renderer<'_, '_> {
     }
 
     fn hard_limit(&self, atom: AtomView<'_>, depth: usize) -> bool {
+        self.bytes < MAX_LEAF_BYTES || self.hard_semantic_limit(atom, depth)
+    }
+
+    fn hard_semantic_limit(&self, atom: AtomView<'_>, depth: usize) -> bool {
         depth >= 64
             || self.nodes == 0
-            || self.bytes < MAX_LEAF_BYTES
+            || self.bytes == 0
             || atom
                 .get_symbol()
                 .is_some_and(|s| s.get_name().len() > MAX_LEAF_BYTES)
@@ -567,12 +571,19 @@ impl Renderer<'_, '_> {
             .fold(self.depth_limit, |limit, (p, _)| {
                 limit.max((p.len() + 4).min(64))
             });
-        if self.hard_limit(atom, depth) {
+        if self.hard_semantic_limit(atom, depth) {
             self.budget_exhausted |= self.nodes == 0 || self.bytes < MAX_LEAF_BYTES;
             return self.hole(atom, path);
         }
         if let Some(custom) = self.semantic(atom, path, state) {
             return custom;
+        }
+        // The native formatter reserves enough room for its largest leaf.
+        // Scoped notation already has an exact byte/node check, so a small
+        // tensor or scalar product can still use the remaining space.
+        if self.bytes < MAX_LEAF_BYTES {
+            self.budget_exhausted = true;
+            return self.hole(atom, path);
         }
         // A tail probe may render an opaque semantic leaf or a small native
         // expression, including powers of semantic leaves. Never walk a large
@@ -1729,6 +1740,50 @@ mod tests {
             assert_eq!((page.start, page.end, page.total), (0, 1, 3));
             assert_eq!(page.markers.len(), 1);
             assert_eq!(page.markers[0].start, 1);
+        }
+    }
+
+    #[test]
+    fn compact_semantic_leaves_use_the_actual_remaining_byte_budget() {
+        for fragment in [
+            "<mmultiscripts><mi>g</mi><none/><msub><mi>μ</mi><mn>3</mn></msub><none/><msub><mi>ν</mi><mn>3</mn></msub></mmultiscripts>",
+            "<mrow><mo>(</mo><msub><mi>k</mi><mn>0</mn></msub><mo>·</mo><msub><mi>k</mi><mn>1</mn></msub><mo>)</mo></mrow>",
+        ] {
+            let expression = parse!("mathml_compact_bytes::leaf(mink(4,mu),mink(4,nu))");
+            let options = PrintOptions::new();
+            let mut calls = 0;
+            let mut semantic = |_: AtomView<'_>, _: &PrintOptions, _: &PrintState| {
+                calls += 1;
+                Ok(Some(fragment.to_owned()))
+            };
+            let mut renderer = Renderer {
+                opts: &options,
+                state: PrintState::new(),
+                cursors: None,
+                nodes: 100,
+                bytes: 512,
+                budget_exhausted: false,
+                nested_limit: 1,
+                depth_limit: 2,
+                expansions: &[],
+                multiline_sums: false,
+                markers: vec![],
+                semantic: Some(&mut semantic),
+                probing_compact_tail: false,
+                compact_probe_remaining: MAX_NODES,
+                failed: false,
+            };
+            let html = renderer.render(expression.as_view(), &mut vec![0, 1], 3);
+            assert!(html.contains(fragment), "{html}");
+            assert!(renderer.markers.is_empty());
+            assert!(!renderer.budget_exhausted);
+            assert_eq!(renderer.bytes, 512 - html.len());
+            assert_eq!(
+                renderer.nodes,
+                100 - html.bytes().filter(|c| *c == b'<').count()
+            );
+            drop(renderer);
+            assert_eq!(calls, 1);
         }
     }
 
