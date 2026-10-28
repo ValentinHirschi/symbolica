@@ -349,14 +349,25 @@ impl Renderer<'_, '_> {
         start: usize,
         state: PrintState,
     ) -> Vec<(String, Option<FractionParts>)> {
-        let total = atom.mathml_child_count();
-        if self.semantic.is_none()
-            || self.probing_compact_tail
+        if self.semantic.is_none() || depth == 0 {
+            return vec![];
+        }
+        self.compact_rendered_tail(atom, path, depth, start..atom.mathml_child_count(), state)
+    }
+
+    fn compact_rendered_tail(
+        &mut self,
+        atom: AtomView<'_>,
+        path: &mut Vec<usize>,
+        depth: usize,
+        range: std::ops::Range<usize>,
+        state: PrintState,
+    ) -> Vec<(String, Option<FractionParts>)> {
+        if self.probing_compact_tail
             || self.compact_probe_remaining == 0
             || self.failed
             || self.budget_exhausted
-            || depth == 0
-            || total.saturating_sub(start) > 4
+            || range.len() > 4
             || self.hard_limit(atom, depth)
         {
             return vec![];
@@ -365,7 +376,7 @@ impl Renderer<'_, '_> {
         self.probing_compact_tail = true;
         let mut tail = Vec::new();
         let mut visible = String::new();
-        for (i, child) in MathMlChildren::new(atom, start, self.cursors) {
+        for (i, child) in MathMlChildren::new(atom, range.start, self.cursors).take(range.len()) {
             path.push(i);
             let mut parts = None;
             let html = self.render_factor(child, path, depth + 1, &mut parts, state);
@@ -1064,6 +1075,8 @@ impl Renderer<'_, '_> {
             ..self.state_at(depth + 1)
         };
         let mut tail = vec![].into_iter();
+        let requested_end = start.saturating_add(limit).min(atom.mathml_child_count());
+        let mut reserved_tail: Option<std::vec::IntoIter<(String, Option<FractionParts>)>> = None;
         for (i, child) in MathMlChildren::new(atom, start, self.cursors).take(limit + 4) {
             if self.failed {
                 break;
@@ -1073,7 +1086,12 @@ impl Renderer<'_, '_> {
                     .compact_semantic_tail(atom, path, depth, i, state)
                     .into_iter();
             }
-            let preview = if i >= start + limit {
+            let preview = if let Some(tail) = &mut reserved_tail {
+                let Some(fragment) = tail.next() else {
+                    break;
+                };
+                Some(fragment)
+            } else if i >= start + limit {
                 let Some(fragment) = tail.next() else {
                     break;
                 };
@@ -1090,12 +1108,30 @@ impl Renderer<'_, '_> {
             let mut parts = None;
             let previous_multiline_sums = self.multiline_sums;
             self.multiline_sums |= multiline;
+            // Keep a small part of the existing page budget for a few following
+            // factors. A large sum must not spend the resources needed to show
+            // an otherwise compact scalar, such as C_A^4. Defer its formatting
+            // until after the prefix so scoped aliases retain visitation order.
+            let remaining = requested_end.saturating_sub(i + 1);
+            let reserve = if depth == 0 && preview.is_none() && (1..=4).contains(&remaining) {
+                (
+                    (64 * remaining).min(self.nodes / 4),
+                    (MAX_LEAF_BYTES + 512 * remaining)
+                        .min(self.bytes.saturating_sub(MAX_LEAF_BYTES)),
+                )
+            } else {
+                (0, 0)
+            };
+            self.nodes -= reserve.0;
+            self.bytes -= reserve.1;
             let mut html = if let Some((html, preview_parts)) = preview {
                 parts = preview_parts;
                 html
             } else {
                 self.render_factor(child, path, depth + 1, &mut parts, state)
             };
+            self.nodes += reserve.0;
+            self.bytes += reserve.1;
             self.multiline_sums = previous_multiline_sums;
             path.pop();
             if let Some(parts) = parts {
@@ -1118,11 +1154,20 @@ impl Renderer<'_, '_> {
                 }
             }
             end = i + 1;
-            // A factor may have used the remaining budget to show part of a
-            // large sum. Keep that bounded preview, fraction parts and markers;
-            // only the following factors need a fresh page budget.
+            // Spend the reserve only on complete, compact factors within the
+            // requested page. A larger remainder keeps its navigable omission.
             if self.budget_exhausted {
-                break;
+                if depth > 0 {
+                    break;
+                }
+                self.budget_exhausted = false;
+                let retained =
+                    self.compact_rendered_tail(atom, path, depth, end..requested_end, state);
+                if retained.is_empty() {
+                    self.budget_exhausted = true;
+                    break;
+                }
+                reserved_tail = Some(retained.into_iter());
             }
         }
         self.nested_limit = previous_nested_limit;
@@ -2065,6 +2110,101 @@ mod tests {
         assert_eq!(next.end, omission.start + 25);
         assert_eq!(next.total, 1771);
         assert_eq!(expression, before);
+    }
+
+    #[test]
+    fn compact_root_factor_after_large_sum_keeps_its_display_budget() {
+        let casimir = crate::symbol!("mathml_root_reserve::casimir");
+        // Short powers exhaust nodes; long names exhaust the text budget.
+        for prefix in ["x".to_owned(), "long".repeat(20)] {
+            let sum = (0..400)
+                .map(|i| format!("{prefix}{i}^2"))
+                .collect::<Vec<_>>()
+                .join("+");
+            let expression = parse!(&format!(
+                "a*({sum})*mathml_root_reserve::casimir(adjoint)^4"
+            ));
+            let cursors = MathMlCursorCache::new(expression.as_view());
+            let mut calls = 0;
+            let mut semantic = |atom: AtomView<'_>, _: &PrintOptions, state: &PrintState| {
+                if atom.get_symbol() == Some(casimir) {
+                    calls += 1;
+                    assert!(state.in_exp_base);
+                    Ok(Some("<msub><mi>C</mi><mi>A</mi></msub>".to_owned()))
+                } else {
+                    Ok(None)
+                }
+            };
+            let page = expression
+                .as_view()
+                .render_mathml_layout_cached(
+                    &PrintOptions::new(),
+                    0,
+                    25,
+                    0,
+                    &[],
+                    &cursors,
+                    Some(&mut semantic),
+                )
+                .unwrap();
+            assert_eq!((page.end, page.total), (3, 3));
+            assert!(page.html.contains("<msub><mi>C</mi><mi>A</mi></msub>"));
+            assert_eq!(calls, 1);
+            assert!(page.markers.iter().all(|marker| !marker.path.is_empty()));
+            assert!(page.markers.iter().any(|marker| marker.path == [1]));
+        }
+    }
+
+    #[test]
+    fn root_reserve_preserves_requested_pages_and_noncompact_omissions() {
+        let casimir = crate::symbol!("mathml_root_reserve_limits::casimir");
+        let sum = (0..400)
+            .map(|i| format!("x{i}^2"))
+            .collect::<Vec<_>>()
+            .join("+");
+        let expression = parse!(&format!(
+            "a*({sum})*mathml_root_reserve_limits::casimir(adjoint)^4"
+        ));
+        let cursors = MathMlCursorCache::new(expression.as_view());
+        for (start, size, fragment, expected_end, expected_calls) in [
+            (0, 2, "<msub><mi>C</mi><mi>A</mi></msub>", 2, 0),
+            (1, 2, "<msub><mi>C</mi><mi>A</mi></msub>", 3, 1),
+            (0, 25, "<mi>long_visible_casimir_name</mi>", 2, 1),
+        ] {
+            let mut calls = 0;
+            let mut semantic = |atom: AtomView<'_>, _: &PrintOptions, _: &PrintState| {
+                if atom.get_symbol() == Some(casimir) {
+                    calls += 1;
+                    Ok(Some(fragment.to_owned()))
+                } else {
+                    Ok(None)
+                }
+            };
+            let page = expression
+                .as_view()
+                .render_mathml_layout_cached(
+                    &PrintOptions::new(),
+                    start,
+                    size,
+                    0,
+                    &[],
+                    &cursors,
+                    Some(&mut semantic),
+                )
+                .unwrap();
+            assert_eq!((page.start, page.end, page.total), (start, expected_end, 3));
+            assert_eq!(calls, expected_calls);
+            if expected_end == 2 {
+                assert!(
+                    page.markers
+                        .iter()
+                        .any(|marker| marker.path.is_empty() && marker.start == 2)
+                );
+                assert!(!page.html.contains(fragment));
+            } else {
+                assert!(page.html.contains(fragment));
+            }
+        }
     }
 
     #[test]
