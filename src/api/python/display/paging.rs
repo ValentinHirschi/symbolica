@@ -268,6 +268,7 @@ struct Navigation {
     position: Position,
     parents: Vec<Position>,
     expanded: BTreeMap<Vec<usize>, usize>,
+    automatic_product_preview: bool,
 }
 #[derive(PartialEq, Eq)]
 struct CacheKey {
@@ -379,8 +380,64 @@ impl PythonMathMLViewer {
         if self.source.is_none() {
             return Err(PyRuntimeError::new_err("This expression viewer is closed"));
         }
+        self.prepare_automatic_preview(py)?;
         let p = self.navigation.position.clone();
         self.pages(py, &p.path, p.start, p.size, &self.expansions())
+    }
+
+    fn prepare_automatic_preview(&mut self, py: Python<'_>) -> PyResult<()> {
+        if !self.navigation.automatic_product_preview {
+            return Ok(());
+        }
+        let p = self.navigation.position.clone();
+        if !p.path.is_empty()
+            || p.start != 0
+            || p.size != 25
+            || !self.navigation.parents.is_empty()
+            || !self.navigation.expanded.is_empty()
+        {
+            self.navigation.automatic_product_preview = false;
+            return Ok(());
+        }
+        let initial = self.source_page(py, &[], 0, p.size, 0, &[])?;
+        let total = initial.value.total;
+        if initial.value.kind == "Product" && (26..=50).contains(&total) {
+            // A complete small product can be clearer than an arbitrary
+            // 25-factor cut. Probe at most one additional page, preserving the
+            // ordinary renderer bounds. Judge the final output, not the size
+            // of the underlying tensor representation or its item count.
+            let candidate = match self.source_page(py, &[], 0, total, 0, &[]) {
+                Ok(candidate) => candidate,
+                // Optional probing must not break an otherwise valid preview.
+                // Keep failures retryable, as with every uncached source error.
+                Err(_) => return Ok(()),
+            };
+            let html = &candidate.value.html;
+            let elements = html
+                .as_bytes()
+                .windows(2)
+                .filter(|pair| pair[0] == b'<' && pair[1].is_ascii_alphabetic())
+                .take(1001)
+                .count();
+            if candidate.value.kind == "Product"
+                && candidate.value.start == 0
+                && candidate.value.end == total
+                && candidate.value.total == total
+                && candidate.value.markers.is_empty()
+                && !html.contains("data-symbolica-marker=")
+                && html.len() <= 16 * 1024
+                && elements <= 1000
+            {
+                let p = &mut self.navigation.position;
+                p.size = total;
+                p.compact_size = total;
+            }
+        }
+        // Successful renders, including rejected candidates, are shared with
+        // the ordinary bounded page cache. Do not probe again after navigation
+        // or after an explicit size selection restores the original 25 items.
+        self.navigation.automatic_product_preview = false;
+        Ok(())
     }
 
     fn expansions(&self) -> Vec<(Vec<usize>, usize)> {
@@ -619,6 +676,21 @@ impl PythonMathMLViewer {
             .get_item("action")?
             .map(|v| v.extract())
             .transpose()?;
+        if matches!(
+            action.as_deref(),
+            Some(
+                "next"
+                    | "previous"
+                    | "size"
+                    | "expand"
+                    | "expand_all"
+                    | "collapse"
+                    | "open"
+                    | "back"
+            )
+        ) {
+            self.navigation.automatic_product_preview = false;
+        }
         match action.as_deref() {
             Some("next") => {
                 if let Some(next) = page.next {
@@ -823,13 +895,14 @@ impl PythonMathMLViewer {
 #[pymethods]
 impl PythonMathMLViewer {
     #[new]
-    #[pyo3(signature = (source, page_size=25, *, layout_count=1, supports_expansion=false))]
+    #[pyo3(signature = (source, page_size=25, *, layout_count=1, supports_expansion=false, _automatic_product_preview=false))]
     fn new(
         py: Python<'_>,
         source: Py<PyAny>,
         #[pyo3(from_py_with=page_size)] page_size: usize,
         #[pyo3(from_py_with=layout_count)] layout_count: usize,
         supports_expansion: bool,
+        _automatic_product_preview: bool,
     ) -> PyResult<Self> {
         if !source
             .bind(py)
@@ -859,6 +932,7 @@ impl PythonMathMLViewer {
                 },
                 parents: Vec::new(),
                 expanded: BTreeMap::new(),
+                automatic_product_preview: _automatic_product_preview,
             },
             cache: VecDeque::new(),
             cache_bytes: 0,
@@ -1022,6 +1096,7 @@ impl PythonMathMLViewer {
     }
 
     fn _render_page(&mut self, py: Python<'_>, layout: usize) -> PyResult<Py<PyDict>> {
+        self.prepare_automatic_preview(py)?;
         let p = self.navigation.position.clone();
         self.source_page(py, &p.path, p.start, p.size, layout, &self.expansions())?
             .to_dict(py)

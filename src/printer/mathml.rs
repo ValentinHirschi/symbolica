@@ -456,7 +456,7 @@ impl Renderer<'_, '_> {
         }
         let marker_type = match atom {
             AtomView::Add(_) => "+",
-            AtomView::Mul(_) => "·",
+            AtomView::Mul(_) => "×",
             _ => {
                 if atom.mathml_child_count() > 0 {
                     label
@@ -1257,12 +1257,25 @@ impl Renderer<'_, '_> {
                 previous_numeric = numeric;
             }
             if result.is_empty() {
-                result.push_str("<mn>1</mn>");
+                result.push_str(if multiline && tail.is_some() {
+                    // A reciprocal-only prefix still needs a packable
+                    // numerator: 1 and the omitted product share a row.
+                    "<mrow data-symbolica-factor=\"\"><mn>1</mn></mrow>"
+                } else {
+                    "<mn>1</mn>"
+                });
             }
             if multiline {
                 rows.push(result);
                 if let Some(tail) = tail {
-                    rows.push(tail);
+                    // The omitted suffix is a product factor too. Keep its
+                    // leading operator directly inside the factor so browser
+                    // packing can replace it with a continuation operator.
+                    let tail = tail
+                        .strip_prefix("<mrow>")
+                        .and_then(|body| body.strip_suffix("</mrow>"))
+                        .unwrap_or(&tail);
+                    rows.push(format!("<mrow data-symbolica-factor=\"\">{tail}</mrow>"));
                 }
                 let rows = rows
                     .into_iter()
@@ -1287,7 +1300,9 @@ impl Renderer<'_, '_> {
         };
         let n = join(
             numerator,
-            if multiline && denominator.is_empty() {
+            if multiline {
+                // The omitted product multiplies the known quotient. Keeping
+                // it in the numerator also keeps it in the final visible row.
                 omission.take()
             } else {
                 None
@@ -2761,6 +2776,92 @@ mod tests {
         );
         assert!(expanded.html.contains("data-symbolica-product-fraction"));
         assert!(expanded.html.contains("<mo form=\"infix\">−</mo>"));
+    }
+
+    #[test]
+    fn product_omissions_are_packed_factors_inside_fraction_numerators() {
+        let product = (0..40)
+            .map(|i| format!("x{i}"))
+            .collect::<Vec<_>>()
+            .join("*");
+        let tail = "<mrow data-symbolica-factor=\"\"><mo form=\"infix\">×</mo><mtext data-symbolica-marker=\"0\">[1]</mtext></mrow>";
+        for (input, fraction, negative) in [
+            (product.clone(), false, false),
+            (format!("-3*({product})/8"), true, true),
+            (format!("-3*({product})/12345678901"), true, true),
+            (format!("1/({product})"), true, false),
+        ] {
+            let expression = parse!(&input);
+            let before = expression.clone();
+            let page = expression
+                .as_view()
+                .render_mathml_page(&PrintOptions::new(), 0, 25);
+            assert_eq!(page.end, 25);
+            assert_eq!(page.markers.len(), 1);
+            assert!(page.markers[0].path.is_empty());
+            assert_eq!(page.markers[0].start, 25);
+            assert_eq!(page.html.matches(tail).count(), 1, "{}", page.html);
+            assert!(!page.html.contains("<mo form=\"infix\">·</mo>"));
+            if fraction {
+                // The omitted product multiplies the numerator. Leaving it
+                // after the fraction places it beside the center of a wrapped
+                // numerator instead of after the final visible factor.
+                let numerator_end = page
+                    .html
+                    .find("</mtable></mrow><mrow><mtable")
+                    .expect("canonical numerator and denominator tables");
+                assert!(
+                    page.html.find(tail).unwrap() < numerator_end,
+                    "{}",
+                    page.html
+                );
+                assert_eq!(page.html.matches("<mfrac").count(), 1);
+                if !negative {
+                    assert!(
+                        page.html
+                            .contains("<mrow data-symbolica-factor=\"\"><mn>1</mn></mrow>"),
+                        "{}",
+                        page.html
+                    );
+                }
+            }
+            assert_eq!(
+                page.html.matches("<mo>−</mo>").count(),
+                usize::from(negative)
+            );
+            let rest = expression
+                .as_view()
+                .render_mathml_page(&PrintOptions::new(), page.end, 25);
+            assert_eq!(rest.start, 25);
+            assert_eq!(rest.end, rest.total);
+            assert!(rest.markers.is_empty());
+            assert!(rest.html.contains("<mtext>⋯</mtext>"));
+            assert_eq!(expression, before);
+        }
+    }
+
+    #[test]
+    fn inline_product_omissions_use_a_single_cross_after_the_fraction() {
+        let product = (0..40)
+            .map(|i| format!("x{i}"))
+            .collect::<Vec<_>>()
+            .join("*");
+        let expression = parse!(&format!("outer(-3*({product})/8)"));
+        let page = expression
+            .as_view()
+            .render_mathml_layout(&PrintOptions::new(), 0, 25, 5, &[]);
+        assert!(!page.html.contains("data-symbolica-product"));
+        assert_eq!(page.markers.len(), 1);
+        assert_eq!(page.markers[0].path, [0]);
+        assert_eq!(page.markers[0].start, 2);
+        assert!(
+            page.html
+                .contains("</mfrac><mrow><mo form=\"infix\">×</mo>"),
+            "{}",
+            page.html
+        );
+        assert_eq!(page.html.matches("<mo form=\"infix\">×</mo>").count(), 1);
+        assert_eq!(page.html.matches("<mo>−</mo>").count(), 1);
     }
 
     #[test]
