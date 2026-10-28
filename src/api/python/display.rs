@@ -10,7 +10,7 @@ pub use provider::{MathMLMarker, MathMLPage};
 #[cfg(feature = "python_export")]
 pub use provider::{MathMLPageRequest, MathMLPageSource, MathMLViewer};
 #[cfg(not(feature = "python_export"))]
-use provider::{MathMLPageRequest, MathMLPageSource, MathMLViewer};
+pub(super) use provider::{MathMLPageRequest, MathMLPageSource, MathMLViewer};
 mod paging;
 
 pub(super) fn default_options() -> PrintOptions {
@@ -319,6 +319,22 @@ pub(super) fn formatted(
     }))
 }
 
+pub(super) fn formatted_preview(
+    py: Python<'_>,
+    expression: Py<PythonExpression>,
+    options: PrintOptions,
+) -> PyResult<PythonFormattedOutput> {
+    let owner = expression.clone_ref(py);
+    let preview_options = options.clone();
+    Ok(
+        formatted(py, expression, options, mathml::DEFAULT_PAGE_SIZE)?.with_notebook(move |py| {
+            MathMLViewer::expression(owner.clone_ref(py), preview_options.clone(), None)
+                .automatic_product_preview()
+                .into_python(py)
+        }),
+    )
+}
+
 fn paging_module(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
     let modules = py.import("sys")?.getattr("modules")?;
     let name = "_symbolica_paging";
@@ -383,9 +399,28 @@ pub fn mathml_viewer(
     layout_count: usize,
     supports_expansion: bool,
 ) -> PyResult<Py<PyAny>> {
+    mathml_viewer_with_preview(
+        py,
+        source,
+        page_size,
+        layout_count,
+        supports_expansion,
+        false,
+    )
+}
+
+fn mathml_viewer_with_preview(
+    py: Python<'_>,
+    source: Py<PyAny>,
+    page_size: usize,
+    layout_count: usize,
+    supports_expansion: bool,
+    automatic_product_preview: bool,
+) -> PyResult<Py<PyAny>> {
     let kwargs = PyDict::new(py);
     kwargs.set_item("layout_count", layout_count)?;
     kwargs.set_item("supports_expansion", supports_expansion)?;
+    kwargs.set_item("_automatic_product_preview", automatic_product_preview)?;
     paging_module(py)?
         .getattr("MathMLViewer")?
         .call((source, page_size), Some(&kwargs))

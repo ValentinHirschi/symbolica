@@ -18,6 +18,13 @@ javascript = MathMLViewer.javascript()
 formatting options. Plain `FormattedOutput` objects without a MathML provider
 return `None`.
 
+Omitting `page_size` from `expression.mathml_viewer()` uses an automatic initial
+preview. It starts with 25 items, but a product with at most 50 factors can be
+shown completely when its rendered MathML fits in 16 KiB and 1,000 elements.
+Only complete candidates are accepted; larger products retain their pager.
+An explicit `page_size=25` keeps the 25-item maximum, and later size selections
+or navigation do not repeat the automatic check.
+
 Import `javascript` as an ES module and mount it in an HTML element:
 
 ```javascript
