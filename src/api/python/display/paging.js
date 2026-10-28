@@ -114,11 +114,10 @@ function render({ model, el }) {
     .preview-math > math { overflow:visible!important; }
     .preview-hint { margin-top:8px; color:var(--muted-foreground,var(--jp-ui-font-color2,#68716c)); font-size:12px; }
   </style>
-  <nav class="toolbar" aria-label="Expression pages"></nav>
+  <nav class="toolbar" aria-label="Expression controls"></nav>
   <div class="status" role="status" aria-live="polite"></div>
   <div class="math" tabindex="0" role="region" aria-label="Expression"
     aria-keyshortcuts="+ = - 0"
-    title="Click or Tab to focus. + or = zooms in, − zooms out, 0 resets."
     ><div class="math-content"></div></div>
   <span class="zoom-feedback" aria-live="polite" hidden></span>
   <div class="preview" role="tooltip" popover="manual" hidden>
@@ -133,6 +132,7 @@ function render({ model, el }) {
       <button class="preview-next" type="button">Next</button>
       <select class="preview-size" aria-label="Items per page"></select>
       <button class="preview-expand" type="button">Show more</button>
+      <button class="preview-show-all" type="button" hidden>Show all</button>
       <button class="preview-collapse" type="button" hidden>Show less</button>
       <button class="preview-inspect" type="button">Inspect</button>
     </nav>
@@ -151,11 +151,13 @@ function render({ model, el }) {
   function setZoom(index) {
     scaleIndex = Math.max(0, Math.min(scales.length - 1, index));
     content.style.setProperty('--expression-zoom', scales[scaleIndex]);
+    previewMath.style.zoom = scales[scaleIndex];
     zoomFeedback.textContent = `Zoom ${Math.round(scales[scaleIndex] * 100)}% · 0 to reset`;
     zoomFeedback.hidden = false;
     clearTimeout(zoomTimer);
     zoomTimer = setTimeout(() => { zoomFeedback.hidden = true; }, 1800);
-    hidePreview();
+    if (activePreview?.pinned) positionPreview();
+    else hidePreview();
   }
   const preview = root.querySelector('.preview');
   const previewHeading = root.querySelector('.preview-heading');
@@ -168,12 +170,14 @@ function render({ model, el }) {
   const previewSize = root.querySelector('.preview-size');
   const previewInspect = root.querySelector('.preview-inspect');
   const previewExpand = root.querySelector('.preview-expand');
+  const previewShowAll = root.querySelector('.preview-show-all');
   const previewCollapse = root.querySelector('.preview-collapse');
   pageArrow(previewPrevious, 'Previous', 'previous');
   pageArrow(previewNext, 'Next', 'next');
   const previewHint = root.querySelector('.preview-hint');
   preview.id = `symbolica-preview-${view}`;
   preview.tabIndex = -1;
+  preview.setAttribute('aria-keyshortcuts', '+ = - 0');
   previewHeading.id = `${preview.id}-heading`;
   const popupSizes = new Map();
   let activePreview = null;
@@ -182,6 +186,38 @@ function render({ model, el }) {
   let previewSequence = 0;
   let hoverTimer, hideTimer, restoringFocus = false;
   let positionFrame, previewNeedsFit = false;
+  const pendingExpansions = [];
+  let showAllLayout = false;
+  // Parsed source trees are immutable. Keep a small per-view cache, never
+  // measured DOM: fitting moves nodes and depends on the current font/width.
+  const templates = new Map();
+  let templateBytes = 0;
+  function sourceTemplate(html) {
+    let entry = templates.get(html);
+    if (entry) {
+      templates.delete(html);
+      templates.set(html, entry);
+      return entry;
+    }
+    const template = doc.createElement('template');
+    template.innerHTML = html;
+    entry = { template, parts: new Map([...template.content.querySelectorAll('[data-symbolica-path]')]
+      .map(part => [part.dataset.symbolicaPath, part])) };
+    const bytes = html.length * 2;
+    if (bytes <= 2 * 1024 * 1024) {
+      while (templates.size && (templates.size >= 32 || templateBytes + bytes > 2 * 1024 * 1024)) {
+        const oldest = templates.keys().next().value;
+        templateBytes -= oldest.length * 2;
+        templates.delete(oldest);
+      }
+      templates.set(html, entry);
+      templateBytes += bytes;
+    }
+    return entry;
+  }
+  function putHtml(container, html) {
+    container.replaceChildren(sourceTemplate(html).template.content.cloneNode(true));
+  }
   function hidePreview(restoreFocus = false) {
     clearTimeout(hoverTimer);
     clearTimeout(hideTimer);
@@ -230,7 +266,7 @@ function render({ model, el }) {
     if (!state) return;
     state.request = `${view}-${++previewSequence}`;
     previewPrevious.disabled = previewNext.disabled = previewSize.disabled = true;
-    previewExpand.disabled = previewCollapse.disabled = true;
+    previewExpand.disabled = previewShowAll.disabled = previewCollapse.disabled = true;
     preview.setAttribute('aria-busy', 'true');
     model.send({ action: 'preview', value: state.path, request: state.request,
       layout: state.layout, context: state.context, popup: state.pinned, start: state.start, size: state.size });
@@ -242,7 +278,7 @@ function render({ model, el }) {
     hidePreview();
     const key = JSON.stringify(path);
     const size = popupSizes.get(key) || model.get('page').page_size;
-    activePreview = { button, path, layout, markerStart, pinned, size, start: 0, previous: [] };
+    activePreview = { button, path, layout, markerStart, pinned, size, start: markerStart, previous: [] };
     const show = () => {
       preview.classList.toggle('pinned', pinned);
       preview.setAttribute('role', pinned ? 'dialog' : 'tooltip');
@@ -251,10 +287,10 @@ function render({ model, el }) {
       previewBack.hidden = true;
       previewPrevious.hidden = previewNext.hidden = previewSize.hidden = true;
       previewExpand.hidden = !model.get('page').supports_expansion;
-      previewCollapse.hidden = !model.get('page').can_collapse;
+      previewShowAll.hidden = previewCollapse.hidden = true;
       previewHint.textContent = pinned
         ? (model.get('page').supports_expansion
-          ? 'Show more expands the main view. Show less restores its compact display. Inspect opens this part separately.'
+          ? 'Show more expands this part in the main view. Show less compacts this part. Inspect opens it separately.'
           : 'Inspect opens this part in the main view.')
         : 'Click to explore this part. Escape closes this preview.';
       previewHeading.textContent = label.replace('Inspect ', '');
@@ -391,8 +427,34 @@ function render({ model, el }) {
             && children.some(node => node.hasAttribute('data-symbolica-factor') || node.hasAttribute('data-symbolica-term'))) {
           // The surrounding product can move this factor between rows, but
           // a continuation's fixed prefix still takes space from its children.
-          overhead += children.find(node => node.hasAttribute('data-symbolica-continuation'))
-            ?.getBoundingClientRect().width || 0;
+          // Keep a small leading coefficient with the next factor: otherwise
+          // a nested sum first fills the entire row and strands the coefficient
+          // above it. Reserve the coefficient while fitting that sum, even if
+          // a previous pass put it on a separate continuation row.
+          const owner = child.hasAttribute('data-symbolica-factor')
+            ? parent.closest('mtable[data-symbolica-product]') : null;
+          const factors = owner ? [...owner.querySelectorAll(':scope > mtr > mtd > mrow > [data-symbolica-factor]')] : [];
+          const coefficient = factors[0]?.hasAttribute('data-symbolica-coefficient') ? factors[0] : null;
+          const coefficientWidth = coefficient?.getBoundingClientRect().width || 0;
+          const keepCoefficient = child === factors[1] && coefficientWidth > 0
+            && coefficientWidth <= 2 * parseFloat(getComputedStyle(coefficient).fontSize);
+          let separatorWidth = 0;
+          if (keepCoefficient) {
+            // Recursive fitting can reach an old continuation whose original
+            // multiplication separator is still hidden. Account for that
+            // separator too: it returns when these factors share a row.
+            const hidden = [...child.children].filter(node =>
+              node.hasAttribute('data-symbolica-continuation-separator'));
+            if (hidden.length) {
+              const before = child.getBoundingClientRect().width;
+              for (const node of hidden) node.removeAttribute('data-symbolica-continuation-separator');
+              separatorWidth = Math.max(0, child.getBoundingClientRect().width - before);
+              for (const node of hidden) node.setAttribute('data-symbolica-continuation-separator', '');
+            }
+          }
+          overhead += keepCoefficient ? coefficientWidth + separatorWidth
+            : children.find(node => node.hasAttribute('data-symbolica-continuation'))
+              ?.getBoundingClientRect().width || 0;
           continue;
         }
         if (['mtable', 'mtr', 'mtd'].includes(parent.localName)
@@ -405,19 +467,25 @@ function render({ model, el }) {
       const tableLimit = Math.max(0, available - (overhead - cellOverhead));
       let limit = Math.max(0, available - overhead);
       let continuation, continuationWidth = 0;
-      if (product) {
+      {
         continuation = doc.createElementNS(table.namespaceURI, 'mrow');
         continuation.setAttribute('data-symbolica-continuation', '');
         const indent = doc.createElementNS(table.namespaceURI, 'mspace');
         indent.setAttribute('width', '0.75em');
-        const operator = doc.createElementNS(table.namespaceURI, 'mo');
-        operator.setAttribute('form', 'infix');
-        operator.setAttribute('lspace', '0');
-        operator.setAttribute('rspace', '0');
-        operator.textContent = '×';
-        const gap = doc.createElementNS(table.namespaceURI, 'mspace');
-        gap.setAttribute('width', '0.25em');
-        continuation.append(indent, operator, gap);
+        continuation.append(indent);
+        if (product) {
+          const operator = doc.createElementNS(table.namespaceURI, 'mo');
+          operator.setAttribute('form', 'infix');
+          operator.setAttribute('lspace', '0');
+          operator.setAttribute('rspace', '0');
+          operator.textContent = '×';
+          const gap = doc.createElementNS(table.namespaceURI, 'mspace');
+          gap.setAttribute('width', '0.25em');
+          continuation.append(operator, gap);
+        } else {
+          // The term itself already carries its + or −. Only indent it.
+          continuation.setAttribute('data-symbolica-sum-continuation', '');
+        }
         // Measure in this table's math style, including fraction/script size.
         rows.find(({ factors }) => factors.length).factors[0].before(continuation);
         continuationWidth = continuation.getBoundingClientRect().width;
@@ -467,7 +535,7 @@ function render({ model, el }) {
               row.append(cell);
               packed.push(row);
               lineWidth = 0;
-              if (product && seenFactors) {
+              if (seenFactors) {
                 line.append(continuation.cloneNode(true));
                 for (const separator of factor.separators) separator.setAttribute('data-symbolica-continuation-separator', '');
                 // Include both the indent and operator when fitting this row.
@@ -511,6 +579,17 @@ function render({ model, el }) {
         // rows. Check the packed table too, and only reduce this pass's budget.
         const overflow = table.getBoundingClientRect().width - tableLimit;
         if (overflow <= 0.5 || limit === 0) break;
+        // A single wide leaf cannot become narrower by moving other terms to
+        // another row. In particular, a sum's hanging indent can expose this
+        // limit. Avoid retrying every term when no nested table can reflow it.
+        const indivisibleOverflow = packed.some(row => {
+          const body = row.querySelector(':scope > mtd > mrow');
+          const factors = body ? [...body.children].filter(node =>
+            node.hasAttribute('data-symbolica-factor') || node.hasAttribute('data-symbolica-term')) : [];
+          return factors.length === 1 && !factors[0].querySelector(tables)
+            && body.getBoundingClientRect().width > limit + .5;
+        });
+        if (indivisibleOverflow) break;
         limit = Math.max(0, limit - overflow);
       }
       tableLimits.set(table, limit);
@@ -633,25 +712,34 @@ function render({ model, el }) {
       previewPrevious.hidden = previewNext.hidden = previewSize.hidden = true;
     } else {
       const layouts = [value, ...(value.layouts || []).map(p => ({...value, ...p}))];
-      let selected = value, smallest = Infinity;
+      const zoom = previewMath.style.zoom;
+      previewMath.style.zoom = 1;
+      let selected = value, smallest = Infinity, selectedNodes, shown;
       for (const candidate of layouts) {
-        previewMath.innerHTML = candidate.html;
+        putHtml(previewMath, candidate.html);
+        shown = candidate;
         decorateMarkers(candidate, previewMath, value.context);
         setWrapWidth(previewMath, previewMath.clientWidth);
         const width = widthWithCells(previewMath,
           Math.max(previewMath.scrollWidth - 4, previewMath.firstElementChild?.getBoundingClientRect().width || 0),
           previewMath.clientWidth - 4);
-        if (width < smallest) { selected = candidate; smallest = width; }
+        if (width < smallest) {
+          selected = candidate;
+          smallest = width;
+          selectedNodes = [...previewMath.childNodes];
+        }
         // Rendering a tall candidate may introduce a vertical scrollbar and
         // reduce the available width on platforms with classic scrollbars.
         if (width <= previewMath.clientWidth - 4 + 1) { selected = candidate; break; }
       }
-      previewMath.innerHTML = selected.html;
-      decorateMarkers(selected, previewMath, value.context);
-      setWrapWidth(previewMath, previewMath.clientWidth);
+      if (shown !== selected) {
+        previewMath.replaceChildren(...selectedNodes);
+        setWrapWidth(previewMath, previewMath.clientWidth);
+      }
       revealFittingParts(layouts, previewMath.clientWidth - 4, previewMath, value.context);
       numberMarkers(previewMath);
-    setWrapWidth(previewMath, previewMath.clientWidth);
+      setWrapWidth(previewMath, previewMath.clientWidth);
+      previewMath.style.zoom = zoom || scales[scaleIndex];
       activePreview.page = selected;
       activePreview.start = selected.start;
       previewMath.scrollTop = previewMath.scrollLeft = 0;
@@ -663,29 +751,34 @@ function render({ model, el }) {
       previewSize.disabled = false;
       previewExpand.disabled = value.kind === 'Value' || value.can_expand === false;
       previewExpand.title = previewExpand.disabled ? 'Inline display limit reached; use pagination or Inspect.' : '';
+      previewShowAll.hidden = !value.can_show_all;
+      previewShowAll.disabled = !value.can_show_all;
+      previewCollapse.hidden = !(value.can_collapse ?? model.get('page').can_collapse);
       previewCollapse.disabled = false;
     }
     positionPreview();
   }
-  function showSubPreview(path, label, layout, context) {
+  function showSubPreview(path, label, layout, context, markerStart = 0) {
     const parent = activePreview;
     if (!parent) return;
     parent.pinned = true;
     parent.scrollTop = previewMath.scrollTop;
     parent.scrollLeft = previewMath.scrollLeft;
     activePreview = {button:parent.button, parent, path, layout, context,
-      pinned:true, start:0, size:popupSizes.get(JSON.stringify(path)) || parent.size, previous:[]};
+      markerStart, pinned:true, start:markerStart,
+      size:popupSizes.get(JSON.stringify(path)) || parent.size, previous:[]};
     preview.classList.add('pinned');
     preview.setAttribute('role', 'dialog');
     previewControls.hidden = previewClose.hidden = false;
     previewExpand.hidden = !model.get('page').supports_expansion;
-    previewCollapse.hidden = !model.get('page').can_collapse;
+    previewShowAll.hidden = previewCollapse.hidden = true;
     previewHint.textContent = 'Back returns to the previous popup. Inspect opens this part in the main view.';
     previewHeading.textContent = label.replace('Inspect ', '');
     previewMath.textContent = 'Loading preview…';
     previewBack.hidden = false;
     previewSize.value = activePreview.size;
     requestPreview();
+    preview.focus({preventScroll:true});
   }
   previewBack.onclick = () => {
     if (!activePreview?.parent) return;
@@ -696,13 +789,13 @@ function render({ model, el }) {
     previewMath.scrollLeft = activePreview.scrollLeft || 0;
     if (!activePreview.parent) {
       previewHint.textContent = model.get('page').supports_expansion
-        ? 'Show more expands the main view. Show less restores its compact display. Inspect opens this part separately.'
+        ? 'Show more expands this part in the main view. Show less compacts this part. Inspect opens it separately.'
         : 'Inspect opens this part in the main view.';
     }
     preview.focus({preventScroll:true});
   };
   previewPrevious.onclick = () => {
-    activePreview.start = activePreview.previous.pop() ?? 0;
+    activePreview.start = activePreview.previous.pop() ?? Math.max(0, activePreview.start - activePreview.size);
     requestPreview();
   };
   previewNext.onclick = () => {
@@ -713,23 +806,38 @@ function render({ model, el }) {
   previewSize.onchange = () => {
     activePreview.size = Number(previewSize.value);
     popupSizes.set(JSON.stringify(activePreview.path), activePreview.size);
-    activePreview.start = 0;
     activePreview.previous = [];
     requestPreview();
   };
-  previewExpand.onclick = () => {
-    const { path, layout, size, context } = activePreview;
-    hidePreview();
-    model.send({ action: 'expand', value: path, layout, size, context });
-  };
-  previewCollapse.onclick = () => {
-    hidePreview();
-    model.send({ action: 'collapse' });
-  };
+  function rememberExpansion(action, button, target, rect = button.getBoundingClientRect()) {
+    const scrollers = [];
+    // Include nested notebook scroll panes as well as the document. Snapshot
+    // actual offsets so a user scroll during the request is not undone.
+    for (let node = math; node; node = node.parentElement || node.getRootNode()?.host) {
+      if (node === doc.scrollingElement || node.scrollHeight > node.clientHeight
+          || node.scrollWidth > node.clientWidth) {
+        scrollers.push({ node, top: node.scrollTop, left: node.scrollLeft });
+      }
+    }
+    if (!scrollers.some(({node}) => node === doc.scrollingElement)) {
+      const node = doc.scrollingElement;
+      scrollers.push({node, top:node.scrollTop, left:node.scrollLeft});
+    }
+    pendingExpansions.push({ action, path:target.path, start:target.start, rect, scrollers, button });
+  }
+  function changeExpansion(action) {
+    const { path, layout, size, context, button } = activePreview;
+    rememberExpansion(action, button, inspection.get(button));
+    hidePreview(true);
+    model.send({ action, value:path, layout, size, context });
+  }
+  previewExpand.onclick = () => changeExpansion('expand');
+  previewShowAll.onclick = () => changeExpansion('expand_all');
+  previewCollapse.onclick = () => changeExpansion('collapse');
   previewInspect.onclick = () => {
-    const { path, layout, size, context } = activePreview;
+    const { path, layout, size, context, start } = activePreview;
     hidePreview();
-    model.send({ action: 'open', value: path, layout, size, context });
+    model.send({ action: 'open', value: path, layout, size, context, start });
   };
   previewClose.onclick = () => hidePreview(true);
   function bindInspection(button, path, label, layout, context = null, start = 0) {
@@ -737,7 +845,7 @@ function render({ model, el }) {
     button.setAttribute('aria-haspopup', 'dialog');
     button.setAttribute('aria-expanded', 'false');
     if (context) {
-      button.onclick = () => showSubPreview(path, label, layout, context);
+      button.onclick = () => showSubPreview(path, label, layout, context, start);
       return;
     }
     button.onclick = () => showPreview(button, path, label, true, layout, start);
@@ -760,8 +868,9 @@ function render({ model, el }) {
       hidePreview(true);
     }
     // Local shortcuts only: leave browser zoom and notebook/editor inputs alone.
-    if (!math.contains(event.target) || event.ctrlKey || event.metaKey || event.altKey
-      || event.isComposing || event.target.closest('input,textarea,select,[contenteditable]')) return;
+    const target = event.composedPath()[0];
+    if ((!math.contains(target) && !preview.contains(target)) || event.ctrlKey || event.metaKey || event.altKey
+      || event.isComposing || target.closest('input,textarea,select,[contenteditable]')) return;
     let index;
     if (event.key === '+' || event.key === '=') index = scaleIndex + 1;
     else if (event.key === '-' || event.key === '−') index = scaleIndex - 1;
@@ -805,7 +914,17 @@ function render({ model, el }) {
   const back = button('Back to parent', 'back');
   const previous = button('Previous', 'previous');
   const next = button('Next', 'next');
+  const collapseAll = button('Collapse all', 'collapse');
+  collapseAll.classList.add('collapse-all');
+  collapseAll.onclick = () => {
+    rememberExpansion('collapse', collapseAll, {path:[], start:0}, math.getBoundingClientRect());
+    send('collapse');
+  };
   function update(preservePreview = false) {
+    const expansion = preservePreview === true ? null : pendingExpansions.shift();
+    const restoreExpansionFocus = expansion && root.activeElement === expansion.button;
+    const restoreExpansionScroll = expansion && expansion.scrollers.every(({node, top, left}) =>
+      Math.abs(node.scrollTop - top) < 1 && Math.abs(node.scrollLeft - left) < 1);
     const retainedPreview = preservePreview === true ? activePreview : null;
     const restoreMarkerFocus = retainedPreview && root.activeElement === retainedPreview.button;
     if (!retainedPreview) hidePreview();
@@ -815,7 +934,15 @@ function render({ model, el }) {
     }
     refitting = true;
     const base = model.get('page');
-    const layouts = [base, ...(base.layouts || []).map(candidate => ({ ...base, ...candidate }))];
+    if (preservePreview !== true) {
+      if (expansion?.action === 'expand_all' && !base.error) showAllLayout = true;
+      else if (!expansion || expansion.action === 'collapse') showAllLayout = false;
+    }
+    // An explicit Show all must not immediately hide the same detail again
+    // through a narrower alternative. Keep measured wrapping, with horizontal
+    // scrolling for an indivisible wide item, until navigation or collapse.
+    const layouts = showAllLayout ? [base]
+      : [base, ...(base.layouts || []).map(candidate => ({ ...base, ...candidate }))];
     // Measure native MathML with the actual font and notebook width. Keep the
     // first (most detailed) layout that fits; no resize messages to the kernel.
     // Zoom magnifies the chosen expression, rather than hiding detail again.
@@ -824,7 +951,7 @@ function render({ model, el }) {
     let available = math.clientWidth;
     let page = base, smallestWidth = Infinity, selectedNodes, shown;
     for (const candidate of layouts) {
-      content.innerHTML = candidate.html;
+      putHtml(content, candidate.html);
       shown = candidate;
       decorateMarkers(candidate);
       // A taller candidate can give an enclosing notebook cell a scrollbar.
@@ -849,15 +976,16 @@ function render({ model, el }) {
       content.replaceChildren(...selectedNodes);
       setWrapWidth(content, available);
     }
-    math.scrollLeft = 0;
+    if (!expansion && preservePreview !== true) math.scrollLeft = 0;
     status.textContent = page.error || `Items ${page.total ? page.start + 1 : 0}–${page.end} of ${page.total} (${page.unit})${page.markers.length ? ' · Detail fitted to width; open a marker for more' : ''}`;
     previous.disabled = !page.previous;
     next.disabled = page.next === null;
     back.hidden = !page.back;
     const paginated = page.previous || page.next !== null;
     previous.hidden = next.hidden = !page.back || !paginated;
-    controls.hidden = !page.back;
-    math.classList.toggle('compact', controls.hidden);
+    collapseAll.hidden = !page.can_collapse;
+    controls.hidden = !page.back && !page.can_collapse;
+    math.classList.toggle('compact', !page.back);
     status.hidden = !page.error && !page.back;
     const finalWidth = Math.min(available, math.clientWidth);
     if (finalWidth < available - .5) setWrapWidth(content, finalWidth);
@@ -866,6 +994,31 @@ function render({ model, el }) {
     if (numberMarkers(content)) setWrapWidth(content, available);
     content.style.setProperty('--expression-zoom', zoom || 1);
     refitting = false;
+    if (expansion) {
+      const path = expansion.path.join('/');
+      const firstRevealed = [...expansion.path, expansion.start].join('/');
+      const parts = [...content.querySelectorAll('[data-symbolica-path]')];
+      const marker = [...content.querySelectorAll('button.omission')].find(button =>
+        JSON.stringify(inspection.get(button)?.path) === JSON.stringify(expansion.path));
+      const target = parts.find(part => part.dataset.symbolicaPath === firstRevealed)
+        || parts.find(part => part.dataset.symbolicaPath === path) || marker || math;
+      if (restoreExpansionScroll) {
+        for (const {node, top, left} of expansion.scrollers) {
+          node.scrollTop = top;
+          node.scrollLeft = left;
+        }
+        for (const {node} of expansion.scrollers) {
+          const rect = target.getBoundingClientRect();
+          node.scrollTop += rect.top - expansion.rect.top;
+          node.scrollLeft += rect.left - expansion.rect.left;
+        }
+      }
+      if (restoreExpansionFocus) {
+        restoringFocus = true;
+        (marker || math).focus({preventScroll:true});
+        restoringFocus = false;
+      }
+    }
     if (retainedPreview) {
       let anchor = retainedPreview;
       while (anchor.parent) anchor = anchor.parent;
@@ -934,12 +1087,7 @@ function render({ model, el }) {
     // in by marking corresponding MathML subtrees with data-symbolica-path.
     // Each marker keeps its source layout for valid kernel navigation.
     if (layouts.length < 2 || !container.querySelector('button.omission')) return;
-    const sources = layouts.map(page => {
-      const template = document.createElement('template');
-      template.innerHTML = page.html;
-      return { page, parts: new Map([...template.content.querySelectorAll('[data-symbolica-path]')]
-        .map(part => [part.dataset.symbolicaPath, part])) };
-    });
+    const sources = layouts.map(page => ({page, parts:sourceTemplate(page.html).parts}));
     let attempts = 0;
     let fittingWidth = available;
     const tried = new Set();
@@ -1016,6 +1164,9 @@ function render({ model, el }) {
     model.off('change:preview', updatePreview);
     hidePreview();
     clearTimeout(zoomTimer);
+    templates.clear();
+    popupSizes.clear();
+    pendingExpansions.length = 0;
     root.removeEventListener('keydown', onKeyDown);
     model.send({ action: 'dispose', view });
     root.replaceChildren();
@@ -1032,6 +1183,7 @@ export function mount({ el, page, send }) {
   const listeners = new Map();
   let closed = false;
   let pending = Promise.resolve();
+  let queuedHover = null;
   const publish = response => {
     if (closed || response == null) return;
     const [field, value] = response;
@@ -1050,12 +1202,25 @@ export function mount({ el, page, send }) {
     send(message) {
       const disposing = message.action === 'dispose';
       if (closed && !disposing) return;
+      // A moving pointer can queue several previews behind a busy worker.
+      // Only the newest unsent hover remains useful. Pinned popup requests
+      // and navigation are authoritative and must keep their original order.
+      const hover = message.action === 'preview' && message.popup === false;
+      const ticket = hover ? {} : null;
+      queuedHover = ticket;
       pending = pending.then(async () => {
         if (closed && !disposing) return;
+        if (hover && queuedHover !== ticket) return;
+        if (hover) queuedHover = null;
         try {
           publish(await send(message));
         } catch (error) {
-          publish(['page', { ...state.page, error: String(error).slice(0, 1024) }]);
+          const detail = String(error).slice(0, 1024);
+          // Failed previews belong to their request, including a hover that
+          // became stale while running. Never replace the main page with one.
+          publish(message.action === 'preview'
+            ? ['preview', { request: message.request, error: detail }]
+            : ['page', { ...state.page, error: detail }]);
         }
       });
     },
