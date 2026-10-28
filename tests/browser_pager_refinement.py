@@ -55,19 +55,28 @@ HOOK = '''
         frame.style.width=previous;setWrapWidth(target(scope),width(scope));
         return {wide,restored:snapshot(scope)};
       },
-      reject(layouts, scope, context) {
+      reject(layouts, scope, context, narrow=false) {
         const node=target(scope), nodes=descendants(node);
         const buttons=[...node.querySelectorAll('button.omission')];
         const bindings=buttons.map(b=>[b.onclick,b.onmouseenter,b.onfocus,inspection.get(b)]);
         const before=snapshot(scope);
         const observer=new MutationObserver(()=>{});
         observer.observe(node,{childList:true,subtree:true});
+        // Model an enclosing scrollbar reducing the available width during
+        // the first rejected trial, independently of OS scrollbar settings.
+        const frame=scope==='preview'?previewMath:math;
+        const initialWidth=frame.clientWidth;
+        let reads=0;
+        if(narrow) Object.defineProperty(frame,'clientWidth',{configurable:true,
+          get:()=>initialWidth-(reads++?20:0)});
         revealFittingParts(layouts,width(scope),node,context);
-        const trialInserted=observer.takeRecords().some(record=>[...record.addedNodes].some(n=>
-          n.nodeType===1&&(n.matches('[data-test-detail]')||n.querySelector('[data-test-detail]'))));
+        if(narrow) delete frame.clientWidth;
+        const trialNodes=new Set(observer.takeRecords().flatMap(record=>[...record.addedNodes])
+          .filter(n=>n.nodeType===1&&n.matches('[data-test-detail]')));
+        const trialInserted=trialNodes.size>0;
         observer.disconnect();
         const restored=descendants(node);
-        return {before,after:snapshot(scope),trialInserted,
+        return {before,after:snapshot(scope),trialInserted,trialCount:trialNodes.size,
           sameNodes:nodes.length===restored.length&&nodes.every((n,i)=>n===restored[i]),
           sameBindings:buttons.every((b,i)=>b.isConnected&&b.onclick===bindings[i][0]
             &&b.onmouseenter===bindings[i][1]&&b.onfocus===bindings[i][2]
@@ -177,6 +186,77 @@ class PagerRefinementTests(unittest.IsolatedAsyncioTestCase):
                     for state in states[1:]:
                         self.assertEqual(state, states[0])
                     self.assertLessEqual(states[0]['scroll'][0], width + 1)
+
+    async def test_identical_rejected_details_are_tried_once_per_refinement(self):
+        await self.browser_cases(self.check_identical_rejected_details)
+
+    async def check_identical_rejected_details(self, page):
+        compact, detailed = refinement_pages()
+        # No marker inside the replacement: its actual decorated DOM is the
+        # same in both layouts, including its labels and navigation context.
+        detailed['html'] = detailed['html'].replace(
+            '<mtext data-symbolica-marker="0">[1]</mtext>', '')
+        duplicate = dict(detailed, layout=1)
+        fitting = dict(detailed, layout=2, html=detailed['html'].replace('1800px', '40px'))
+        anchor = dict(compact, html='<math><mrow data-symbolica-path="9"><mi>x</mi><mo>+</mo>'
+                      '<mtext data-symbolica-marker="0">[1]</mtext></mrow></math>',
+                      markers=[[[9], 'Inspect outer [1]']], marker_starts=[2])
+        for scope in ('root', 'preview'):
+            with self.subTest(scope=scope):
+                await self.mount(page, compact if scope == 'root' else anchor, 260,
+                                 preview=compact if scope == 'preview' else None)
+                if scope == 'preview':
+                    await page.locator('#host').evaluate('''host =>
+                      host.shadowRoot.querySelector('.math-content button.omission').click()''')
+                    await page.wait_for_function('''() => {
+                      const popup=document.querySelector('#host').shadowRoot.querySelector('.preview');
+                      return !popup.hidden&&!popup.hasAttribute('aria-busy');
+                    }''')
+                await page.evaluate("scope=>document.querySelector('#host').testPager.prepare(scope)", scope)
+                # Each new refinement must retry: no persistent measurement
+                # cache may outlive a width/font or surrounding-DOM change.
+                for _ in range(2):
+                    result = await page.evaluate('''({layouts,scope}) =>
+                      document.querySelector('#host').testPager.reject(layouts,scope,
+                        scope==='preview'?'popup-origin':null)''',
+                                                {'layouts': [detailed, duplicate, compact], 'scope': scope})
+                    self.assertEqual(result['trialCount'], 1)
+                    self.assertEqual(result['after'], result['before'])
+                    self.assertTrue(result['sameNodes'])
+                    self.assertTrue(result['sameBindings'])
+                # Identical source markup with different decorated marker
+                # metadata is not an interchangeable navigation candidate.
+                _, marked = refinement_pages()
+                result = await page.evaluate('''({layouts,scope}) =>
+                  document.querySelector('#host').testPager.reject(layouts,scope,
+                    scope==='preview'?'popup-origin':null)''',
+                                            {'layouts': [marked, dict(marked, layout=1), compact],
+                                             'scope': scope})
+                self.assertEqual(result['trialCount'], 2)
+                self.assertEqual(result['after'], result['before'])
+                result = await page.evaluate('''({layouts,scope}) =>
+                  document.querySelector('#host').testPager.reject(layouts,scope,
+                    scope==='preview'?'popup-origin':null)''',
+                                            {'layouts': [detailed, duplicate, fitting, compact], 'scope': scope})
+                self.assertEqual(result['trialCount'], 2)
+                self.assertFalse(result['after']['markers'])
+                self.assertIn('width="40px"', result['after']['html'])
+                await self.mount(page, compact if scope == 'root' else anchor, 260,
+                                 preview=compact if scope == 'preview' else None)
+                if scope == 'preview':
+                    await page.locator('#host').evaluate('''host =>
+                      host.shadowRoot.querySelector('.math-content button.omission').click()''')
+                    await page.wait_for_function('''() => {
+                      const popup=document.querySelector('#host').shadowRoot.querySelector('.preview');
+                      return !popup.hidden&&!popup.hasAttribute('aria-busy');
+                    }''')
+                await page.evaluate("scope=>document.querySelector('#host').testPager.prepare(scope)", scope)
+                result = await page.evaluate('''({layouts,scope}) =>
+                  document.querySelector('#host').testPager.reject(layouts,scope,
+                    scope==='preview'?'popup-origin':null,true)''',
+                                            {'layouts': [detailed, duplicate, compact], 'scope': scope})
+                self.assertEqual(result['trialCount'], 2,
+                                 'A changed width must not reuse the earlier rejection')
 
     async def test_rejected_refinements_restore_nodes_bindings_and_popup_context(self):
         await self.browser_cases(self.check_rejected_refinements)
