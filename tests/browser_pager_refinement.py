@@ -115,6 +115,11 @@ def refinement_pages():
     return compact, detailed
 
 
+def font_handler(font):
+    return lambda route: (route.fulfill(path=font, content_type='font/woff2')
+                          if font else route.abort())
+
+
 class PagerRefinementTests(unittest.IsolatedAsyncioTestCase):
     async def browser_cases(self, check):
         async with async_playwright() as playwright:
@@ -127,8 +132,7 @@ class PagerRefinementTests(unittest.IsolatedAsyncioTestCase):
                         errors = []
                         page.on('pageerror', lambda error, errors=errors: errors.append(str(error)))
                         font = os.environ.get('SYMBOLICA_TEST_FONT')
-                        await page.route('https://cdn.jsdelivr.net/**', lambda route, font=font:
-                                         route.fulfill(path=font, content_type='font/woff2') if font else route.abort())
+                        await page.route('https://cdn.jsdelivr.net/**', font_handler(font))
                         await page.set_content('<div id="host"></div>')
                         await page.evaluate('''async source => {
                           const url=URL.createObjectURL(new Blob([source],{type:'text/javascript'}));
