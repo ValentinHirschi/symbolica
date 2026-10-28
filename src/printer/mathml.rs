@@ -84,6 +84,10 @@ struct Renderer<'a, 'r> {
     nodes: usize,
     bytes: usize,
     budget_exhausted: bool,
+    // Direct budget refusals still present in the current fragment. Sequence
+    // rollback restores this counter when it replaces a rejected atom with a
+    // meaningful suffix omission after a complete prefix.
+    budget_holes: usize,
     nested_limit: usize,
     depth_limit: usize,
     expansions: &'a [(Vec<usize>, usize)],
@@ -252,20 +256,22 @@ impl Renderer<'_, '_> {
         fragment
     }
 
-    fn checkpoint(&self) -> (usize, usize, usize, bool) {
+    fn checkpoint(&self) -> (usize, usize, usize, bool, usize) {
         (
             self.nodes,
             self.bytes,
             self.markers.len(),
             self.budget_exhausted,
+            self.budget_holes,
         )
     }
 
-    fn restore(&mut self, state: (usize, usize, usize, bool)) {
+    fn restore(&mut self, state: (usize, usize, usize, bool, usize)) {
         self.nodes = state.0;
         self.bytes = state.1;
         self.markers.truncate(state.2);
         self.budget_exhausted = state.3;
+        self.budget_holes = state.4;
     }
 
     fn tagged(body: String, path: &[usize]) -> String {
@@ -540,6 +546,7 @@ impl Renderer<'_, '_> {
             // must not fall back to raw tensor arguments. Let its containing
             // sum keep complete terms and omit the unfinished suffix instead.
             self.budget_exhausted = true;
+            self.budget_holes += 1;
             return Some(self.hole(atom, path));
         }
         self.bytes -= fragment.len();
@@ -590,6 +597,9 @@ impl Renderer<'_, '_> {
             });
         if self.hard_semantic_limit(atom, depth) {
             self.budget_exhausted |= self.nodes == 0 || self.bytes < MAX_LEAF_BYTES;
+            if self.nodes == 0 || self.bytes == 0 {
+                self.budget_holes += 1;
+            }
             return self.hole(atom, path);
         }
         if let Some(custom) = self.semantic(atom, path, state) {
@@ -600,6 +610,7 @@ impl Renderer<'_, '_> {
         // tensor or scalar product can still use the remaining space.
         if self.bytes < MAX_LEAF_BYTES {
             self.budget_exhausted = true;
+            self.budget_holes += 1;
             return self.hole(atom, path);
         }
         // A tail probe may render an opaque semantic leaf or a small native
@@ -931,12 +942,17 @@ impl Renderer<'_, '_> {
             let checkpoint = self.checkpoint();
             path.push(i);
             let mut fragment = preview.unwrap_or_else(|| self.render(child, path, depth + 1));
-            // The first item already contains bounded, navigable omissions.
-            // Keep that preview; later items can start on a fresh page budget.
-            if self.budget_exhausted
-                && end > start
-                && (depth == 0 || matches!(atom, AtomView::Add(_)))
-            {
+            // Root pages keep their first bounded preview so opening an
+            // oversized item always makes progress. A nested sum with no
+            // complete first term should instead omit that whole sum, rather
+            // than exposing a tiny tensor as g([n]). Native calls can likewise
+            // retain complete arguments before a rejected atomic argument.
+            let keep_complete_prefix = if end > start {
+                depth == 0 || matches!(atom, AtomView::Add(_)) || self.budget_holes > checkpoint.4
+            } else {
+                depth > 0 && matches!(atom, AtomView::Add(_))
+            };
+            if self.budget_exhausted && keep_complete_prefix {
                 self.restore(checkpoint);
                 self.budget_exhausted = true;
                 path.pop();
@@ -1107,6 +1123,7 @@ impl Renderer<'_, '_> {
                 self.budget_exhausted = true;
                 break;
             }
+            let checkpoint = self.checkpoint();
             path.push(i);
             let mut parts = None;
             let previous_multiline_sums = self.multiline_sums;
@@ -1137,6 +1154,15 @@ impl Renderer<'_, '_> {
             self.bytes += reserve.1;
             self.multiline_sums = previous_multiline_sums;
             path.pop();
+            // Keep useful prefixes of large sums, functions and denominators.
+            // Only roll back a later factor when it still contains a direct
+            // atom-level budget refusal; its enclosing product tail is the
+            // meaningful omission. Do this before changing signs or fractions.
+            if end > start && self.budget_holes > checkpoint.4 {
+                self.restore(checkpoint);
+                self.budget_exhausted = true;
+                break;
+            }
             if let Some(parts) = parts {
                 let n = Self::product_sign(child, parts.numerator, &mut negative);
                 if n != "<mn>1</mn>" && n != "<mrow><mn>1</mn></mrow>" {
@@ -1460,6 +1486,7 @@ impl<'a> AtomView<'a> {
             nodes: MAX_NODES * budget_pages,
             bytes: MAX_TEXT_BYTES * budget_pages,
             budget_exhausted: false,
+            budget_holes: 0,
             nested_limit,
             depth_limit: depth_limit.min(MAX_DEPTH),
             expansions,
@@ -1711,6 +1738,7 @@ mod tests {
             nodes: 2,
             bytes: MAX_TEXT_BYTES,
             budget_exhausted: false,
+            budget_holes: 0,
             nested_limit: 2,
             depth_limit: MAX_DEPTH,
             expansions: &[],
@@ -1763,6 +1791,7 @@ mod tests {
             nodes: MAX_NODES,
             bytes: MAX_TEXT_BYTES,
             budget_exhausted: false,
+            budget_holes: 0,
             nested_limit: 2,
             depth_limit: MAX_DEPTH,
             expansions: &[],
@@ -1831,6 +1860,7 @@ mod tests {
                 nodes: 100,
                 bytes: 512,
                 budget_exhausted: false,
+                budget_holes: 0,
                 nested_limit: 1,
                 depth_limit: 2,
                 expansions: &[],
@@ -1890,6 +1920,7 @@ mod tests {
                 nodes: 2 * leaf_cost - 1,
                 bytes: MAX_TEXT_BYTES,
                 budget_exhausted: false,
+                budget_holes: 0,
                 nested_limit: 500,
                 depth_limit: 2,
                 expansions: &[],
@@ -1911,6 +1942,175 @@ mod tests {
             assert!(renderer.budget_exhausted);
             drop(renderer);
             assert_eq!(calls, 2);
+        }
+    }
+
+    #[test]
+    fn incomplete_first_nested_sum_term_becomes_one_sum_omission() {
+        let expression = parse!("g(mink(4,mu),mink(4,nu))+g(mink(4,rho),mink(4,sigma))");
+        let fragment = "<msup><mi>g</mi><mrow><mi>μ</mi><mi>ν</mi></mrow></msup>";
+        let tagged = Renderer::tagged(fragment.to_owned(), &[0, 0]);
+        let leaf_nodes = tagged.bytes().filter(|c| *c == b'<').count();
+        for (nodes, bytes) in [
+            (leaf_nodes - 1, MAX_TEXT_BYTES),
+            (MAX_NODES, tagged.len() - 1),
+        ] {
+            let options = PrintOptions::new();
+            let mut calls = 0;
+            let mut semantic = |_: AtomView<'_>, _: &PrintOptions, _: &PrintState| {
+                calls += 1;
+                Ok(Some(fragment.to_owned()))
+            };
+            let mut renderer = Renderer {
+                opts: &options,
+                state: PrintState::new(),
+                cursors: None,
+                nodes,
+                bytes,
+                budget_exhausted: false,
+                budget_holes: 0,
+                nested_limit: 500,
+                depth_limit: 32,
+                expansions: &[],
+                multiline_sums: true,
+                markers: vec![],
+                semantic: Some(&mut semantic),
+                probing_compact_tail: false,
+                compact_probe_remaining: MAX_NODES,
+                failed: false,
+            };
+            let (html, end) = renderer.sequence(expression.as_view(), &mut vec![0], 1, 0, 25);
+            assert_eq!(end, 0, "{html}");
+            assert!(!html.contains("&#x2061;"), "{html}");
+            assert_eq!(renderer.markers.len(), 1);
+            assert_eq!(renderer.markers[0].path, [0]);
+            assert_eq!(renderer.markers[0].start, 0);
+            assert_eq!((renderer.nodes, renderer.bytes), (nodes, bytes));
+            assert!(renderer.budget_exhausted);
+            drop(renderer);
+            assert_eq!(calls, 1);
+        }
+    }
+
+    #[test]
+    fn exhausted_atomic_product_factor_moves_to_the_product_tail() {
+        let fragment = "<msup><mi>g</mi><mrow><mi>μ</mi><mi>ν</mi></mrow></msup>";
+        let tagged = Renderer::tagged(fragment.to_owned(), &[0]);
+        let leaf_nodes = tagged.bytes().filter(|c| *c == b'<').count();
+        for power in [false, true] {
+            let input = (0..7)
+                .map(|i| format!("g(k{i}){}", if power { "^2" } else { "" }))
+                .collect::<Vec<_>>()
+                .join("*");
+            let expression = parse!(&input);
+            let cost = leaf_nodes + if power { 2 } else { 0 };
+            let byte_limit = MAX_LEAF_BYTES + if power { tagged.len() + 16 } else { 1 };
+            for (nodes, bytes) in [(2 * cost - 1, MAX_TEXT_BYTES), (MAX_NODES, byte_limit)] {
+                let options = PrintOptions::new();
+                let mut calls = 0;
+                let mut semantic = |atom: AtomView<'_>, _: &PrintOptions, _: &PrintState| {
+                    assert!(matches!(atom, AtomView::Fun(_)));
+                    calls += 1;
+                    Ok(Some(fragment.to_owned()))
+                };
+                let mut renderer = Renderer {
+                    opts: &options,
+                    state: PrintState::new(),
+                    cursors: None,
+                    nodes,
+                    bytes,
+                    budget_exhausted: false,
+                    budget_holes: 0,
+                    nested_limit: 500,
+                    depth_limit: 32,
+                    expansions: &[],
+                    multiline_sums: false,
+                    markers: vec![],
+                    semantic: Some(&mut semantic),
+                    probing_compact_tail: false,
+                    compact_probe_remaining: MAX_NODES,
+                    failed: false,
+                };
+                let (html, end) = renderer.product(expression.as_view(), &mut vec![], 0, 0, 25);
+                assert_eq!(end, 1, "{html}");
+                assert_eq!(html.matches(fragment).count(), 1, "{html}");
+                assert!(!html.contains("&#x2061;"), "{html}");
+                assert_eq!(renderer.markers.len(), 1);
+                assert!(renderer.markers[0].path.is_empty());
+                assert_eq!(renderer.markers[0].start, 1);
+                assert_eq!(renderer.nodes, nodes - cost);
+                assert!(renderer.bytes <= bytes);
+                assert!(renderer.budget_exhausted);
+                drop(renderer);
+                assert_eq!(
+                    calls,
+                    if bytes == MAX_TEXT_BYTES || power {
+                        2
+                    } else {
+                        1
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_function_keeps_complete_arguments_before_a_budget_refusal() {
+        let arguments = (0..100)
+            .map(|i| format!("g(k{i})"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let expression = parse!(&format!("a*f({arguments})"));
+        let metric = crate::symbol!("g");
+        let fragment = "<msup><mi>g</mi><mrow><mi>μ</mi><mi>ν</mi></mrow></msup>";
+        let cursors = MathMlCursorCache::new(expression.as_view());
+        let mut calls = 0;
+        let mut semantic = |atom: AtomView<'_>, _: &PrintOptions, _: &PrintState| {
+            Ok((atom.get_symbol() == Some(metric)).then(|| {
+                calls += 1;
+                fragment.to_owned()
+            }))
+        };
+        let page = expression
+            .as_view()
+            .render_mathml_layout_cached(
+                &PrintOptions::new(),
+                0,
+                25,
+                0,
+                &[],
+                &cursors,
+                Some(&mut semantic),
+            )
+            .unwrap();
+        assert_eq!((page.end, page.total), (2, 2));
+        assert_eq!(page.html.matches("&#x2061;").count(), 1, "{}", page.html);
+        assert!(page.html.matches(fragment).count() > 1);
+        assert_eq!(page.markers.len(), 1);
+        assert_eq!(page.markers[0].path, [1]);
+        assert!(page.markers[0].start > 0);
+        assert!(calls <= 100);
+    }
+
+    #[test]
+    fn compound_function_and_power_factors_keep_useful_sum_previews() {
+        let sum = (0..400)
+            .map(|i| format!("x{i}^2"))
+            .collect::<Vec<_>>()
+            .join("+");
+        for input in [
+            format!("a*f({sum})"),
+            format!("a*({sum})^2"),
+            format!("a/({sum})"),
+        ] {
+            let expression = parse!(&input);
+            let page = expression
+                .as_view()
+                .render_mathml_page(&PrintOptions::new(), 0, 25);
+            assert_eq!((page.end, page.total), (2, 2), "{}", page.html);
+            assert!(page.html.contains("<mi>x"), "{}", page.html);
+            assert!(page.markers.iter().any(|m| m.path == [1, 0] && m.start > 0));
+            assert!(page.markers.iter().all(|m| !m.path.is_empty()));
         }
     }
 
@@ -2050,6 +2250,7 @@ mod tests {
             nodes: MAX_NODES,
             bytes: MAX_TEXT_BYTES,
             budget_exhausted: false,
+            budget_holes: 0,
             nested_limit: 500,
             depth_limit: MAX_DEPTH,
             expansions: &[],
