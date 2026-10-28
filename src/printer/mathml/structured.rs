@@ -18,8 +18,13 @@ fn variable(v: &PolyVariable, opts: &PrintOptions) -> String {
             a.as_view()
                 .format_mathml(&mut html, opts, PrintState::new())
                 .unwrap();
-            // A polynomial variable can itself be a non-polynomial power.
-            if matches!(v, PolyVariable::Power(_)) {
+            // A radical already groups its contents, including when it is
+            // raised to a polynomial power. Other power variables may contain
+            // sums or nested powers that still need parentheses.
+            let radical = matches!(a.as_view(), AtomView::Pow(p)
+                if matches!(p.get_base_exp().1, AtomView::Num(n)
+                    if matches!(n.get_coeff_view(), CoefficientView::Natural(1, 2, 0, 1))));
+            if matches!(v, PolyVariable::Power(_)) && !radical {
                 Renderer::fence(html)
             } else {
                 html
