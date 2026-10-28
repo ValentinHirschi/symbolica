@@ -80,6 +80,32 @@ class AlgebraicMathMLTests(unittest.TestCase):
             rendered = mathml_expression(fragment(root(poly._repr_html_())))
             self.assertEqual((rendered - poly.to_expression()).expand(), E('0'))
 
+    def test_polynomial_radicals_do_not_add_parentheses(self):
+        for text, extensions, pairs in [
+            ('sqrt(2)+x', [], 0), ('-sqrt(2)+x', [], 0),
+            ('sqrt(2)*x+1', [], 0), ('1/sqrt(2)+x', [], 0),
+            ('(1+sqrt(2))*x', [], 1),
+            ('x^(1/2)+x^(3/2)', None, 0),
+            ('x^(2/3)', None, 1),
+        ]:
+            with self.subTest(text=text):
+                poly = E(text).to_polynomial(extensions=extensions)
+                for html in [poly.format(mode=PrintMode.MathML, print_ring=False),
+                             poly._repr_html_()]:
+                    tree = ET.fromstring('<math>' + html + '</math>')
+                    operators = [n.text for n in tree.iter() if kind(n) == 'mo']
+                    self.assertEqual(operators.count('('), pairs)
+                    self.assertEqual(operators.count(')'), pairs)
+                    # Interpret the math independently, excluding the textual
+                    # coefficient-domain annotation in the notebook output.
+                    math = root(html) if '<math' in html else tree
+                    for parent in math.iter():
+                        for child in list(parent):
+                            if kind(child) == 'mtext':
+                                parent.remove(child)
+                    rendered = mathml_expression(fragment(math))
+                    self.assertEqual((rendered - poly.to_expression()).expand(), E('0'))
+
     def test_rational_function_uses_a_fraction(self):
         for text in ['(x-1)/(x+2)', '-(x+1)/(x^2+2)', '(1+x*y)/(1+x+y)']:
             poly = RationalPolynomial.parse(text, ['x', 'y'])
