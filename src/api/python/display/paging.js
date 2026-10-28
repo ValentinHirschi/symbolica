@@ -283,11 +283,34 @@ function render({ model, el }) {
   function updatePreview() {
     displayPreview(model.get('preview'));
   }
+  const productPrefactors = new WeakMap();
+  function restoreProductFraction(numerator) {
+    const state = productPrefactors.get(numerator);
+    if (!state) return;
+    state.prefix.remove();
+    numerator.removeAttribute('data-symbolica-product-prefactor');
+    numerator.replaceWith(state.fraction);
+    state.fraction.append(numerator, state.denominator);
+    if (state.sign) state.signPlaceholder.replaceWith(state.sign);
+    if (state.coefficientFactor) {
+      state.table.querySelector(':scope > mtr > mtd > mrow > [data-symbolica-factor]')
+        ?.before(state.coefficientFactor);
+    }
+    productPrefactors.delete(numerator);
+  }
   function setWrapWidth(container, width) {
     const style = getComputedStyle(container);
     const padding = parseFloat(style.paddingLeft) + parseFloat(style.paddingRight);
     const available = Math.max(0, width - padding);
     container.style.setProperty('--symbolica-wrap-width', `${available}px`);
+    // Always decide between a stacked fraction and a leading coefficient in
+    // the original stacked layout. Measuring the previously chosen layout
+    // would let the coefficient's own width change the decision on a resize.
+    for (const numerator of [...container.querySelectorAll('[data-symbolica-product-prefactor]')].reverse()) {
+      const cell = numerator.closest('[data-symbolica-cell]');
+      if (cell && cell !== container) continue;
+      restoreProductFraction(numerator);
+    }
     // Gecko and WebKit ignore flex layout on MathML rows. Keep the compact
     // MathML transport, but use HTML flex layout with one math root per term.
     // Only convert a root flow: nested math must retain its grouping/fences.
@@ -320,7 +343,11 @@ function render({ model, el }) {
     // Nested sums in a long factor use the same measured packing policy.
     const tables = 'mtable[data-symbolica-product],mtable[data-symbolica-sum]';
     const refitted = new Map();
+    const tableLimits = new Map();
     function fitTable(table) {
+      // This denominator already passed the compact, single-line check in
+      // canonical layout. Keep the resulting coefficient indivisible.
+      if (table.closest('[data-symbolica-fraction-prefix]')) return;
       const cell = table.closest('[data-symbolica-cell]');
       if (cell && cell !== container) return;
       const product = table.hasAttribute('data-symbolica-product');
@@ -486,8 +513,92 @@ function render({ model, el }) {
         if (overflow <= 0.5 || limit === 0) break;
         limit = Math.max(0, limit - overflow);
       }
+      tableLimits.set(table, limit);
     }
     for (const table of [...container.querySelectorAll(tables)].reverse()) fitTable(table);
+    // A short denominator is more readable as a leading coefficient only
+    // when a substantially longer numerator has actual product continuations.
+    // Leave single-line quotients, sums and large denominators stacked.
+    const compactFractions = [];
+    for (const fraction of container.querySelectorAll('mfrac[data-symbolica-product-fraction]')) {
+      const cell = fraction.closest('[data-symbolica-cell]');
+      if (cell && cell !== container) continue;
+      const [numerator, denominator] = fraction.children;
+      const table = numerator?.children.length === 1 ? numerator.firstElementChild : null;
+      if (!denominator || table?.localName !== 'mtable'
+          || !table.hasAttribute('data-symbolica-product')) continue;
+      const factorRows = [...table.children].map(row =>
+        [...row.querySelectorAll(':scope > mtd > mrow > [data-symbolica-factor]')]);
+      if (factorRows.filter(factors => factors.length).length < 2) continue;
+      // Restrict this change to simple, fully visible denominator notation.
+      // In particular, a tiny omission button must not disguise a large sum.
+      const simple = new Set(['mrow', 'mtable', 'mtr', 'mtd', 'mi', 'mn', 'mo', 'mspace', 'msub', 'msup', 'msubsup']);
+      if ([denominator, ...denominator.querySelectorAll('*')].some(node =>
+        !simple.has(node.localName) || node.hasAttribute('data-symbolica-marker')
+        || node.hasAttribute('data-symbolica-sum')
+        || (node.localName === 'mo' && !['\u2062', '×', '·'].includes(node.textContent)))) continue;
+      const denominatorTables = [...denominator.querySelectorAll('mtable')];
+      if (denominatorTables.length > 1
+          || denominatorTables.some(table => table.children.length !== 1)) continue;
+      const box = denominator.getBoundingClientRect();
+      const em = parseFloat(getComputedStyle(denominator).fontSize);
+      const factors = factorRows.flat();
+      const numeratorWidth = factors.reduce((total, factor) => total + factor.getBoundingClientRect().width, 0);
+      if (!(box.width > 0 && em > 0) || box.width > 3 * em || box.height > 2 * em
+          || numeratorWidth < 4 * box.width) continue;
+      // The kernel marks its real numeric coefficient, which is ordered first.
+      // Keep that exact node so 3*A/8 becomes (3/8)*A rather than (1/8)*3*A.
+      const coefficientFactor = factors[0].hasAttribute('data-symbolica-coefficient') ? factors[0] : null;
+      compactFractions.push({ fraction, numerator, denominator, table, coefficientFactor,
+        first: factors[coefficientFactor ? 1 : 0], limit: tableLimits.get(table) ?? 0 });
+    }
+    // Freeze every choice before changing any DOM. In particular, moving an
+    // outer coefficient must not change the eligibility of a nested fraction.
+    for (const { fraction, numerator, denominator, table, coefficientFactor, first, limit } of compactFractions.reverse()) {
+      const prefix = doc.createElementNS(fraction.namespaceURI, 'mrow');
+      prefix.setAttribute('data-symbolica-fraction-prefix', '');
+      const previous = fraction.previousElementSibling;
+      const sign = previous?.localName === 'mo' && previous.textContent === '−' ? previous : null;
+      const signPlaceholder = sign ? doc.createComment('product sign') : null;
+      if (sign) {
+        sign.replaceWith(signPlaceholder);
+        prefix.append(sign);
+      }
+      const coefficient = doc.createElementNS(fraction.namespaceURI, 'mfrac');
+      const one = doc.createElementNS(fraction.namespaceURI, 'mn');
+      one.textContent = '1';
+      const coefficientRow = coefficientFactor?.parentElement.children.length === 1
+        ? coefficientFactor.closest('mtr') : null;
+      coefficient.append(coefficientFactor || one, denominator);
+      coefficientRow?.remove();
+      const separator = doc.createElementNS(fraction.namespaceURI, 'mo');
+      separator.textContent = '\u2062';
+      const gap = doc.createElementNS(fraction.namespaceURI, 'mspace');
+      gap.setAttribute('width', '0.15em');
+      prefix.append(coefficient);
+      // Moving the original first coefficient leaves its next factor's
+      // configured multiplication separator in place. Otherwise this was the
+      // first factor already and needs a new implicit separator.
+      if (!coefficientFactor) {
+        prefix.append(separator, gap);
+      }
+      first.prepend(prefix);
+      fraction.replaceWith(numerator);
+      numerator.setAttribute('data-symbolica-product-prefactor', '');
+      productPrefactors.set(numerator, { fraction, denominator, table, coefficientFactor,
+        prefix, sign, signPlaceholder });
+      // Keep the coefficient attached to a real factor, but do not create a
+      // newly indivisible wide item. A large numeric coefficient may have fit
+      // on its own canonical row. The original row budget is conservative:
+      // removing the outer fraction/sign only makes more room available.
+      if (first.getBoundingClientRect().width > limit + .5) restoreProductFraction(numerator);
+    }
+    if (compactFractions.length) {
+      // The selected coefficient consumes width only on the first row. Fit
+      // once more without reconsidering the canonical decision in this pass.
+      refitted.clear();
+      for (const table of [...container.querySelectorAll(tables)].reverse()) fitTable(table);
+    }
     // Composite outputs retain a static frame while each value is fitted to
     // its own cell width. Root-flow conversion stays outside nested MathML.
     for (const cell of container.querySelectorAll('[data-symbolica-cell]')) {
