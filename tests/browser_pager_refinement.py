@@ -43,6 +43,18 @@ HOOK = '''
     };
     return {
       prepare(scope) {setWrapWidth(target(scope), width(scope));},
+      reuseFittingRows() {
+        const before=snapshot('root');
+        const rows=[...content.querySelectorAll('mtable > mtr')];
+        setWrapWidth(content,width('root'));
+        const after=snapshot('root');
+        const kept=[...content.querySelectorAll('mtable > mtr')];
+        el.style.width='110px';setWrapWidth(content,width('root'));
+        const narrow=content.querySelectorAll('mtable > mtr').length;
+        el.style.width='1100px';setWrapWidth(content,width('root'));
+        return {before,after,narrow,wide:snapshot('root'),
+          reused:rows.length===kept.length&&rows.every((row,i)=>row===kept[i])};
+      },
       repeat(scope) {
         const states=[snapshot(scope)];
         for(let i=0;i<3;i++) {setWrapWidth(target(scope),width(scope));states.push(snapshot(scope));}
@@ -168,6 +180,28 @@ class PagerRefinementTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_repeated_fits_keep_the_same_nested_rows_fractions_and_cells(self):
         await self.browser_cases(self.check_repeated_fits)
+
+    async def test_fitting_single_rows_are_retained_but_still_reflow_on_resize(self):
+        async def check(page):
+            product = product_page()
+            terms = ''.join('<mrow data-symbolica-term=""><mo>+</mo>'
+                            f'<mi>x</mi><mn>{i}</mn></mrow>' for i in range(8))
+            total = dict(product, html='<math displaystyle="true"><mrow><mo>(</mo>'
+                         '<mtable data-symbolica-sum=""><mtr><mtd><mrow>' + terms
+                         + '</mrow></mtd></mtr></mtable><mo>)</mo></mrow></math>')
+            for name, fixture in [('product', product), ('nested sum', total)]:
+                with self.subTest(fixture=name):
+                    await self.mount(page, fixture, 1100)
+                    result = await page.evaluate("document.querySelector('#host').testPager.reuseFittingRows()")
+                    self.assertTrue(result['reused'], 'An already fitting row was rebuilt')
+                    self.assertEqual(result['after'], result['before'])
+                    # A narrow rebuild normalizes CSS serialization (padding:0
+                    # becomes padding: 0px); all geometry and notation match.
+                    self.assertEqual({k: v for k, v in result['wide'].items() if k != 'html'},
+                                     {k: v for k, v in result['before'].items() if k != 'html'})
+                    self.assertGreater(result['narrow'], 1)
+
+        await self.browser_cases(check)
 
     async def check_repeated_fits(self, page):
         matrix = fraction_page(coefficient=True)
@@ -319,6 +353,63 @@ class PagerRefinementTests(unittest.IsolatedAsyncioTestCase):
                 request = await page.evaluate('before=>sent.slice(before).find(m=>m.action==="preview")', before)
                 self.assertEqual((request['value'], request['layout'], request['start']), ([4, 1], 3, 7))
                 self.assertEqual(request.get('context'), 'popup-origin' if scope == 'preview' else None)
+
+
+    async def test_refined_matrix_entries_do_not_overlap_neighbouring_cells(self):
+        await self.browser_cases(self.check_refined_matrix_entries)
+
+    async def check_refined_matrix_entries(self, page):
+        marker = '<mrow data-symbolica-path="0"><mtext data-symbolica-marker="0">[1]</mtext></mrow>'
+        html = ('<div style="width:var(--symbolica-wrap-width)"><table '
+                'style="width:100%;table-layout:fixed"><tr><td><div data-symbolica-cell="">'
+                '<math>' + marker + '</math></div></td><td><div data-symbolica-cell="">'
+                '<math><mn>123456789</mn></math></div></td></tr></table></div>')
+        compact = {'html': html, 'start': 0, 'end': 2, 'total': 2, 'kind': 'Matrix', 'unit': 'entries',
+                       'markers': [[[0], 'Inspect first cell [1]']], 'marker_ids': [0], 'marker_starts': [0],
+                       'layout': 1, 'previous': False, 'next': None, 'back': False, 'page_size': 25}
+        detailed = dict(compact, layout=0, markers=[], marker_ids=[], marker_starts=[],
+                        html=html.replace(marker, '<mrow data-symbolica-path="0" data-test-detail="">'
+                                          '<mspace width="300px" height="20px"/><mi>y</mi></mrow>'))
+        fitting = dict(detailed, html=detailed['html'].replace('300px', '80px'))
+        anchor = dict(compact, html='<math><mrow data-symbolica-path="9">'
+                      '<mtext data-symbolica-marker="0">[1]</mtext></mrow></math>',
+                      markers=[[[9], 'Inspect matrix [1]']])
+        for scope in ('root', 'preview'):
+            for width in (480, 360):
+                with self.subTest(scope=scope, width=width):
+                    await self.mount(page, compact if scope == 'root' else anchor, width,
+                                     preview=compact if scope == 'preview' else None)
+                    if scope == 'preview':
+                        await page.locator('#host').evaluate("""host =>
+                          host.shadowRoot.querySelector('.math-content button.omission').click()""")
+                        await page.wait_for_function("""() => {
+                          const popup=document.querySelector('#host').shadowRoot.querySelector('.preview');
+                          return !popup.hidden&&!popup.hasAttribute('aria-busy');
+                        }""")
+                        await page.locator('#host').evaluate("""(host,width) =>
+                          host.shadowRoot.querySelector('.preview').style.width=`${width}px`""", width)
+                    await page.evaluate("scope=>document.querySelector('#host').testPager.prepare(scope)", scope)
+                    result = await page.evaluate("""({layouts,scope}) =>
+                      document.querySelector('#host').testPager.reject(layouts,scope,
+                        scope==='preview'?'matrix-preview':null)""",
+                                                 {'layouts': [detailed, compact], 'scope': scope})
+                    self.assertEqual(result['trialCount'], 1)
+                    self.assertEqual(result['after'], result['before'])
+                    self.assertTrue(result['sameNodes'])
+                    self.assertTrue(result['sameBindings'])
+                    # A genuinely fitting richer entry remains eligible; the
+                    # check must not disable refinement in composite outputs.
+                    result = await page.evaluate("""({layouts,scope}) =>
+                      document.querySelector('#host').testPager.reject(layouts,scope,
+                        scope==='preview'?'matrix-preview':null)""",
+                                                 {'layouts': [fitting, compact], 'scope': scope})
+                    self.assertEqual(result['trialCount'], 1)
+                    self.assertFalse(result['after']['markers'])
+                    self.assertIn('<mi>y</mi>', result['after']['html'])
+                    selector = '.preview-math' if scope == 'preview' else '.math-content'
+                    self.assertTrue(await page.locator('#host').evaluate("""(host,selector) =>
+                      [...host.shadowRoot.querySelector(selector).querySelectorAll('[data-symbolica-cell]')]
+                        .every(cell=>cell.scrollWidth<=cell.clientWidth+1)""", selector))
 
 
 if __name__ == '__main__':
