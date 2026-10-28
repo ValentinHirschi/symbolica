@@ -98,6 +98,7 @@ struct Renderer<'a, 'r> {
 struct ProductFactor {
     html: String,
     needs_fence: bool,
+    coefficient: bool,
 }
 
 struct FractionParts {
@@ -194,6 +195,7 @@ impl Renderer<'_, '_> {
                 denominator: ProductFactor {
                     html: Self::token("mn", d),
                     needs_fence: false,
+                    coefficient: false,
                 },
             });
             format!(
@@ -220,6 +222,7 @@ impl Renderer<'_, '_> {
             denominator: ProductFactor {
                 html: denominator.clone(),
                 needs_fence: false,
+                coefficient: false,
             },
         });
         format!("<mfrac>{numerator}{denominator}</mfrac>")
@@ -1086,6 +1089,7 @@ impl Renderer<'_, '_> {
                     numerator.push(ProductFactor {
                         html: n,
                         needs_fence: false,
+                        coefficient: matches!(child, AtomView::Num(_)),
                     });
                 }
                 denominator.push(parts.denominator);
@@ -1096,6 +1100,7 @@ impl Renderer<'_, '_> {
                         html,
                         needs_fence: matches!(child, AtomView::Add(_))
                             || child.mathml_complex_coefficient(),
+                        coefficient: matches!(child, AtomView::Num(n) if n.get_coeff_view().is_real()),
                     });
                 }
             }
@@ -1119,6 +1124,7 @@ impl Renderer<'_, '_> {
             // Fence a sum only when it is multiplied by another factor.
             let multiple = !fraction || factors.len() > 1 || tail.is_some();
             for (i, factor) in factors.into_iter().enumerate() {
+                let coefficient = factor.coefficient;
                 let factor = if multiple && factor.needs_fence {
                     Self::fence(factor.html)
                 } else {
@@ -1131,7 +1137,11 @@ impl Renderer<'_, '_> {
                         row_cost = 0;
                     }
                     row_cost += cost;
-                    result.push_str("<mrow data-symbolica-factor=\"\">");
+                    result.push_str(if coefficient {
+                        "<mrow data-symbolica-factor=\"\" data-symbolica-coefficient=\"\">"
+                    } else {
+                        "<mrow data-symbolica-factor=\"\">"
+                    });
                 }
                 let mut leading = factor.as_str();
                 while let Some(rest) = leading
@@ -1201,7 +1211,13 @@ impl Renderer<'_, '_> {
             if multiline {
                 // WebKit mislays fractions with direct table arguments. Group
                 // each table without changing the numerator or denominator.
-                format!("<mfrac>{}{}</mfrac>", Self::row(n), Self::row(denominator))
+                // The browser can move a small denominator into a prefactor
+                // when this canonical stacked layout needs continuation rows.
+                format!(
+                    "<mfrac data-symbolica-product-fraction=\"\">{}{}</mfrac>",
+                    Self::row(n),
+                    Self::row(denominator)
+                )
             } else {
                 format!("<mfrac>{n}{denominator}</mfrac>")
             }
@@ -1948,7 +1964,7 @@ mod tests {
                 assert_eq!(page.total, 3);
                 assert_eq!(page.end, if fraction { 3 } else { 2 });
                 assert!(page.html.contains(&format!("<mi>{prefix}")));
-                assert_eq!(page.html.contains("<mfrac>"), fraction);
+                assert_eq!(page.html.contains("<mfrac"), fraction);
                 if fraction {
                     assert!(page.html.contains("<mo>−</mo>"));
                 } else {
@@ -2200,16 +2216,60 @@ mod tests {
             .collect::<Vec<_>>()
             .join("*");
         let html = page(&format!("({product})/8"));
-        assert!(html.contains("<mfrac><mrow><mtable"), "{html}");
+        assert!(
+            html.contains("<mfrac data-symbolica-product-fraction=\"\"><mrow><mtable"),
+            "{html}"
+        );
         assert!(html.contains("</mtable></mrow><mrow><mtable"), "{html}");
         assert!(html.contains("</mtable></mrow></mfrac>"), "{html}");
+    }
+
+    #[test]
+    fn product_fractions_keep_canonical_layout_and_mark_numeric_coefficients() {
+        for input in ["-3*x*y/8", "-3*x*y/z", "-x*y/8", "(x+5)*(x+6)/x"] {
+            let html = page(input);
+            assert!(
+                html.contains("<mfrac data-symbolica-product-fraction=\"\"><mrow><mtable"),
+                "{input}: {html}"
+            );
+            assert_eq!(html.matches("<mfrac").count(), 1, "{input}: {html}");
+            assert_eq!(
+                html.matches("data-symbolica-coefficient").count(),
+                usize::from(input.contains("-3")),
+                "{input}: {html}"
+            );
+        }
+        // An imaginary or mixed complex factor must not be treated as a real
+        // numeric numerator when the viewer forms a compact coefficient.
+        for input in ["2i*x/y", "(2+3i)*x/y"] {
+            assert!(!page(input).contains("data-symbolica-coefficient"));
+        }
+        // Inline products in sums keep their normal fraction; an explicitly
+        // expanded product gets responsive rows and the opt-in marker.
+        let expression = crate::parse!("a-b*c/8");
+        let product = expression
+            .as_view()
+            .children()
+            .position(|term| matches!(term, AtomView::Mul(_)))
+            .unwrap();
+        let inline = page("a-b*c/8");
+        assert!(!inline.contains("data-symbolica-product-fraction"));
+        let expanded = expression.as_view().render_mathml_layout(
+            &PrintOptions::new(),
+            0,
+            25,
+            0,
+            &[(vec![product], 25)],
+        );
+        assert!(expanded.html.contains("data-symbolica-product-fraction"));
+        assert!(expanded.html.contains("<mo form=\"infix\">−</mo>"));
     }
 
     #[test]
     fn fraction_bars_group_single_sums_without_parentheses() {
         for input in ["x/(1+z^2)", "(a+b)/(c+d)", "1/(a+b)"] {
             let html = page(input);
-            assert!(html.contains("<mfrac>"), "{input}: {html}");
+            assert!(html.contains("<mfrac"), "{input}: {html}");
             assert!(!html.contains(">(</mo>"), "{input}: {html}");
         }
     }
