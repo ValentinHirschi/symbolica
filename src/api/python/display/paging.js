@@ -1103,16 +1103,23 @@ function render({ model, el }) {
     }
   }
   function numberMarkers(container) {
-    let number = 0, changed = false;
+    const changes = [];
+    let number = 0;
     for (const marker of container.querySelectorAll('button.omission[data-numbered]')) {
       const text = String(++number);
-      if (marker.textContent !== text) {
-        marker.textContent = text;
-        changed = true;
-      }
+      if (marker.textContent !== text) changes.push({marker, text});
       marker.setAttribute('aria-label', marker.getAttribute('aria-label').replace(/\[\d+\]$/, `[${number}]`));
     }
-    return changed;
+    // Numbering often changes only a tabular digit, leaving its button the
+    // same size. Refit the expression only when actual dimensions change,
+    // including multi-digit labels or fallback fonts with different metrics.
+    // Batch reads and writes to avoid a layout flush for each marker.
+    for (const change of changes) change.before = change.marker.getBoundingClientRect();
+    for (const {marker, text} of changes) marker.textContent = text;
+    return changes.some(({marker, before}) => {
+      const after = marker.getBoundingClientRect();
+      return after.width !== before.width || after.height !== before.height;
+    });
   }
   function decorateMarkers(page, container = content, context = null) {
     for (const marker of container.querySelectorAll('[data-symbolica-marker]')) {
@@ -1152,6 +1159,13 @@ function render({ model, el }) {
         if (!marker.isConnected) continue;
         const part = marker.closest('[data-symbolica-path]');
         if (!part?.dataset.symbolicaPath) continue;
+        // Alternative pages can contain the exact same subtree. Compare the
+        // decorated candidate so marker labels/context still participate in
+        // the decision. A rejected candidate need not be fitted twice while
+        // this marker's surroundings and width are unchanged. Keep this local
+        // to one marker: another accepted refinement, resize or font load can
+        // change whether the same content fits.
+        const candidates = new Set();
         for (const { page, parts } of sources) {
           if ((page.layout || 0) >= Number(marker.dataset.layout)) continue;
           const key = `${part.dataset.symbolicaPath}:${marker.dataset.layout}:${page.layout || 0}`;
@@ -1159,11 +1173,14 @@ function render({ model, el }) {
           tried.add(key);
           const original = parts.get(part.dataset.symbolicaPath);
           if (!original) continue;
+          const replacement = original.cloneNode(true);
+          decorateMarkers(page, replacement, context);
+          const candidate = `${fittingWidth}:${replacement.outerHTML}`;
+          if (candidates.has(candidate)) continue;
+          candidates.add(candidate);
           if (++attempts > 64) return;
           const trialWidth = fittingWidth;
           const rollback = wrappedWidths.get(container) === trialWidth ? wrappingCheckpoint(container) : null;
-          const replacement = original.cloneNode(true);
-          decorateMarkers(page, replacement, context);
           part.replaceWith(replacement);
           setWrapWidth(container, fittingWidth);
           const width = context
