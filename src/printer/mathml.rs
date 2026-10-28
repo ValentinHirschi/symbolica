@@ -519,9 +519,12 @@ impl Renderer<'_, '_> {
         if fragment.len() > MAX_LEAF_BYTES || fragment.len() > self.bytes || nodes > self.nodes {
             // An opaque scoped fragment that cannot fit should not hide the
             // native arguments behind a root marker that opens itself forever.
-            if semantic {
+            if semantic && (fragment.len() > MAX_LEAF_BYTES || nodes > MAX_NODES) {
                 return None;
             }
+            // A bounded semantic leaf only rejected by the remaining budget
+            // must not fall back to raw tensor arguments. Let its containing
+            // sum keep complete terms and omit the unfinished suffix instead.
             self.budget_exhausted = true;
             return Some(self.hole(atom, path));
         }
@@ -916,8 +919,12 @@ impl Renderer<'_, '_> {
             let mut fragment = preview.unwrap_or_else(|| self.render(child, path, depth + 1));
             // The first item already contains bounded, navigable omissions.
             // Keep that preview; later items can start on a fresh page budget.
-            if depth == 0 && self.budget_exhausted && end > start {
+            if self.budget_exhausted
+                && end > start
+                && (depth == 0 || matches!(atom, AtomView::Add(_)))
+            {
                 self.restore(checkpoint);
+                self.budget_exhausted = true;
                 path.pop();
                 break;
             }
@@ -1114,7 +1121,7 @@ impl Renderer<'_, '_> {
             // A factor may have used the remaining budget to show part of a
             // large sum. Keep that bounded preview, fraction parts and markers;
             // only the following factors need a fresh page budget.
-            if depth == 0 && self.budget_exhausted {
+            if self.budget_exhausted {
                 break;
             }
         }
@@ -1785,6 +1792,101 @@ mod tests {
             drop(renderer);
             assert_eq!(calls, 1);
         }
+    }
+
+    #[test]
+    fn semantic_node_exhaustion_keeps_complete_nested_sum_terms() {
+        for (name, fragment) in [
+            (
+                "g",
+                "<mmultiscripts><mi>g</mi><none/><msub><mi>μ</mi><mn>3</mn></msub><none/><msub><mi>ν</mi><mn>3</mn></msub></mmultiscripts>",
+            ),
+            (
+                "dot",
+                "<mrow><mo>(</mo><msub><mi>k</mi><mn>0</mn></msub><mo>·</mo><msub><mi>k</mi><mn>1</mn></msub><mo>)</mo></mrow>",
+            ),
+        ] {
+            let expression = parse!(&format!(
+                "{name}(mink(4,mu),mink(4,nu))+{name}(mink(4,rho),mink(4,sigma))"
+            ));
+            let leaf_cost = fragment.bytes().filter(|c| *c == b'<').count() + 2;
+            let options = PrintOptions::new();
+            let mut calls = 0;
+            let mut semantic = |atom: AtomView<'_>, _: &PrintOptions, _: &PrintState| {
+                assert!(
+                    atom.get_symbol()
+                        .unwrap()
+                        .get_name()
+                        .ends_with(&format!("::{name}"))
+                );
+                calls += 1;
+                Ok(Some(fragment.to_owned()))
+            };
+            let mut renderer = Renderer {
+                opts: &options,
+                state: PrintState::new(),
+                cursors: None,
+                nodes: 2 * leaf_cost - 1,
+                bytes: MAX_TEXT_BYTES,
+                budget_exhausted: false,
+                nested_limit: 500,
+                depth_limit: 2,
+                expansions: &[],
+                multiline_sums: false,
+                markers: vec![],
+                semantic: Some(&mut semantic),
+                probing_compact_tail: false,
+                compact_probe_remaining: MAX_NODES,
+                failed: false,
+            };
+            let (html, end) = renderer.sequence(expression.as_view(), &mut vec![0], 1, 0, 25);
+            assert_eq!(end, 1, "{html}");
+            assert_eq!(html.matches(fragment).count(), 1, "{html}");
+            assert!(!html.contains("&#x2061;"), "{html}");
+            assert_eq!(renderer.markers.len(), 1);
+            assert_eq!(renderer.markers[0].path, [0]);
+            assert_eq!(renderer.markers[0].start, 1);
+            assert_eq!(renderer.nodes, leaf_cost - 1);
+            assert!(renderer.budget_exhausted);
+            drop(renderer);
+            assert_eq!(calls, 2);
+        }
+    }
+
+    #[test]
+    fn semantic_node_exhaustion_does_not_leave_raw_heads_in_polynomials() {
+        let terms = (0..60)
+            .map(|i| format!("dot(p,k{i})^2*dot(k{i},k{i})^2*dot(p,p)"))
+            .collect::<Vec<_>>()
+            .join("+");
+        let expression = parse!(&format!("a*({terms})"));
+        let dot = crate::symbol!("dot");
+        let fragment = "<mrow><mo>(</mo><msub><mi>k</mi><mn>0</mn></msub><mo>·</mo><msub><mi>k</mi><mn>1</mn></msub><mo>)</mo></mrow>";
+        let cursors = MathMlCursorCache::new(expression.as_view());
+        let mut calls = 0;
+        let mut semantic = |atom: AtomView<'_>, _: &PrintOptions, _: &PrintState| {
+            calls += 1;
+            Ok((atom.get_symbol() == Some(dot)).then(|| fragment.to_owned()))
+        };
+        let page = expression
+            .as_view()
+            .render_mathml_layout_cached(
+                &PrintOptions::new(),
+                0,
+                25,
+                0,
+                &[],
+                &cursors,
+                Some(&mut semantic),
+            )
+            .unwrap();
+        assert!(page.html.contains(fragment));
+        assert!(!page.html.contains("&#x2061;"), "{}", page.html);
+        assert_eq!(page.markers.len(), 1);
+        assert_eq!(page.markers[0].path, [1]);
+        assert!(page.markers[0].start > 0);
+        assert_eq!((page.end, page.total), (2, 2));
+        assert!(calls < MAX_NODES);
     }
 
     #[test]
