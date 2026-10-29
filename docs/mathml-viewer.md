@@ -19,11 +19,24 @@ formatting options. Plain `FormattedOutput` objects without a MathML provider
 return `None`.
 
 Omitting `page_size` from `expression.mathml_viewer()` uses an automatic initial
-preview. It starts with 25 items, but a product with at most 50 factors can be
-shown completely when its rendered MathML fits in 16 KiB and 1,000 elements.
-Only complete candidates are accepted; larger products retain their pager.
+preview. It starts with 25 items. A product can try a larger prefix of up to
+500 factors, accepting it when the output has at most 2,000 HTML elements and
+an estimated visible cost of 768 characters. It may retain existing omissions,
+but cannot hide detail that was already visible.
 An explicit `page_size=25` keeps the 25-item maximum, and later size selections
 or navigation do not repeat the automatic check.
+
+Native rendering starts with an internal allowance of 64 KiB and 4,000 work
+units per alternative. These account for rendering work and fragment markup,
+not the exact final HTML size or DOM element count. Expansion can increase the
+allowance up to 256 KiB and 16,000 units. Individual leaves remain bounded.
+
+After wrapping, the browser targets an initial height of about eight ordinary
+math lines (12 em). It chooses a shorter prefix of complete terms when possible;
+it does not meet the height target by hiding small factors inside those terms.
+The target is soft: if no suitable shorter alternative exists, the taller
+expression remains visible. Show more, Show all and inspection bypass this
+height target. Resizing and font changes remeasure the output locally.
 
 Import `javascript` as an ES module and mount it in an HTML element:
 

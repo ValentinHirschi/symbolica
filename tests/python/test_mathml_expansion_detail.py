@@ -7,6 +7,37 @@ from symbolica import E, S
 
 
 class ExpansionDetailTests(unittest.TestCase):
+    def test_initial_wrapped_sums_offer_shorter_complete_prefixes(self):
+        polynomial = E("(x+y+z+w)^20").expand()
+        for expression, prefix in ((polynomial, []), (polynomial * E("1+a"), [1])):
+            with self.subTest(prefix=prefix):
+                viewer = expression.mathml_viewer()
+                self.addCleanup(viewer.close)
+                initial = viewer.page()
+
+                def terms(page):
+                    result = {}
+                    for node in ElementTree.fromstring(page["html"]).iter():
+                        path = node.get("data-symbolica-path")
+                        if path is None:
+                            continue
+                        path = [int(p) for p in path.split("/")]
+                        if len(path) == len(prefix) + 1 and path[:-1] == prefix:
+                            result[path[-1]] = "".join(node.itertext())
+                    return result
+
+                complete = terms(initial)
+                lengths = []
+                for page in [initial, *initial["layouts"]]:
+                    self.assertEqual([path for path, _ in page["markers"]], [prefix])
+                    shown = terms(page)
+                    self.assertTrue(shown)
+                    self.assertTrue(all(complete.get(k) == v for k, v in shown.items()))
+                    if prefix and page.get("layout") == 4:
+                        self.assertIn('data-symbolica-sum=', page["html"])
+                    lengths.append(len(shown))
+                self.assertLess(min(lengths), max(lengths))
+
     def test_show_more_preserves_polynomial_factors_in_compact_layouts(self):
         x, y, z, w, a = S("x", "y", "z", "w", "a")
         expression = ((x + y + z + w) ** 20).expand() * (1 + a)
