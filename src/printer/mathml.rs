@@ -1078,12 +1078,17 @@ impl Renderer<'_, '_> {
         let columns = previous_nested_limit.clamp(2, if self.multiline_sums { 6 } else { 8 });
         self.nested_limit = previous_nested_limit;
         self.depth_limit = previous_depth_limit;
-        if expanded_sum && expanded_terms.len() > columns {
-            body = "<mtable data-symbolica-sum=\"\" columnalign=\"left\" rowspacing=\"0.35em\">"
+        // A few wide terms can overflow just as easily as a long sum. Keep
+        // their boundaries available to the browser even when the static
+        // fallback fits them on one row. Zero cell padding preserves inline
+        // spacing; the row gap applies only when the sum actually wraps.
+        if expanded_sum && expanded_terms.len() > 1 {
+            body = "<mtable data-symbolica-sum=\"\" data-symbolica-row-gap=\"0.35em\" columnalign=\"left\" rowspacing=\"0\">"
                 .to_owned();
-            for terms in expanded_terms.chunks(columns) {
+            for (row, terms) in expanded_terms.chunks(columns).enumerate() {
+                let padding = if row == 0 { "0" } else { "0.35em 0 0" };
                 body.push_str(&format!(
-                    "<mtr><mtd>{}</mtd></mtr>",
+                    "<mtr><mtd style=\"padding:{padding}\">{}</mtd></mtr>",
                     Self::row(
                         terms
                             .iter()
@@ -1722,6 +1727,21 @@ mod tests {
             assert_eq!(page.markers.len(), 1);
             assert_eq!(page.markers[0].start, count);
             assert!(page.html.contains("data-symbolica-sum"));
+        }
+    }
+
+    #[test]
+    fn short_nested_sums_retain_wrappable_terms() {
+        for input in [
+            "c*(a*b*d*e*f*g+h*i*j*k*l*m)",
+            "c*(a*b*d*e*f*g+h*i*j*k*l*m+n*o*p*q*r*s)",
+        ] {
+            let html = page(input);
+            assert!(html.contains("data-symbolica-sum=\"\""), "{html}");
+            assert!(html.contains("data-symbolica-term=\"\""), "{html}");
+            // Reflow can make these sums tall, so their fences must stretch.
+            assert!(!html.contains("stretchy=\"false\""), "{html}");
+            assert!(!html.contains("data-symbolica-marker="), "{html}");
         }
     }
 

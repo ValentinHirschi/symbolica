@@ -3,6 +3,7 @@
 Install playwright and its chromium, firefox and webkit browsers, then run:
     python tests/browser_mathml_wrapping.py
 Optional *_EXECUTABLE environment variables select existing browser binaries.
+SYMBOLICA_TEST_BROWSERS selects engines, comma-separated (default: all three).
 Set SYMBOLICA_TEST_STATIC=1 to also check static previews from a locally built
 Symbolica module (selected with PYTHONPATH).
 """
@@ -11,6 +12,8 @@ import math
 import os
 from pathlib import Path
 import unittest
+
+BROWSERS = os.environ.get('SYMBOLICA_TEST_BROWSERS', 'chromium,firefox,webkit').split(',')
 
 JAVASCRIPT = (Path(__file__).resolve().parents[1]
               / "src/api/python/display/paging.js").read_text()
@@ -29,6 +32,25 @@ def static_previews():
 
 # Initialize the native allocator before loading the browser driver's TLS users.
 STATIC_PREVIEWS = static_previews()
+
+def short_sum_previews():
+    if os.environ.get('SYMBOLICA_TEST_STATIC') != '1':
+        return []
+    from symbolica import E
+    pages = []
+    for expression in (
+        'c*(aaaa*bbbb*cccc+dddd*eeee*ffff+gggg*hhhh*iiii)',
+        'c*(aaaa*bbbb*cccc*dddd+eeee*ffff*gggg*hhhh)',
+    ):
+        viewer = E(expression).formatted().mathml_viewer()
+        try:
+            pages.append(dict(viewer.page(), layouts=[], can_collapse=True))
+        finally:
+            viewer.close()
+    return pages
+
+
+SHORT_SUM_PREVIEWS = short_sum_previews()
 
 from playwright.async_api import async_playwright
 
@@ -145,9 +167,59 @@ def fraction_page(denominator='number', short=False, coefficient=False):
 
 
 class MathMLWrappingTests(unittest.IsolatedAsyncioTestCase):
+    @unittest.skipUnless(SHORT_SUM_PREVIEWS, 'Set SYMBOLICA_TEST_STATIC=1 for native previews')
+    async def test_short_wide_sums_wrap_and_stretch_their_fences(self):
+        async with async_playwright() as playwright:
+            for engine in BROWSERS:
+                with self.subTest(engine=engine):
+                    options = {'headless': True}
+                    if executable := os.environ.get(f'{engine.upper()}_EXECUTABLE'):
+                        options['executable_path'] = executable
+                    browser = await getattr(playwright, engine).launch(**options)
+                    try:
+                        for fixture in SHORT_SUM_PREVIEWS:
+                            page = await browser.new_page(viewport={'width': 1100, 'height': 900})
+                            font = os.environ.get('SYMBOLICA_TEST_FONT')
+                            await page.route('https://cdn.jsdelivr.net/**', lambda route:
+                                             route.fulfill(path=font, content_type='font/woff2') if font else route.abort())
+                            await page.set_content('<div id="host" style="width:900px"></div>')
+                            await page.evaluate('''async ({source,fixture}) => {
+                              const url=URL.createObjectURL(new Blob([source],{type:'text/javascript'}));
+                              const {mount}=await import(url);URL.revokeObjectURL(url);
+                              window.viewer=mount({el:host,page:fixture,send:()=>{}});
+                            }''', {'source': JAVASCRIPT, 'fixture': fixture})
+                            await page.evaluate('document.fonts.ready')
+                            wide = None
+                            for width in (900, 350, 900):
+                                await page.locator('#host').evaluate('(el,w)=>el.style.width=`${w}px`', width)
+                                await self.settle(page)
+                                state = await page.locator('#host').evaluate('''host => {
+                                  const root=host.shadowRoot, content=root.querySelector('.math-content');
+                                  const table=content.querySelector('mtable[data-symbolica-sum]');
+                                  const fence=table.closest('mrow[data-symbolica-path]').parentElement;
+                                  return {rows:table.children.length, text:table.textContent,
+                                    height:table.getBoundingClientRect().height,
+                                    fence:fence.firstElementChild.getBoundingClientRect().height,
+                                    scroll:content.scrollWidth, width:root.querySelector('.math').clientWidth};
+                                }''')
+                                self.assertLessEqual(state['scroll'], state['width'] + 1, state)
+                                if width == 900:
+                                    self.assertEqual(state['rows'], 1, state)
+                                    if wide is not None:
+                                        self.assertEqual(state, wide)
+                                    wide = state
+                                else:
+                                    self.assertGreater(state['rows'], 1, state)
+                                    self.assertGreater(state['fence'], wide['fence'], state)
+                                    self.assertGreaterEqual(state['fence'], state['height'] - 2, state)
+                                    self.assertEqual(state['text'], wide['text'])
+                            await page.close()
+                    finally:
+                        await browser.close()
+
     async def test_product_fraction_layout_responds_to_available_width(self):
         async with async_playwright() as playwright:
-            for engine in ('chromium', 'firefox', 'webkit'):
+            for engine in BROWSERS:
                 with self.subTest(engine=engine):
                     options = {'headless': True}
                     executable = os.environ.get(f'{engine.upper()}_EXECUTABLE')
@@ -256,7 +328,7 @@ class MathMLWrappingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_product_continuations_resize_in_each_engine(self):
         async with async_playwright() as playwright:
-            for engine in ("chromium", "firefox", "webkit"):
+            for engine in BROWSERS:
                 with self.subTest(engine=engine):
                     options = {"headless": True}
                     executable = os.environ.get(f"{engine.upper()}_EXECUTABLE")
@@ -407,7 +479,7 @@ class MathMLWrappingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_composite_cell_overflow_selects_a_compact_page(self):
         async with async_playwright() as playwright:
-            for engine in ("chromium", "firefox", "webkit"):
+            for engine in BROWSERS:
                 with self.subTest(engine=engine):
                     options = {"headless": True}
                     executable = os.environ.get(f"{engine.upper()}_EXECUTABLE")
@@ -444,7 +516,7 @@ class MathMLWrappingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_fractional_cell_width_does_not_wrap_a_fitting_sum(self):
         async with async_playwright() as playwright:
-            for engine in ("chromium", "firefox", "webkit"):
+            for engine in BROWSERS:
                 with self.subTest(engine=engine):
                     options = {"headless": True}
                     executable = os.environ.get(f"{engine.upper()}_EXECUTABLE")
@@ -482,7 +554,7 @@ class MathMLWrappingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_product_cell_padding_survives_measured_repacking(self):
         async with async_playwright() as playwright:
-            for engine in ("chromium", "firefox", "webkit"):
+            for engine in BROWSERS:
                 with self.subTest(engine=engine):
                     options = {"headless": True}
                     executable = os.environ.get(f"{engine.upper()}_EXECUTABLE")
@@ -526,7 +598,7 @@ class MathMLWrappingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_root_sums_resize_and_preview_in_each_engine(self):
         async with async_playwright() as playwright:
-            for engine in ("chromium", "firefox", "webkit"):
+            for engine in BROWSERS:
                 with self.subTest(engine=engine):
                     options = {"headless": True}
                     executable = os.environ.get(f"{engine.upper()}_EXECUTABLE")
