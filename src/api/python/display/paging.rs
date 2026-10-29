@@ -437,12 +437,13 @@ impl PythonMathMLViewer {
         }
         let initial = self.source_page(py, &[], 0, p.size, 0, &[])?;
         let total = initial.value.total;
-        if initial.value.kind == "Product" && (26..=50).contains(&total) {
-            // A complete small product can be clearer than an arbitrary
-            // 25-factor cut. Probe at most one additional page, preserving the
-            // ordinary renderer bounds. Judge the final output, not the size
-            // of the underlying tensor representation or its item count.
-            let candidate = match self.source_page(py, &[], 0, total, 0, &[]) {
+        if initial.value.kind == "Product" && total > p.size && initial.value.end < total {
+            // Factor count is not a display budget. Try one bounded larger
+            // prefix, retaining interior omissions and the ordinary renderer's
+            // allocation limits. Indexed factors can need substantial markup
+            // while displaying little text, so judge those costs separately.
+            let requested = total.min(500);
+            let candidate = match self.source_page(py, &[], 0, requested, 0, &[]) {
                 Ok(candidate) => candidate,
                 // Optional probing must not break an otherwise valid preview.
                 // Keep failures retryable, as with every uncached source error.
@@ -453,20 +454,39 @@ impl PythonMathMLViewer {
                 .as_bytes()
                 .windows(2)
                 .filter(|pair| pair[0] == b'<' && pair[1].is_ascii_alphabetic())
-                .take(1001)
+                .take(2001)
                 .count();
+            let mut omissions = BTreeMap::new();
+            for marker in &initial.value.markers {
+                omissions
+                    .entry(marker.path.as_slice())
+                    .and_modify(|start: &mut usize| *start = (*start).min(marker.start))
+                    .or_insert(marker.start);
+            }
             if candidate.value.kind == "Product"
                 && candidate.value.start == 0
-                && candidate.value.end == total
+                && candidate.value.end > initial.value.end
                 && candidate.value.total == total
-                && candidate.value.markers.is_empty()
-                && !html.contains("data-symbolica-marker=")
-                && html.len() <= 16 * 1024
-                && elements <= 1000
+                && html.matches("data-symbolica-marker=").count() == candidate.ids.len()
+                // Page validation already enforces the 256 KiB transfer bound.
+                // DOM work and visible content, not attribute bytes, determine
+                // whether this is still a compact automatic preview.
+                && elements <= 2000
+                && crate::printer::mathml::visible_cost(html, 768) <= 768
+                // More factors must not hide detail that was already visible.
+                // Each remaining omission must stay inside a previously
+                // omitted region, including the original root product tail.
+                && candidate.value.markers.iter().all(|marker| {
+                    (0..=marker.path.len()).any(|depth| {
+                        omissions.get(&marker.path[..depth]).is_some_and(|start| {
+                            marker.path.get(depth).copied().unwrap_or(marker.start) >= *start
+                        })
+                    })
+                })
             {
                 let p = &mut self.navigation.position;
-                p.size = total;
-                p.compact_size = total;
+                p.size = requested;
+                p.compact_size = requested;
             }
         }
         // Successful renders, including rejected candidates, are shared with

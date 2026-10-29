@@ -4469,7 +4469,7 @@ impl PythonExpression {
     /// Create a bounded MathML viewer without importing notebook or widget packages.
     /// Use its page(), handle_message(), and javascript() methods to connect a
     /// custom frontend. The viewer retains the expression until close() is called.
-    /// With page_size=None, a small complete product may extend the initial
+    /// With page_size=None, a compact product may extend the initial
     /// 25-factor preview when it fits the output budget. An explicit size remains
     /// the maximum number of items on a page.
     #[pyo3(signature = (page_size=None))]

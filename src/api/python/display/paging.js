@@ -547,7 +547,8 @@ function render({ model, el }) {
             // A continuation replaces that separator instead of doubling it.
             const leading = product && node.firstElementChild;
             const separators = leading?.localName === 'mo' ? [leading] : [];
-            if (leading?.textContent === '\u2062' && leading.nextElementSibling?.localName === 'mspace') {
+            if ((leading?.textContent === '\u2062' || leading?.textContent === '×')
+                && leading.nextElementSibling?.localName === 'mspace') {
               separators.push(leading.nextElementSibling);
             }
             for (const separator of separators) separator.removeAttribute('data-symbolica-continuation-separator');
