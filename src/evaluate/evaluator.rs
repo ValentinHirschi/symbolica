@@ -1336,6 +1336,62 @@ impl<T: Default> ExpressionEvaluator<T> {
 mod tests {
     use super::*;
 
+    #[cfg(all(feature = "bincode", feature = "serde", feature = "float-mpfr"))]
+    #[test]
+    fn polygamma_bounded_integer_legacy_fixed_callback_ir() {
+        use crate::domains::float::{ErrorPropagatingFloat, Float};
+        let _ = crate::transcendental::polygamma();
+        // Generated with the unmodified ae0c82b library before its normalizer
+        // knew these identities. Loading must retain and resolve the OLD
+        // tagged callbacks, not silently rebuild newly normalized expressions.
+        let bytes = include_bytes!("../../tests/fixtures/polygamma-positive-integer-ae0c82b.bin");
+        let (exact, consumed): (ExpressionEvaluator<Complex<Rational>>, usize) =
+            bincode::serde::borrow_decode_from_slice(bytes, bincode::config::standard()).unwrap();
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(exact.export_instructions().constant_functions.len(), 3);
+        let tag = Atom::num(1);
+        let info = crate::transcendental::polygamma()
+            .get_evaluation_info()
+            .unwrap();
+        assert!(
+            <ErrorPropagatingFloat<f64> as EvaluationDomain>::resolve_function(
+                &[tag.as_view()],
+                info
+            )
+            .is_none()
+        );
+        const BITS: u32 = 3322;
+        let mut mapped = exact.map_coeff_with_prec(
+            &|c| {
+                Complex::new(
+                    c.re.to_multi_prec_float(BITS),
+                    c.im.to_multi_prec_float(BITS),
+                )
+            },
+            BITS,
+        );
+        let mut actual = vec![Complex::new(Float::new(BITS), Float::new(BITS)); 3];
+        mapped.evaluate(&[], &mut actual);
+        let expected = [
+            crate::parse!("polygamma(1,2)"),
+            crate::parse!("polygamma(3,64)"),
+            crate::parse!("(2+3𝑖)*polygamma(1,3)"),
+        ];
+        let inputs = std::collections::HashMap::<Atom, Complex<Float>>::new();
+        for (value, expression) in actual.iter().zip(expected) {
+            let reference = expression.evaluate_with_prec(&inputs, BITS + 256).unwrap();
+            assert_eq!(value.re.prec(), BITS);
+            assert_eq!(value.im.prec(), BITS);
+            let error = (value.re.clone() - &reference.re).norm()
+                + (value.im.clone() - &reference.im).norm();
+            let scale = reference.re.norm() + reference.im.norm();
+            assert!(error <= scale * Float::with_val(BITS, 0.5).pow(u64::from(BITS - 2)));
+        }
+        assert!(actual[0].im.is_fully_zero());
+        assert!(actual[1].im.is_fully_zero());
+        assert!(!actual[2].im.is_fully_zero());
+    }
+
     #[test]
     fn coefficient_conversion_shares_function_bodies() {
         let exact = crate::parse!("shared_body::outer(x)")
