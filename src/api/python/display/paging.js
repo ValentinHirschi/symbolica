@@ -506,6 +506,17 @@ function render({ model, el }) {
       }
       const tableLimit = Math.max(0, available - (overhead - cellOverhead));
       let limit = Math.max(0, available - overhead);
+      // A single canonical row that already fits needs no continuation
+      // measurement, separator toggles, or replacement rows. Check the same
+      // additive factor widths the packer uses, as well as the rendered table.
+      if (rows.length === 1 && rows[0].factors.length === factorCount
+          && (!table.hasAttribute('data-symbolica-row-gap')
+            || rows[0].row.firstElementChild.style.padding === '0px')
+          && rows[0].factors.reduce((sum, factor) => sum + factor.getBoundingClientRect().width, 0) <= limit + .5
+          && table.getBoundingClientRect().width <= tableLimit + .5) {
+        tableLimits.set(table, limit);
+        return;
+      }
       let continuation, continuationWidth = 0;
       {
         continuation = doc.createElementNS(table.namespaceURI, 'mrow');
@@ -1183,9 +1194,11 @@ function render({ model, el }) {
           const rollback = wrappedWidths.get(container) === trialWidth ? wrappingCheckpoint(container) : null;
           part.replaceWith(replacement);
           setWrapWidth(container, fittingWidth);
-          const width = context
+          // Richer detail must fit each matrix/tensor cell too. A wide value
+          // can overlap its neighbour without overflowing the outer frame.
+          const width = widthWithCells(container, context
             ? Math.max(container.scrollWidth - 4, container.firstElementChild?.getBoundingClientRect().width || 0)
-            : Math.max(container.scrollWidth, container.getBoundingClientRect().width);
+            : Math.max(container.scrollWidth, container.getBoundingClientRect().width), fittingWidth);
           // Keep DOM/transport-sized work bounded even when mixing layouts.
           fittingWidth = Math.min(fittingWidth, context ? container.clientWidth - 4 : math.clientWidth);
           if (width <= fittingWidth + 1 && container.querySelectorAll('*').length <= 10000

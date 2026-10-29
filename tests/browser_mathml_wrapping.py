@@ -420,7 +420,8 @@ class MathMLWrappingTests(unittest.IsolatedAsyncioTestCase):
                         await page.set_content('<div id="host" style="width:480px"></div>')
                         html = ('<div style="width:var(--symbolica-wrap-width)"><table '
                                 'style="width:100%;table-layout:fixed"><tr><td>'
-                                '<div data-symbolica-cell=""><math><mspace width="300px"/></math></div>'
+                                # A zero-height box does not contribute scroll overflow in Chromium.
+                                '<div data-symbolica-cell=""><math><mspace width="300px" height="20px"/></math></div>'
                                 '</td><td><div data-symbolica-cell=""><math><mi>x</mi></math></div>'
                                 '</td></tr></table></div>')
                         fixture = dict(html=html, start=0, end=2, total=2,
