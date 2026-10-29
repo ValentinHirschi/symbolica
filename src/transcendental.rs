@@ -3204,14 +3204,68 @@ fn polygamma_exact_rational(order: u32, rat: &Rational) -> Option<Atom> {
         return polygamma_order_zero_exact_rational(rat);
     }
 
-    if *rat != Rational::one() {
+    if !rat.is_integer() {
         return None;
     }
+    let (power, denominator, correction) =
+        polygamma_integer_parts(order, rat.numerator().to_i64()?)?;
+    Some(Atom::from(State::PI).pow(power) / Atom::num(denominator) - Atom::num(correction))
+}
 
-    match order {
-        1 => Some(Atom::from(State::PI).pow(2) / 6),
-        3 => Some(Atom::from(State::PI).pow(4) / 15),
-        _ => None,
+// Keep the finite recurrence cheap and its cancellation uniformly bounded.
+// For 1<=n<=64, psi1(n)>1/n and psi3(n)>2/n^3: subtracting the rational
+// correction from the pi term loses fewer than 8 and 21 bits, respectively.
+const POLYGAMMA_INTEGER_CAP: i64 = 64;
+
+/// The already supported exact bases, pi^power/denominator, minus an exact
+/// rational recurrence correction. Shared by symbolic normalization and the
+/// numeric callback; the latter never constructs an Atom or a Workspace.
+fn polygamma_integer_parts(order: u32, n: i64) -> Option<(u32, i64, Rational)> {
+    let (power, denominator, factor) = match order {
+        1 => (2, 6, 1),
+        3 => (4, 15, 6),
+        _ => return None,
+    };
+    if !(1..=POLYGAMMA_INTEGER_CAP).contains(&n) {
+        return None;
+    }
+    // psi^(m)(n)=psi^(m)(1)+(-1)^m*m!*sum_{k=1}^{n-1} k^(-m-1).
+    // Both supported orders are odd. With n<=64 and power<=4, i64 powers
+    // cannot overflow. No approximation enters the finite sum.
+    let mut correction = Rational::zero();
+    for k in 1..n {
+        correction += Rational::from((factor, k.pow(power)));
+    }
+    Some((power, denominator, correction))
+}
+
+fn polygamma_integer_numeric(
+    order: u32,
+    z: &Complex<Float>,
+    bits: u32,
+    work: u32,
+) -> Option<Complex<Float>> {
+    if !z.im.is_fully_zero() {
+        return None;
+    }
+    let (power, denominator, correction) =
+        polygamma_integer_parts(order, complex_float_to_integer(z)?)?;
+    let base = Float::with_val(work, Constant::Pi).pow(u64::from(power))
+        / Float::with_val(work, denominator);
+    let correction = correction.to_multi_prec_float(work);
+    let value = base.clone() - &correction;
+
+    // At most four pi factors, one division, rational conversion and one
+    // subtraction. The same conservative round unit as the checked fallback
+    // (256 working ulps), with eight operation allowances, bounds rounding
+    // before final output rounding. Test the requested relative-error budget
+    // explicitly, including cancellation; retain the fallback if it fails.
+    let magnitude = base.norm() + correction.norm() + value.norm();
+    let roundoff = magnitude * binary_series_threshold(work - 8) * Float::with_val(work, 8);
+    if value.is_finite() && roundoff <= value.norm() * binary_series_threshold(bits + 8) {
+        Some(at_precision(&Complex::new(value, Float::new(work)), bits))
+    } else {
+        None
     }
 }
 
@@ -4518,6 +4572,12 @@ fn polygamma_checked(order: u32, z: &Complex<Float>, bits: u32) -> Complex<Float
         return Complex::new(Float::with_val(bits, f64::INFINITY), Float::new(bits));
     }
 
+    // This also serves legacy evaluator IR whose fixed callback predates the
+    // exact integer normalization. All existing admission above still applies.
+    if let Some(value) = polygamma_integer_numeric(order, &z, bits, work) {
+        return value;
+    }
+
     // Recurrence to the right half-plane, followed by DLMF 5.11.2/5.15.9.
     // The Euler--Maclaurin remainder after B_(2k) is bounded by the
     // magnitude of that term with z replaced by Re(z)>0. This also works
@@ -4837,8 +4897,12 @@ fn erf_checked(z: &Complex<Float>, bits: u32) -> Complex<Float> {
 mod tests {
     #[cfg(feature = "float-mpfr")]
     use super::{
-        Constant, complex_one, complex_pi, polylog_integer_numeric_eval, polylog_numeric_eval,
-        polylog_series_integer,
+        Constant, MAX_WORK_BITS, at_precision, binary_series_threshold, complex_one, complex_pi,
+        finite, polygamma_checked, polygamma_integer_numeric, polylog_integer_numeric_eval,
+        polylog_numeric_eval, polylog_series_integer,
+    };
+    use super::{
+        POLYGAMMA_INTEGER_CAP, polygamma, polygamma_exact_rational, polygamma_integer_parts,
     };
     use crate::domains::float::FloatLike;
 
@@ -4852,8 +4916,11 @@ mod tests {
     use crate::{
         atom::{Atom, AtomCore},
         coefficient::Coefficient,
-        domains::float::{Complex, Float, Real, RealLike},
-        parse, symbol,
+        domains::{
+            float::{Complex, Float, Real, RealLike},
+            rational::Rational,
+        },
+        function, parse, symbol,
     };
 
     #[test]
@@ -5269,6 +5336,125 @@ mod tests {
             parse!("polygamma(3,x)").derivative(symbol!("x")),
             parse!("polygamma(4,x)")
         );
+    }
+
+    #[test]
+    fn polygamma_bounded_integer_exact_normalization() {
+        assert_eq!(parse!("polygamma(1,2)"), parse!("pi^2/6-1"));
+        assert_eq!(parse!("polygamma(1,3)"), parse!("pi^2/6-5/4"));
+        assert_eq!(parse!("polygamma(3,2)"), parse!("pi^4/15-6"));
+        for order in [1, 3] {
+            for n in 1..POLYGAMMA_INTEGER_CAP {
+                let a = function!(polygamma(), order, n);
+                let b = function!(polygamma(), order, n + 1);
+                let correction = if order == 1 { 1 } else { 6 };
+                assert_eq!(
+                    (b - a).expand_num(),
+                    Atom::num(Rational::from((-correction, n.pow(order + 1))))
+                );
+            }
+        }
+        for (order, argument) in [
+            (2, Rational::one()),
+            (1, Rational::from((1, 3))),
+            (1, Rational::from((65, 1))),
+            (3, Rational::from((0, 1))),
+            (1, Rational::from((-1, 1))),
+        ] {
+            assert!(polygamma_exact_rational(order, &argument).is_none());
+        }
+        assert!(polygamma_integer_parts(1, i64::MAX).is_none());
+    }
+
+    #[cfg(feature = "float-mpfr")]
+    fn polygamma_integer_reference(order: u32, n: i64, bits: u32) -> Complex<Float> {
+        // Independent high-precision floating recurrence, not the exact
+        // rational helper used by either implementation path.
+        let pi = Float::with_val(bits, Constant::Pi);
+        let mut value = if order == 1 {
+            pi.pow(2) / Float::with_val(bits, 6)
+        } else {
+            pi.pow(4) / Float::with_val(bits, 15)
+        };
+        for k in 1..n {
+            let term = Float::with_val(bits, if order == 1 { 1 } else { 6 })
+                / Float::with_val(bits, k).pow(u64::from(order + 1));
+            value -= term;
+        }
+        Complex::new(value, Float::new(bits))
+    }
+
+    #[cfg(feature = "float-mpfr")]
+    #[test]
+    fn polygamma_bounded_integer_tagged_precision_and_cap_cancellation() {
+        use crate::evaluate::EvaluationDomain;
+        let info = polygamma().get_evaluation_info().unwrap();
+        for bits in [53, 106, 128, 3322] {
+            for order in [1, 3] {
+                let tag = Atom::num(order);
+                let tags = [tag.as_view()];
+                let complex =
+                    <Complex<Float> as EvaluationDomain>::resolve_function(&tags, info).unwrap();
+                let real = <Float as EvaluationDomain>::resolve_function(&tags, info).unwrap();
+                for n in [1, 2, 3, POLYGAMMA_INTEGER_CAP] {
+                    let argument = Float::with_val(bits, n);
+                    let actual = complex(&[Complex::new(argument.clone(), Float::new(bits))]);
+                    let real_actual = real(&[argument]);
+                    let expected = polygamma_integer_reference(order, n, bits + 256);
+                    assert_eq!(actual.re.prec(), bits);
+                    assert_eq!(actual.im.prec(), bits);
+                    assert!(actual.im.is_fully_zero());
+                    assert_eq!(real_actual.prec(), bits);
+                    assert_eq!(actual.re, real_actual);
+                    let error = (actual.re.clone() - expected.re.clone()).norm();
+                    // An ulp-sized allowance includes final requested-bit
+                    // rounding; it is far tighter than the existing helper's
+                    // generic 16-bit comparison allowance.
+                    let bound = expected.re.norm() * binary_series_threshold(bits - 2);
+                    assert!(error <= bound, "order={order}, n={n}, bits={bits}");
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "float-mpfr")]
+    #[test]
+    fn polygamma_bounded_integer_exclusions_and_admission() {
+        const BITS: u32 = 128;
+        let integer = Complex::new(Float::with_val(BITS, 2), Float::new(BITS));
+        let tiny = binary_series_threshold(80);
+        for z in [
+            Complex::new(integer.re.clone() + &tiny, Float::new(BITS)),
+            Complex::new(integer.re.clone(), tiny.clone()),
+            Complex::new(Float::with_val(BITS, 65), Float::new(BITS)),
+            Complex::new(
+                Float::with_val(BITS, 1) / Float::with_val(BITS, 3),
+                Float::new(BITS),
+            ),
+        ] {
+            assert!(polygamma_integer_numeric(1, &z, BITS, BITS + 64).is_none());
+            let value = polygamma_checked(1, &z, BITS);
+            assert!(finite(&value));
+            let refined = polygamma_checked(1, &at_precision(&z, BITS + 128), BITS + 128);
+            assert_precision_complex(&value, &refined, BITS, "unchanged noninteger fallback");
+        }
+        let z = Complex::new(integer.re.clone(), tiny);
+        assert!(!polygamma_checked(1, &z, BITS).im.is_fully_zero());
+        assert!(polygamma_integer_numeric(2, &integer, BITS, BITS + 64).is_none());
+        assert!(!finite(&polygamma_checked(1, &integer, 0)));
+        assert!(!finite(&polygamma_checked(1, &integer, MAX_WORK_BITS)));
+        assert!(!finite(&polygamma_checked(4097, &integer, BITS)));
+        let nonfinite = Complex::new(Float::with_val(BITS, f64::NAN), Float::new(BITS));
+        assert!(!finite(&polygamma_checked(1, &nonfinite, BITS)));
+        for n in [0, -1] {
+            let value = polygamma_checked(
+                1,
+                &Complex::new(Float::with_val(BITS, n), Float::new(BITS)),
+                BITS,
+            );
+            assert!(!value.re.is_finite() && value.re > Float::new(BITS));
+            assert!(value.im.is_fully_zero());
+        }
     }
 
     #[test]
