@@ -365,8 +365,34 @@ function render({ model, el }) {
     }
     productPrefactors.delete(numerator);
   }
-  function setWrapWidth(container, width) {
+  function layoutMetrics(container) {
+    // clientWidth/scrollWidth and the wrap budget use CSS layout pixels.
+    // DOMRects include ancestor CSS zoom/transforms, even inside a shadow root.
+    // Our HTML containers use border-box sizing and computed pixel dimensions.
     const style = getComputedStyle(container);
+    const width = parseFloat(style.width), height = parseFloat(style.height);
+    const scale = width > 0 ? container.getBoundingClientRect().width / width : 1;
+    return { width, height, scale: scale > 0 ? scale : 1 };
+  }
+  function setWrapWidth(container, width) {
+    let budget = width;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      wrapToWidth(container, budget);
+      // MathML can add spacing/italic overhang outside the tables we packed.
+      // A few pixels of root overflow should trigger a tighter wrap, not a
+      // switch to a drastically shorter preview (or an expansion scrollbar).
+      const metrics = layoutMetrics(container);
+      const overflow = Math.max(container.scrollWidth, metrics.width) - width;
+      if (overflow <= 1 || budget === 0) break;
+      const overhang = Math.max(0, container.scrollWidth - metrics.width);
+      budget = Math.max(0, Math.min(budget - overflow - .5, width - overhang - 1));
+    }
+    wrappedWidths.set(container, width);
+  }
+  function wrapToWidth(container, width) {
+    const style = getComputedStyle(container);
+    const {scale} = layoutMetrics(container);
+    const widthOf = node => node ? node.getBoundingClientRect().width / scale : 0;
     const padding = parseFloat(style.paddingLeft) + parseFloat(style.paddingRight);
     const available = Math.max(0, width - padding);
     container.style.setProperty('--symbolica-wrap-width', `${available}px`);
@@ -457,8 +483,8 @@ function render({ model, el }) {
       // Other table rows and wrapping sums/products do not restrict this table
       // to their current arrangement.
       const rowWidth = Math.max(0, ...rows.map(({ row }) =>
-        row.querySelector(':scope > mtd > mrow')?.getBoundingClientRect().width || 0));
-      const cellOverhead = Math.max(0, table.getBoundingClientRect().width - rowWidth);
+        widthOf(row.querySelector(':scope > mtd > mrow'))));
+      const cellOverhead = Math.max(0, widthOf(table) - rowWidth);
       let overhead = cellOverhead;
       for (let child = table, parent = child.parentElement;
           parent && parent !== container; child = parent, parent = parent.parentElement) {
@@ -467,42 +493,44 @@ function render({ model, el }) {
             && children.some(node => node.hasAttribute('data-symbolica-factor') || node.hasAttribute('data-symbolica-term'))) {
           // The surrounding product can move this factor between rows, but
           // a continuation's fixed prefix still takes space from its children.
-          // Keep a small leading coefficient with the next factor: otherwise
-          // a nested sum first fills the entire row and strands the coefficient
-          // above it. Reserve the coefficient while fitting that sum, even if
+          // Keep a small leading factor with the next factor: otherwise
+          // a nested sum first fills the entire row and strands the prefix
+          // above it. Reserve the prefix while fitting that sum, even if
           // a previous pass put it on a separate continuation row.
           const owner = child.hasAttribute('data-symbolica-factor')
             ? parent.closest('mtable[data-symbolica-product]') : null;
           const factors = owner ? [...owner.querySelectorAll(':scope > mtr > mtd > mrow > [data-symbolica-factor]')] : [];
-          const coefficient = factors[0]?.hasAttribute('data-symbolica-coefficient') ? factors[0] : null;
-          const coefficientWidth = coefficient?.getBoundingClientRect().width || 0;
-          const keepCoefficient = child === factors[1] && coefficientWidth > 0
-            && coefficientWidth <= 2 * parseFloat(getComputedStyle(coefficient).fontSize);
+          // Include short symbolic factors such as (1+a), not just numbers.
+          // Moving such a prefix to its own line can otherwise increase height
+          // when the viewport widens and make height fitting drop detail.
+          const prefix = factors[0];
+          const prefixWidth = widthOf(prefix);
+          const keepPrefix = child === factors[1] && prefixWidth > 0
+            && prefixWidth <= 4 * parseFloat(getComputedStyle(prefix).fontSize);
           let separatorWidth = 0;
-          if (keepCoefficient) {
+          if (keepPrefix) {
             // Recursive fitting can reach an old continuation whose original
             // multiplication separator is still hidden. Account for that
             // separator too: it returns when these factors share a row.
             const hidden = [...child.children].filter(node =>
               node.hasAttribute('data-symbolica-continuation-separator'));
             if (hidden.length) {
-              const before = child.getBoundingClientRect().width;
+              const before = widthOf(child);
               for (const node of hidden) node.removeAttribute('data-symbolica-continuation-separator');
-              separatorWidth = Math.max(0, child.getBoundingClientRect().width - before);
+              separatorWidth = Math.max(0, widthOf(child) - before);
               for (const node of hidden) node.setAttribute('data-symbolica-continuation-separator', '');
             }
           }
-          overhead += keepCoefficient ? coefficientWidth + separatorWidth
-            : children.find(node => node.hasAttribute('data-symbolica-continuation'))
-              ?.getBoundingClientRect().width || 0;
+          overhead += keepPrefix ? prefixWidth + separatorWidth
+            : widthOf(children.find(node => node.hasAttribute('data-symbolica-continuation')));
           continue;
         }
         if (['mtable', 'mtr', 'mtd'].includes(parent.localName)
             || (['flex', 'inline-flex'].includes(parent.style.display) && parent.style.flexWrap === 'wrap')) continue;
         const childWidth = parent.localName === 'mfrac'
-          ? Math.max(0, ...children.map(node => node.getBoundingClientRect().width))
-          : child.getBoundingClientRect().width;
-        overhead += Math.max(0, parent.getBoundingClientRect().width - childWidth);
+          ? Math.max(0, ...children.map(node => widthOf(node)))
+          : widthOf(child);
+        overhead += Math.max(0, widthOf(parent) - childWidth);
       }
       const tableLimit = Math.max(0, available - (overhead - cellOverhead));
       let limit = Math.max(0, available - overhead);
@@ -512,8 +540,8 @@ function render({ model, el }) {
       if (rows.length === 1 && rows[0].factors.length === factorCount
           && (!table.hasAttribute('data-symbolica-row-gap')
             || rows[0].row.firstElementChild.style.padding === '0px')
-          && rows[0].factors.reduce((sum, factor) => sum + factor.getBoundingClientRect().width, 0) <= limit + .5
-          && table.getBoundingClientRect().width <= tableLimit + .5) {
+          && rows[0].factors.reduce((sum, factor) => sum + widthOf(factor), 0) <= limit + .5
+          && widthOf(table) <= tableLimit + .5) {
         tableLimits.set(table, limit);
         return;
       }
@@ -556,20 +584,20 @@ function render({ model, el }) {
           })
         }));
         const factors = measured.flatMap(row => row.factors);
-        for (const factor of factors) factor.width = factor.node.getBoundingClientRect().width;
+        for (const factor of factors) factor.width = widthOf(factor.node);
         if (!attempt) {
           // Read the original factors before inserting the probe. Removing it
           // and hiding separators can then share one layout invalidation.
           // Measure in this table's math style, including fraction/script size.
           factors[0].node.before(continuation);
-          continuationWidth = continuation.getBoundingClientRect().width;
+          continuationWidth = widthOf(continuation);
           continuation.remove();
         }
         for (const factor of factors) {
           for (const separator of factor.separators) separator.setAttribute('data-symbolica-continuation-separator', '');
         }
         for (const factor of factors) {
-          factor.continuationWidth = product ? factor.node.getBoundingClientRect().width : factor.width;
+          factor.continuationWidth = product ? widthOf(factor.node) : factor.width;
         }
         for (const factor of factors) {
           for (const separator of factor.separators) separator.removeAttribute('data-symbolica-continuation-separator');
@@ -626,7 +654,7 @@ function render({ model, el }) {
         let nestedRefit = false;
         for (const row of packed) {
           if (!row.querySelector(':scope > mtd > mrow > [data-symbolica-continuation]')
-              || row.getBoundingClientRect().width <= tableLimit + .5) continue;
+              || widthOf(row) <= tableLimit + .5) continue;
           for (const nested of [...row.querySelectorAll(tables)].reverse()) {
             if (!descendants.has(nested)) {
               descendants.add(nested);
@@ -637,7 +665,7 @@ function render({ model, el }) {
         }
         // WebKit can change intrinsic cell widths when factors move between
         // rows. Check the packed table too, and only reduce this pass's budget.
-        const overflow = table.getBoundingClientRect().width - tableLimit;
+        const overflow = widthOf(table) - tableLimit;
         if (overflow <= 0.5) {
           // An inner fit can free enough room to combine outer rows. Repack
           // with those final widths instead of keeping a stale line break.
@@ -653,7 +681,7 @@ function render({ model, el }) {
           const factors = body ? [...body.children].filter(node =>
             node.hasAttribute('data-symbolica-factor') || node.hasAttribute('data-symbolica-term')) : [];
           return factors.length === 1 && !factors[0].querySelector(tables)
-            && body.getBoundingClientRect().width > limit + .5;
+            && widthOf(body) > limit + .5;
         });
         if (indivisibleOverflow) break;
         limit = Math.max(0, limit - overflow);
@@ -685,10 +713,11 @@ function render({ model, el }) {
       const denominatorTables = [...denominator.querySelectorAll('mtable')];
       if (denominatorTables.length > 1
           || denominatorTables.some(table => table.children.length !== 1)) continue;
-      const box = denominator.getBoundingClientRect();
+      const rect = denominator.getBoundingClientRect();
+      const box = {width:rect.width / scale, height:rect.height / scale};
       const em = parseFloat(getComputedStyle(denominator).fontSize);
       const factors = factorRows.flat();
-      const numeratorWidth = factors.reduce((total, factor) => total + factor.getBoundingClientRect().width, 0);
+      const numeratorWidth = factors.reduce((total, factor) => total + widthOf(factor), 0);
       if (!(box.width > 0 && em > 0) || box.width > 3 * em || box.height > 2 * em
           || numeratorWidth < 4 * box.width) continue;
       // The kernel marks its real numeric coefficient, which is ordered first.
@@ -736,7 +765,7 @@ function render({ model, el }) {
       // newly indivisible wide item. A large numeric coefficient may have fit
       // on its own canonical row. The original row budget is conservative:
       // removing the outer fraction/sign only makes more room available.
-      if (first.getBoundingClientRect().width > limit + .5) restoreProductFraction(numerator);
+      if (widthOf(first) > limit + .5) restoreProductFraction(numerator);
     }
     if (compactFractions.length) {
       // The selected coefficient consumes width only on the first row. Fit
@@ -788,7 +817,7 @@ function render({ model, el }) {
         decorateMarkers(candidate, previewMath, value.context);
         setWrapWidth(previewMath, previewMath.clientWidth);
         const width = widthWithCells(previewMath,
-          Math.max(previewMath.scrollWidth - 4, previewMath.firstElementChild?.getBoundingClientRect().width || 0),
+          Math.max(previewMath.scrollWidth - 4, (previewMath.firstElementChild?.getBoundingClientRect().width || 0) / layoutMetrics(previewMath).scale),
           previewMath.clientWidth - 4);
         if (width < smallest) {
           selected = candidate;
@@ -1053,9 +1082,10 @@ function render({ model, el }) {
       // caused by trial layouts, so compacting cannot reopen a wider layout.
       available = Math.min(available, math.clientWidth);
       setWrapWidth(content, available);
+      const metrics = layoutMetrics(content);
       const width = widthWithCells(content,
-        Math.max(content.scrollWidth, content.getBoundingClientRect().width), available);
-      const result = {candidate, width, height:content.getBoundingClientRect().height,
+        Math.max(content.scrollWidth, metrics.width), available);
+      const result = {candidate, width, height:metrics.height,
         available, nodes:[...content.childNodes]};
       measured.set(candidate, result);
       return result;
@@ -1067,15 +1097,24 @@ function render({ model, el }) {
       // its height. This threshold only chooses the search order; it does not
       // cap displayed markup. A fitting 64 KiB expression can still win.
       const candidates = layouts.filter(candidate => candidate === base || keepsCompleteTerms(candidate, base));
-      let low = 0, high = candidates.length - 1;
-      while (low <= high) {
-        const middle = (low + high) >> 1;
-        const result = measure(candidates[middle]);
-        if (result.width <= available + 1 && result.height <= heightLimit + 1) {
-          heightFit = result;
-          high = middle - 1;
-        } else low = middle + 1;
+      for (let pass = 0; pass < 2; pass++) {
+        heightFit = null;
+        let low = 0, high = candidates.length - 1;
+        while (low <= high) {
+          const middle = (low + high) >> 1;
+          const result = measure(candidates[middle]);
+          if (result.width <= available + 1 && result.height <= heightLimit + 1) {
+            heightFit = result;
+            high = middle - 1;
+          } else low = middle + 1;
+        }
+        // Testing a taller candidate may introduce a native scrollbar after
+        // the winner was measured. Repeat the bounded search at that narrower
+        // width rather than restoring a now-too-tall winner and flickering on
+        // the subsequent ResizeObserver callback.
+        if (!heightFit || heightFit.available === available) break;
       }
+      if (heightFit && heightFit.available !== available) heightFit = null;
     }
     if (heightFit) {
       page = heightFit.candidate;
@@ -1128,9 +1167,9 @@ function render({ model, el }) {
     // again repeats expensive layout work and cannot add another full page
     // of terms within the same target. Width-only fits retain local refinement.
     if (!Number.isFinite(heightLimit) || ((page === base || page === widthFit)
-        && content.getBoundingClientRect().height <= heightLimit + 1)) {
+        && layoutMetrics(content).height <= heightLimit + 1)) {
       revealFittingParts(layouts, available, content, null,
-        Math.max(heightLimit, content.getBoundingClientRect().height));
+        Math.max(heightLimit, layoutMetrics(content).height));
     }
     if (numberMarkers(content)) setWrapWidth(content, available);
     content.style.setProperty('--expression-zoom', zoom || 1);
@@ -1271,12 +1310,13 @@ function render({ model, el }) {
           setWrapWidth(container, fittingWidth);
           // Richer detail must fit each matrix/tensor cell too. A wide value
           // can overlap its neighbour without overflowing the outer frame.
+          const metrics = layoutMetrics(container);
           const width = widthWithCells(container, context
-            ? Math.max(container.scrollWidth - 4, container.firstElementChild?.getBoundingClientRect().width || 0)
-            : Math.max(container.scrollWidth, container.getBoundingClientRect().width), fittingWidth);
+            ? Math.max(container.scrollWidth - 4, (container.firstElementChild?.getBoundingClientRect().width || 0) / metrics.scale)
+            : Math.max(container.scrollWidth, metrics.width), fittingWidth);
           // Keep DOM/transport-sized work bounded even when mixing layouts.
           fittingWidth = Math.min(fittingWidth, context ? container.clientWidth - 4 : math.clientWidth);
-          if (width <= fittingWidth + 1 && container.getBoundingClientRect().height <= heightLimit + 1
+          if (width <= fittingWidth + 1 && metrics.height <= heightLimit + 1
               && container.querySelectorAll('*').length <= 10000
               && container.innerHTML.length <= 256 * 1024) {
             changed = true;
