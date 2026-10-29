@@ -6,7 +6,10 @@ use pyo3::{
     prelude::*,
     types::{PyAnyMethods, PyBool, PyDict, PyDictMethods, PyInt, PyList, PyTuple},
 };
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::{
+    collections::{BTreeMap, HashSet, VecDeque},
+    sync::Arc,
+};
 
 fn invalid(message: &str) -> PyErr {
     PyValueError::new_err(message.to_owned())
@@ -58,7 +61,18 @@ fn size(message: &Bound<'_, PyDict>, key: &str, default: usize) -> PyResult<usiz
     Ok(value)
 }
 
-#[derive(Clone)]
+fn offset(message: &Bound<'_, PyDict>, default: usize) -> PyResult<usize> {
+    let value = message
+        .get_item("start")?
+        .map(|v| integer(&v, "Invalid preview offset"))
+        .transpose()?
+        .unwrap_or(default);
+    if value as u128 >= 1u128 << 63 {
+        return Err(invalid("Invalid preview offset"));
+    }
+    Ok(value)
+}
+
 struct Page {
     value: MathMLPage,
     ids: Vec<usize>,
@@ -212,8 +226,8 @@ impl Page {
 
 #[derive(Clone)]
 struct Pages {
-    main: Page,
-    layouts: Vec<Page>,
+    main: Arc<Page>,
+    layouts: Vec<Arc<Page>>,
 }
 impl Pages {
     fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
@@ -239,6 +253,8 @@ struct Popup {
     main: Capability,
     layouts: Vec<Capability>,
     origin: Option<String>,
+    root_path: Vec<usize>,
+    root_start: usize,
 }
 
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -249,18 +265,20 @@ struct Position {
     size: usize,
     compact_size: usize,
 }
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct Navigation {
     position: Position,
     parents: Vec<Position>,
     expanded: BTreeMap<Vec<usize>, usize>,
+    automatic_product_preview: bool,
 }
 #[derive(PartialEq, Eq)]
 struct CacheKey {
     path: Vec<usize>,
     start: usize,
     size: usize,
-    expanded: BTreeMap<Vec<usize>, usize>,
+    layout: usize,
+    expansions: Vec<(Vec<usize>, usize)>,
 }
 
 /// Paging and notebook integration share one native owner.
@@ -270,7 +288,8 @@ pub(super) struct PythonMathMLViewer {
     layout_count: usize,
     supports_expansion: bool,
     navigation: Navigation,
-    cache: VecDeque<(CacheKey, Pages)>,
+    cache: VecDeque<(CacheKey, Arc<Page>, usize)>,
+    cache_bytes: usize,
     popups: VecDeque<(String, Popup)>,
     serial: u64,
     views: HashSet<String>,
@@ -280,14 +299,27 @@ pub(super) struct PythonMathMLViewer {
 
 impl PythonMathMLViewer {
     fn source_page(
-        &self,
+        &mut self,
         py: Python<'_>,
         path: &[usize],
         start: usize,
         size: usize,
         layout: usize,
         expansions: &[(Vec<usize>, usize)],
-    ) -> PyResult<Page> {
+    ) -> PyResult<Arc<Page>> {
+        let key = CacheKey {
+            path: path.to_vec(),
+            start,
+            size,
+            layout,
+            expansions: expansions.to_vec(),
+        };
+        if let Some(index) = self.cache.iter().position(|(k, _, _)| k == &key) {
+            let entry = self.cache.remove(index).unwrap();
+            let page = entry.1.clone();
+            self.cache.push_back(entry);
+            return Ok(page);
+        }
         let source = self
             .source
             .as_ref()
@@ -297,11 +329,38 @@ impl PythonMathMLViewer {
             "page",
             (path.to_vec(), start, size, layout, expansions.to_vec()),
         )?;
-        Page::from_python(value.bind(py), size, layout)
+        let page = Arc::new(Page::from_python(value.bind(py), size, layout)?);
+        // Main pages, hover previews and bounded Show all probes share the same
+        // cache. Share immutable pages so hits do not copy their HTML/markers;
+        // response dictionaries remain fresh mutable Python objects. Retain
+        // only successful, validated renders, with both an entry limit and a
+        // byte limit; a large popup cannot multiply retained HTML.
+        let bytes = page.value.html.len()
+            + page.value.kind.len()
+            + page.value.unit.len()
+            + page
+                .value
+                .markers
+                .iter()
+                .map(|m| m.label.len() + m.path.len() * std::mem::size_of::<usize>() + 64)
+                .sum::<usize>()
+            + page.ids.len() * std::mem::size_of::<usize>()
+            + key.path.len() * std::mem::size_of::<usize>()
+            + key
+                .expansions
+                .iter()
+                .map(|(p, _)| (p.len() + 1) * std::mem::size_of::<usize>())
+                .sum::<usize>();
+        self.cache_bytes += bytes;
+        self.cache.push_back((key, page.clone(), bytes));
+        while self.cache.len() > 24 || self.cache_bytes > 2 * 1024 * 1024 {
+            self.cache_bytes -= self.cache.pop_front().unwrap().2;
+        }
+        Ok(page)
     }
 
     fn pages(
-        &self,
+        &mut self,
         py: Python<'_>,
         path: &[usize],
         start: usize,
@@ -309,12 +368,11 @@ impl PythonMathMLViewer {
         expansions: &[(Vec<usize>, usize)],
     ) -> PyResult<Pages> {
         let main = self.source_page(py, path, start, size, 0, expansions)?;
-        let mut layouts = Vec::new();
-        let mut previous_html = main.value.html.clone();
+        let mut layouts: Vec<Arc<Page>> = Vec::new();
         for layout in 1..self.layout_count {
             let candidate = self.source_page(py, path, start, size, layout, expansions)?;
-            if candidate.value.html != previous_html {
-                previous_html = candidate.value.html.clone();
+            let previous = layouts.last().unwrap_or(&main);
+            if candidate.value.html != previous.value.html {
                 layouts.push(candidate);
             }
         }
@@ -325,29 +383,126 @@ impl PythonMathMLViewer {
         if self.source.is_none() {
             return Err(PyRuntimeError::new_err("This expression viewer is closed"));
         }
-        let p = &self.navigation.position;
-        let key = CacheKey {
-            path: p.path.clone(),
-            start: p.start,
-            size: p.size,
-            expanded: self.navigation.expanded.clone(),
-        };
-        let pages = if let Some(index) = self.cache.iter().position(|(k, _)| k == &key) {
-            self.cache.remove(index).unwrap().1
-        } else {
-            let expansions = self.expansions();
-            self.pages(py, &p.path, p.start, p.size, &expansions)?
-        };
-        self.cache.push_back((key, pages.clone()));
-        while self.cache.len() > 3 {
-            self.cache.pop_front();
+        self.prepare_automatic_preview(py)?;
+        let p = self.navigation.position.clone();
+        self.pages(py, &p.path, p.start, p.size, &self.expansions())
+    }
+
+    fn current_page(&mut self, py: Python<'_>, layout: usize) -> PyResult<Arc<Page>> {
+        self.prepare_automatic_preview(py)?;
+        let p = self.navigation.position.clone();
+        self.source_page(py, &p.path, p.start, p.size, layout, &self.expansions())
+    }
+
+    fn selected_current_page(&mut self, py: Python<'_>, layout: usize) -> PyResult<Arc<Page>> {
+        if layout >= self.layout_count {
+            return Err(invalid("Unknown layout"));
         }
-        Ok(pages)
+        self.prepare_automatic_preview(py)?;
+        let p = self.navigation.position.clone();
+        let expansions = self.expansions();
+        // Preserve provider visitation order for a cold request: scoped
+        // printers may allocate aliases while producing the earlier layouts.
+        // Later alternatives need not be rendered just to obtain the selected
+        // page's omission capabilities. Warm requests share these cached pages.
+        let mut previous = self.source_page(py, &p.path, p.start, p.size, 0, &expansions)?;
+        if layout == 0 {
+            return Ok(previous);
+        }
+        for index in 1..layout {
+            previous = self.source_page(py, &p.path, p.start, p.size, index, &expansions)?;
+        }
+        let page = self.source_page(py, &p.path, p.start, p.size, layout, &expansions)?;
+        // pages() exposes an alternative only when its HTML differs from the
+        // preceding layout, including runs of identical omitted alternatives.
+        if page.value.html == previous.value.html {
+            return Err(invalid("Unknown layout"));
+        }
+        Ok(page)
+    }
+
+    fn prepare_automatic_preview(&mut self, py: Python<'_>) -> PyResult<()> {
+        if !self.navigation.automatic_product_preview {
+            return Ok(());
+        }
+        let p = self.navigation.position.clone();
+        if !p.path.is_empty()
+            || p.start != 0
+            || p.size != 25
+            || !self.navigation.parents.is_empty()
+            || !self.navigation.expanded.is_empty()
+        {
+            self.navigation.automatic_product_preview = false;
+            return Ok(());
+        }
+        let initial = self.source_page(py, &[], 0, p.size, 0, &[])?;
+        let total = initial.value.total;
+        if initial.value.kind == "Product" && total > p.size && initial.value.end < total {
+            // Factor count is not a display budget. Try one bounded larger
+            // prefix, retaining interior omissions and the ordinary renderer's
+            // allocation limits. Indexed factors can need substantial markup
+            // while displaying little text, so judge those costs separately.
+            let requested = total.min(500);
+            let candidate = match self.source_page(py, &[], 0, requested, 0, &[]) {
+                Ok(candidate) => candidate,
+                // Optional probing must not break an otherwise valid preview.
+                // Keep failures retryable, as with every uncached source error.
+                Err(_) => return Ok(()),
+            };
+            let html = &candidate.value.html;
+            let elements = html
+                .as_bytes()
+                .windows(2)
+                .filter(|pair| pair[0] == b'<' && pair[1].is_ascii_alphabetic())
+                .take(2001)
+                .count();
+            let mut omissions = BTreeMap::new();
+            for marker in &initial.value.markers {
+                omissions
+                    .entry(marker.path.as_slice())
+                    .and_modify(|start: &mut usize| *start = (*start).min(marker.start))
+                    .or_insert(marker.start);
+            }
+            if candidate.value.kind == "Product"
+                && candidate.value.start == 0
+                && candidate.value.end > initial.value.end
+                && candidate.value.total == total
+                && html.matches("data-symbolica-marker=").count() == candidate.ids.len()
+                // Page validation already enforces the 256 KiB transfer bound.
+                // DOM work and visible content, not attribute bytes, determine
+                // whether this is still a compact automatic preview.
+                && elements <= 2000
+                && crate::printer::mathml::visible_cost(html, 768) <= 768
+                // More factors must not hide detail that was already visible.
+                // Each remaining omission must stay inside a previously
+                // omitted region, including the original root product tail.
+                && candidate.value.markers.iter().all(|marker| {
+                    (0..=marker.path.len()).any(|depth| {
+                        omissions.get(&marker.path[..depth]).is_some_and(|start| {
+                            marker.path.get(depth).copied().unwrap_or(marker.start) >= *start
+                        })
+                    })
+                })
+            {
+                let p = &mut self.navigation.position;
+                p.size = requested;
+                p.compact_size = requested;
+            }
+        }
+        // Successful renders, including rejected candidates, are shared with
+        // the ordinary bounded page cache. Do not probe again after navigation
+        // or after an explicit size selection restores the original 25 items.
+        self.navigation.automatic_product_preview = false;
+        Ok(())
     }
 
     fn expansions(&self) -> Vec<(Vec<usize>, usize)> {
-        let prefix = &self.navigation.position.path;
-        self.navigation
+        Self::navigation_expansions(&self.navigation)
+    }
+
+    fn navigation_expansions(navigation: &Navigation) -> Vec<(Vec<usize>, usize)> {
+        let prefix = &navigation.position.path;
+        navigation
             .expanded
             .iter()
             .filter_map(|(path, count)| {
@@ -358,14 +513,18 @@ impl PythonMathMLViewer {
     }
 
     fn can_collapse(&self) -> bool {
+        self.can_collapse_target(&self.navigation.position.path)
+    }
+
+    fn can_collapse_target(&self, target: &[usize]) -> bool {
         let p = &self.navigation.position;
         self.supports_expansion
-            && (p.size > p.compact_size
+            && ((target == p.path && p.size > p.compact_size)
                 || self
                     .navigation
                     .expanded
                     .keys()
-                    .any(|path| path.len() > p.path.len() && path.starts_with(&p.path)))
+                    .any(|path| path.len() > p.path.len() && path.starts_with(target)))
     }
 
     fn context(message: &Bound<'_, PyDict>) -> PyResult<Option<String>> {
@@ -376,12 +535,16 @@ impl PythonMathMLViewer {
             .transpose()
     }
 
-    fn selected(&mut self, py: Python<'_>, message: &Bound<'_, PyDict>) -> PyResult<Capability> {
-        let layout = message
+    fn requested_layout(message: &Bound<'_, PyDict>) -> PyResult<usize> {
+        Ok(message
             .get_item("layout")?
             .map(|v| integer(&v, "Unknown layout"))
             .transpose()?
-            .unwrap_or(0);
+            .unwrap_or(0))
+    }
+
+    fn selected(&mut self, py: Python<'_>, message: &Bound<'_, PyDict>) -> PyResult<Capability> {
+        let layout = Self::requested_layout(message)?;
         if let Some(context) = Self::context(message)? {
             let index = self
                 .popups
@@ -389,6 +552,11 @@ impl PythonMathMLViewer {
                 .position(|(name, _)| name == &context)
                 .ok_or_else(|| invalid("Unknown or expired popup"))?;
             let popup = &self.popups[index].1;
+            if popup.root_path != self.navigation.position.path
+                || popup.root_start != self.navigation.position.start
+            {
+                return Err(invalid("Unknown or expired popup"));
+            }
             let selected = if layout == 0 {
                 Some(&popup.main)
             } else {
@@ -412,14 +580,7 @@ impl PythonMathMLViewer {
             }
             Ok(selected)
         } else {
-            let pages = self.current(py)?;
-            let selected = if layout == 0 {
-                Some(&pages.main)
-            } else {
-                pages.layouts.iter().find(|p| p.layout == layout)
-            }
-            .ok_or_else(|| invalid("Unknown layout"))?;
-            Ok(selected.capability())
+            Ok(self.selected_current_page(py, layout)?.capability())
         }
     }
 
@@ -432,12 +593,157 @@ impl PythonMathMLViewer {
             .ok_or_else(|| invalid("Unknown subexpression"))
     }
 
+    fn expansion_target(&self, target: &MathMLMarker) -> PyResult<()> {
+        let prefix = &self.navigation.position.path;
+        if !self.supports_expansion {
+            return Err(invalid("this source does not support in-place expansion"));
+        }
+        if !target.path.starts_with(prefix) || target.path.len() - prefix.len() >= 64 {
+            return Err(invalid(
+                "subexpression is outside the current expansion range",
+            ));
+        }
+        Ok(())
+    }
+
+    fn show_all(
+        &mut self,
+        py: Python<'_>,
+        target: &MathMLMarker,
+        total: Option<usize>,
+    ) -> PyResult<Option<Navigation>> {
+        self.expansion_target(target)?;
+        let total = match total.or_else(|| {
+            self.cache.iter().rev().find_map(|(key, page, _)| {
+                (key.path == target.path && key.layout == 0 && key.expansions.is_empty())
+                    .then_some(page.value.total)
+            })
+        }) {
+            Some(total) => total,
+            None => {
+                self.source_page(py, &target.path, 0, 1, 0, &[])?
+                    .value
+                    .total
+            }
+        };
+        if !(1..=500).contains(&total) {
+            return Ok(None);
+        }
+        let mut navigation = self.navigation.clone();
+        let p = &mut navigation.position;
+        if target.path == p.path {
+            p.start = 0;
+            p.previous.clear();
+            p.size = 500;
+        } else {
+            navigation.expanded.insert(target.path.clone(), 500);
+            let complete = self.source_page(py, &target.path, 0, 500, 0, &[])?;
+            if complete.value.start != 0
+                || complete.value.end != total
+                || !complete.value.markers.is_empty()
+                // Native providers intentionally drop un-navigable root
+                // capabilities; their omission remains visible in the HTML.
+                || complete.value.html.contains("data-symbolica-marker=")
+            {
+                return Ok(None);
+            }
+        }
+        if navigation == self.navigation {
+            return Ok(None);
+        }
+        // A subtree that fits by itself can still exhaust the enclosing page's
+        // budget. Certify the actual in-place expansion using the existing
+        // renderer limits, and keep that render in the ordinary page cache.
+        let p = &navigation.position;
+        let candidate = self.source_page(
+            py,
+            &p.path,
+            p.start,
+            p.size,
+            0,
+            &Self::navigation_expansions(&navigation),
+        )?;
+        if target.path == p.path {
+            if candidate.value.start != 0 || candidate.value.end != total {
+                return Ok(None);
+            }
+        }
+        if candidate
+            .value
+            .markers
+            .iter()
+            .any(|marker| marker.path.starts_with(&target.path))
+            || candidate
+                .value
+                .html
+                .matches("data-symbolica-marker=")
+                .count()
+                > candidate.value.markers.len()
+        {
+            return Ok(None);
+        }
+        let ancestors = candidate
+            .value
+            .markers
+            .iter()
+            .filter(|marker| {
+                marker.path.len() < target.path.len() && target.path.starts_with(&marker.path)
+            })
+            .collect::<Vec<_>>();
+        if !ancestors.is_empty() {
+            let original = self.navigation.position.clone();
+            let before = self.source_page(
+                py,
+                &original.path,
+                original.start,
+                original.size,
+                0,
+                &self.expansions(),
+            )?;
+            // Providers own path semantics: a matrix's child ID is a flattened
+            // cell index, while its page offsets count rows. An existing tail
+            // is harmless only when the target was directly visible before
+            // expansion and that tail has not grown to hide earlier items.
+            if !before
+                .value
+                .markers
+                .iter()
+                .any(|marker| marker.path == target.path)
+                || ancestors.iter().any(|after| {
+                    !before
+                        .value
+                        .markers
+                        .iter()
+                        .any(|before| before.path == after.path && before.start <= after.start)
+                })
+            {
+                return Ok(None);
+            }
+        }
+        Ok(Some(navigation))
+    }
+
     fn action(&mut self, py: Python<'_>, message: &Bound<'_, PyDict>) -> PyResult<Py<PyDict>> {
         let page = self.selected(py, message)?;
         let action: Option<String> = message
             .get_item("action")?
             .map(|v| v.extract())
             .transpose()?;
+        if matches!(
+            action.as_deref(),
+            Some(
+                "next"
+                    | "previous"
+                    | "size"
+                    | "expand"
+                    | "expand_all"
+                    | "collapse"
+                    | "open"
+                    | "back"
+            )
+        ) {
+            self.navigation.automatic_product_preview = false;
+        }
         match action.as_deref() {
             Some("next") => {
                 if let Some(next) = page.next {
@@ -460,10 +766,8 @@ impl PythonMathMLViewer {
                 p.previous.clear();
             }
             Some("expand") => {
-                if !self.supports_expansion {
-                    return Err(invalid("this source does not support in-place expansion"));
-                }
                 let target = Self::target(&page, message)?;
+                self.expansion_target(&target)?;
                 let size = size(message, "size", self.navigation.position.size)?;
                 if target.path == self.navigation.position.path {
                     self.navigation.position.size = 500.min(self.navigation.position.size + size);
@@ -472,29 +776,49 @@ impl PythonMathMLViewer {
                     *count = 500.min((*count).max(target.start).saturating_add(size));
                 }
             }
+            Some("expand_all") => {
+                let target = Self::target(&page, message)?;
+                self.navigation = self.show_all(py, &target, None)?.ok_or_else(|| {
+                    invalid("this subexpression does not fit completely within the display limits")
+                })?;
+            }
             Some("collapse") => {
                 if !self.supports_expansion {
                     return Err(invalid("this source does not support in-place expansion"));
                 }
-                let p = &mut self.navigation.position;
-                p.size = p.compact_size;
-                p.start = 0;
-                p.previous.clear();
-                self.navigation
-                    .expanded
-                    .retain(|path, _| path.len() <= p.path.len() || !path.starts_with(&p.path));
+                if message.contains("value")? {
+                    let target = Self::target(&page, message)?;
+                    self.expansion_target(&target)?;
+                    let p = &mut self.navigation.position;
+                    if target.path == p.path {
+                        p.size = p.compact_size;
+                    }
+                    self.navigation.expanded.retain(|path, _| {
+                        path.len() <= p.path.len() || !path.starts_with(&target.path)
+                    });
+                } else {
+                    let p = &mut self.navigation.position;
+                    p.size = p.compact_size;
+                    p.start = 0;
+                    p.previous.clear();
+                    self.navigation
+                        .expanded
+                        .retain(|path, _| path.len() <= p.path.len() || !path.starts_with(&p.path));
+                }
             }
             Some("open") => {
                 let target = Self::target(&page, message)?;
                 let size = size(message, "size", self.navigation.position.size)?;
+                let start = offset(message, target.start)?;
                 self.navigation
                     .parents
                     .push(self.navigation.position.clone());
                 self.navigation.position = Position {
                     path: target.path,
+                    start,
+                    previous: if start > 0 { vec![0] } else { Vec::new() },
                     size,
                     compact_size: size,
-                    ..Position::default()
                 };
             }
             Some("back") => {
@@ -516,20 +840,24 @@ impl PythonMathMLViewer {
             .transpose()?
             .unwrap_or(false);
         let (start, size) = if popup {
-            let start = message
-                .get_item("start")?
-                .map(|v| integer(&v, "Invalid preview offset"))
-                .transpose()?
-                .unwrap_or(0);
-            if start as u128 >= 1u128 << 63 {
-                return Err(invalid("Invalid preview offset"));
-            }
+            let start = offset(message, target.start)?;
             (start, size(message, "size", self.navigation.position.size)?)
         } else {
             (target.start, self.navigation.position.size.min(5))
         };
         let pages = self.pages(py, &target.path, start, size, &[])?;
         let dict = pages.to_dict(py)?;
+        dict.set_item("can_collapse", self.can_collapse_target(&target.path))?;
+        dict.set_item(
+            "can_show_all",
+            popup
+                && self.supports_expansion
+                && self
+                    .show_all(py, &target, Some(pages.main.value.total))
+                    .ok()
+                    .flatten()
+                    .is_some(),
+        )?;
         let p = &self.navigation.position;
         let shown = if target.path == p.path {
             p.size
@@ -552,8 +880,10 @@ impl PythonMathMLViewer {
             context,
             Popup {
                 main: pages.main.capability(),
-                layouts: pages.layouts.iter().map(Page::capability).collect(),
+                layouts: pages.layouts.iter().map(|p| p.capability()).collect(),
                 origin: Self::context(message)?,
+                root_path: self.navigation.position.path.clone(),
+                root_start: self.navigation.position.start,
             },
         ));
         while self.popups.len() > 32 {
@@ -564,6 +894,7 @@ impl PythonMathMLViewer {
 
     fn clear_pages(&mut self) {
         self.cache.clear();
+        self.cache_bytes = 0;
         self.popups.clear();
         self.last_page = None;
     }
@@ -617,13 +948,14 @@ impl PythonMathMLViewer {
 #[pymethods]
 impl PythonMathMLViewer {
     #[new]
-    #[pyo3(signature = (source, page_size=25, *, layout_count=1, supports_expansion=false))]
+    #[pyo3(signature = (source, page_size=25, *, layout_count=1, supports_expansion=false, _automatic_product_preview=false))]
     fn new(
         py: Python<'_>,
         source: Py<PyAny>,
         #[pyo3(from_py_with=page_size)] page_size: usize,
         #[pyo3(from_py_with=layout_count)] layout_count: usize,
         supports_expansion: bool,
+        _automatic_product_preview: bool,
     ) -> PyResult<Self> {
         if !source
             .bind(py)
@@ -653,8 +985,10 @@ impl PythonMathMLViewer {
                 },
                 parents: Vec::new(),
                 expanded: BTreeMap::new(),
+                automatic_product_preview: _automatic_product_preview,
             },
             cache: VecDeque::new(),
+            cache_bytes: 0,
             popups: VecDeque::new(),
             serial: 0,
             views: HashSet::new(),
@@ -814,9 +1148,8 @@ impl PythonMathMLViewer {
         Ok(dict.unbind())
     }
 
-    fn _render_page(&self, py: Python<'_>, layout: usize) -> PyResult<Py<PyDict>> {
-        let p = &self.navigation.position;
-        self.source_page(py, &p.path, p.start, p.size, layout, &self.expansions())?
+    fn _render_page(&mut self, py: Python<'_>, layout: usize) -> PyResult<Py<PyDict>> {
+        self.current_page(py, layout)?
             .to_dict(py)
             .map(Bound::unbind)
     }
@@ -826,17 +1159,17 @@ impl PythonMathMLViewer {
         py: Python<'_>,
         message: &Bound<'_, PyDict>,
     ) -> PyResult<Py<PyDict>> {
-        let layout = self.selected(py, message)?.layout;
-        let pages = self.current(py)?;
+        let layout = if Self::context(message)?.is_some() {
+            self.selected(py, message)?.layout
+        } else {
+            Self::requested_layout(message)?
+        };
         if layout == 0 {
             return self._page(py);
         }
-        let page = pages
-            .layouts
-            .iter()
-            .find(|p| p.layout == layout)
-            .ok_or_else(|| invalid("Unknown layout"))?;
-        page.to_dict(py).map(Bound::unbind)
+        self.selected_current_page(py, layout)?
+            .to_dict(py)
+            .map(Bound::unbind)
     }
 
     fn _action(&mut self, py: Python<'_>, message: &Bound<'_, PyDict>) -> PyResult<Py<PyDict>> {
@@ -940,8 +1273,8 @@ impl PythonMathMLViewer {
     }
 
     fn _repr_html_(&mut self, py: Python<'_>) -> PyResult<String> {
-        let pages = self.current(py)?;
-        let page = &pages.main.value;
+        let current = self.current_page(py, 0)?;
+        let page = &current.value;
         let html = super::scrollable_html(&page.html);
         if page.start == 0 && page.end == page.total && page.markers.is_empty() {
             return Ok(html);

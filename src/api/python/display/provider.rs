@@ -178,6 +178,7 @@ impl NativePageSource {
 pub struct MathMLViewer {
     source: Box<dyn MathMLPageSource>,
     page_size: usize,
+    automatic_product_preview: bool,
     layout_count: usize,
     supports_expansion: bool,
 }
@@ -187,6 +188,7 @@ impl MathMLViewer {
         Self {
             source: Box::new(source),
             page_size: 25,
+            automatic_product_preview: false,
             layout_count: 1,
             supports_expansion: false,
         }
@@ -195,6 +197,18 @@ impl MathMLViewer {
     /// Set the requested page size (1..=500), checked by `into_python`.
     pub fn page_size(mut self, size: usize) -> Self {
         self.page_size = size;
+        self.automatic_product_preview = false;
+        self
+    }
+
+    /// Let an automatic initial product preview include more compact factors.
+    /// One bounded prefix of at most 500 factors is tried. A longer result is
+    /// retained only when its visible content and markup fit the display limits,
+    /// without hiding existing detail. Explicit sizes and later navigation keep
+    /// their ordinary limits.
+    pub fn automatic_product_preview(mut self) -> Self {
+        self.page_size = 25;
+        self.automatic_product_preview = true;
         self
     }
 
@@ -217,12 +231,13 @@ impl MathMLViewer {
                 source: Mutex::new(self.source),
             },
         )?;
-        super::mathml_viewer(
+        super::mathml_viewer_with_preview(
             py,
             source.into_any(),
             self.page_size,
             self.layout_count,
             self.supports_expansion,
+            self.automatic_product_preview,
         )
     }
 }

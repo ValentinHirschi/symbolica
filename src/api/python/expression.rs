@@ -4462,33 +4462,34 @@ impl PythonExpression {
         include: Option<Vec<String>>,
         exclude: Option<Vec<String>>,
     ) -> PyResult<Py<PyAny>> {
-        display::formatted(
-            py,
-            slf,
-            display::default_options(),
-            crate::printer::mathml::DEFAULT_PAGE_SIZE,
-        )?
-        ._repr_mimebundle_(py, include, exclude)
+        display::formatted_preview(py, slf, display::default_options())?
+            ._repr_mimebundle_(py, include, exclude)
     }
 
     /// Create a bounded MathML viewer without importing notebook or widget packages.
     /// Use its page(), handle_message(), and javascript() methods to connect a
     /// custom frontend. The viewer retains the expression until close() is called.
-    #[pyo3(signature = (page_size=25))]
+    /// With page_size=None, a compact product may extend the initial
+    /// 25-factor preview when it fits the output budget. An explicit size remains
+    /// the maximum number of items on a page.
+    #[pyo3(signature = (page_size=None))]
     #[gen_stub(override_return_type(type_repr = "MathMLViewer"))]
-    pub fn mathml_viewer(slf: Py<Self>, py: Python<'_>, page_size: usize) -> PyResult<Py<PyAny>> {
-        display::viewer(py, slf, display::default_options(), page_size)
+    pub fn mathml_viewer(
+        slf: Py<Self>,
+        py: Python<'_>,
+        page_size: Option<usize>,
+    ) -> PyResult<Py<PyAny>> {
+        let viewer = display::MathMLViewer::expression(slf, display::default_options(), None);
+        match page_size {
+            Some(size) => viewer.page_size(size),
+            None => viewer.automatic_product_preview(),
+        }
+        .into_python(py)
     }
 
     /// Return native MathML or a live pager in marimo notebooks.
     pub fn _display_(slf: Py<Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        display::formatted(
-            py,
-            slf,
-            display::default_options(),
-            crate::printer::mathml::DEFAULT_PAGE_SIZE,
-        )?
-        ._display_(py)
+        display::formatted_preview(py, slf, display::default_options())?._display_(py)
     }
 
     /// Convert the expression into a LaTeX representation.

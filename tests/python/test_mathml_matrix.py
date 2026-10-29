@@ -45,9 +45,9 @@ class MatrixMathMLTests(unittest.TestCase):
             viewer.handle_message({'action': 'collapse'})
             _, part = viewer.handle_message({'action': 'open', 'value': [0], 'layout': 2})
             self.assertEqual(part['total'], 101)
-            self.assertEqual(part['end'], 7)
+            self.assertEqual((part['start'], part['end']), (1, 8))
             _, following = viewer.handle_message({'action': 'next'})
-            self.assertEqual((following['start'], following['end']), (7, 14))
+            self.assertEqual((following['start'], following['end']), (8, 15))
             viewer.handle_message({'action': 'back'})
             _, other = viewer.handle_message({'action': 'open', 'value': [1]})
             self.assertEqual(other['total'], 91)
@@ -64,7 +64,7 @@ class MatrixMathMLTests(unittest.TestCase):
             for part, count in [(0, 41), (1, 36)]:
                 _, page = viewer.handle_message({'action': 'open', 'value': [1, part]})
                 self.assertEqual(page['total'], count)
-                self.assertEqual(page['end'], 7)
+                self.assertEqual((page['start'], page['end']), (7, 14))
                 viewer.handle_message({'action': 'back'})
         finally:
             viewer.close()
