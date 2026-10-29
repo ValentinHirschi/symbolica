@@ -201,10 +201,11 @@ impl MathMLViewer {
         self
     }
 
-    /// Let an automatic initial product preview include a small complete tail.
-    /// At most one extra 25-factor page is tried, and only complete results
-    /// within the initial output limits are retained. Explicit page sizes and
-    /// later navigation keep their ordinary limits.
+    /// Let an automatic initial product preview include more compact factors.
+    /// One bounded prefix of at most 500 factors is tried. A longer result is
+    /// retained only when its visible content and markup fit the display limits,
+    /// without hiding existing detail. Explicit sizes and later navigation keep
+    /// their ordinary limits.
     pub fn automatic_product_preview(mut self) -> Self {
         self.page_size = 25;
         self.automatic_product_preview = true;

@@ -39,7 +39,7 @@ def omission_page(case):
         factors.append(f'<mrow data-symbolica-factor="" data-test-factor="{index}">'
                        + separator + value + '</mrow>')
     tail = ('<mrow data-symbolica-factor="" data-test-factor="tail">'
-            '<mo form="infix">×</mo><mtext data-symbolica-marker="0">[1]</mtext></mrow>')
+            '<mo form="infix">×</mo><mspace width="0.25em"/><mtext data-symbolica-marker="0">[1]</mtext></mrow>')
     # Static output may already have an omission row. The browser must treat
     # it as the last factor, including when it fits beside the preceding one.
     product = ('<mtable data-symbolica-product="" data-test-product="" '
@@ -84,6 +84,9 @@ MEASURE = '''host => {
   const visible = node => node.getBoundingClientRect().width > 0;
   const nested = content.querySelector('[data-test-nested]');
   const fraction = content.querySelector('mfrac');
+  const cross = [...last.row.querySelectorAll('mo')].filter(node=>
+    node.textContent==='×' && visible(node)).at(-1);
+  const markerText = button.parentElement;
   const rect = node => {
     const r=node.getBoundingClientRect();
     return {left:r.left,right:r.right,top:r.top,bottom:r.bottom,width:r.width};
@@ -96,6 +99,8 @@ MEASURE = '''host => {
     tailFirst:tail===last.factors[0],
     tailOperator:tail.firstElementChild.textContent,
     tailOperatorVisible:visible(tail.firstElementChild),
+    markerGap:markerText.getBoundingClientRect().left-cross.getBoundingClientRect().right,
+    markerGapEm:parseFloat(getComputedStyle(cross).fontSize),
     prefixOperators:prefix ? [...prefix.querySelectorAll('mo')].filter(visible).map(n=>n.textContent) : [],
     tailRowCrosses:[...last.row.querySelectorAll('mo')]
       .filter(node=>node.closest('mtable[data-symbolica-product]')===product
@@ -182,6 +187,11 @@ class ProductOmissionTests(unittest.IsolatedAsyncioTestCase):
                     self.assertTrue(state['markerInsideProduct'], state)
                     self.assertTrue(state['markerIsLast'], state)
                     self.assertEqual(state['tailOperator'], '×', state)
+                    # Inline omissions and marker-only continuations use the
+                    # same explicit quarter-em gap, without counting the
+                    # button's independent one-pixel focus/border margin.
+                    self.assertAlmostEqual(state['markerGap'], .25 * state['markerGapEm'],
+                                           delta=.5, msg=state)
                     self.assertLessEqual(state['scroll'], state['viewport'] + 2, state)
                     self.assertGreaterEqual(state['marker']['left'], state['lastRow']['left'] - 1, state)
                     self.assertLessEqual(state['marker']['right'], state['lastRow']['right'] + 1, state)

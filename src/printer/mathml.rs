@@ -110,6 +110,54 @@ struct FractionParts {
     denominator: ProductFactor,
 }
 
+// Estimate the visible token count, independently of the size of MathML markup.
+// Stop as soon as the caller's budget is exceeded. Whitespace inside text tokens
+// and character entities retain their existing row-packing cost.
+pub(crate) fn visible_cost(fragment: &str, budget: usize) -> usize {
+    let mut cost = 0;
+    let mut tag = false;
+    let mut tag_start = 0;
+    let mut token_depth = 0usize;
+    let mut entity = false;
+    for (position, c) in fragment.char_indices() {
+        match c {
+            '<' => {
+                tag = true;
+                tag_start = position + 1;
+            }
+            '>' => {
+                let markup = &fragment[tag_start..position];
+                let name = markup
+                    .trim_start_matches('/')
+                    .split(|c: char| c.is_ascii_whitespace() || c == '/')
+                    .next()
+                    .unwrap_or_default();
+                if matches!(name, "mi" | "mn" | "mo" | "mtext" | "ms") {
+                    if markup.starts_with('/') {
+                        token_depth = token_depth.saturating_sub(1);
+                    } else if !markup.trim_end().ends_with('/') {
+                        token_depth += 1;
+                    }
+                }
+                tag = false;
+            }
+            _ if tag => (),
+            '&' => entity = true,
+            ';' if entity => {
+                entity = false;
+                cost += 1;
+            }
+            _ if entity => (),
+            _ if token_depth == 0 && c.is_ascii_whitespace() => (),
+            _ => cost += 1,
+        }
+        if cost > budget {
+            break;
+        }
+    }
+    cost
+}
+
 impl Renderer<'_, '_> {
     fn row(body: String) -> String {
         format!("<mrow>{body}</mrow>")
@@ -135,53 +183,6 @@ impl Renderer<'_, '_> {
     }
     fn token(tag: &str, text: &str) -> String {
         format!("<{tag}>{}</{tag}>", AnsiHtmlFormatter::escape_html(text))
-    }
-
-    // A bounded estimate for grouping already-rendered factors into native MathML
-    // rows. Ignore XML indentation, but retain whitespace inside text tokens.
-    fn visible_cost(fragment: &str) -> usize {
-        let mut cost = 0;
-        let mut tag = false;
-        let mut tag_start = 0;
-        let mut token_depth = 0usize;
-        let mut entity = false;
-        for (position, c) in fragment.char_indices() {
-            match c {
-                '<' => {
-                    tag = true;
-                    tag_start = position + 1;
-                }
-                '>' => {
-                    let markup = &fragment[tag_start..position];
-                    let name = markup
-                        .trim_start_matches('/')
-                        .split(|c: char| c.is_ascii_whitespace() || c == '/')
-                        .next()
-                        .unwrap_or_default();
-                    if matches!(name, "mi" | "mn" | "mo" | "mtext" | "ms") {
-                        if markup.starts_with('/') {
-                            token_depth = token_depth.saturating_sub(1);
-                        } else if !markup.trim_end().ends_with('/') {
-                            token_depth += 1;
-                        }
-                    }
-                    tag = false;
-                }
-                _ if tag => (),
-                '&' => entity = true,
-                ';' if entity => {
-                    entity = false;
-                    cost += 1;
-                }
-                _ if entity => (),
-                _ if token_depth == 0 && c.is_ascii_whitespace() => (),
-                _ => cost += 1,
-            }
-            if cost > PRODUCT_ROW_COST {
-                break;
-            }
-        }
-        cost
     }
 
     fn real_number(&self, text: &str, parts: &mut Option<FractionParts>) -> String {
@@ -482,8 +483,15 @@ impl Renderer<'_, '_> {
                 }
             }
         };
+        // Leading MathML operators do not reliably honor rspace in browsers.
+        // Use the same explicit gap as a product continuation in the viewer.
+        let gap = if matches!(atom, AtomView::Mul(_)) {
+            "<mspace width=\"0.25em\"/>"
+        } else {
+            ""
+        };
         format!(
-            "<mrow><mo form=\"infix\">{marker_type}</mo><mtext data-symbolica-marker=\"{index}\">[{}]</mtext></mrow>",
+            "<mrow><mo form=\"infix\">{marker_type}</mo>{gap}<mtext data-symbolica-marker=\"{index}\">[{}]</mtext></mrow>",
             index + 1
         )
     }
@@ -1245,7 +1253,7 @@ impl Renderer<'_, '_> {
                     factor.html
                 };
                 if multiline {
-                    let cost = Self::visible_cost(&factor)
+                    let cost = visible_cost(&factor, PRODUCT_ROW_COST)
                         + usize::from(i > 0)
                         + usize::from(leading_sign && i == 0);
                     if !result.is_empty() && row_cost + cost > PRODUCT_ROW_COST {
@@ -2802,13 +2810,28 @@ mod tests {
     fn visible_cost_ignores_indentation_but_preserves_token_spaces() {
         let compact = "<msubsup><mi>k</mi><mn>0</mn><mi>μ</mi></msubsup>";
         let pretty = "<msubsup>\n    <mi>k</mi>\n    <mn>0</mn>\n    <mi>μ</mi>\n</msubsup>\n";
-        assert_eq!(Renderer::visible_cost(compact), 3);
-        assert_eq!(Renderer::visible_cost(pretty), 3);
-        assert_eq!(Renderer::visible_cost("<mtext>a b</mtext>"), 3);
-        assert_eq!(Renderer::visible_cost("<mtext>a\u{a0}b</mtext>"), 3);
+        assert_eq!(visible_cost(compact, PRODUCT_ROW_COST), 3);
+        assert_eq!(visible_cost(pretty, PRODUCT_ROW_COST), 3);
+        assert_eq!(visible_cost("<mtext>a b</mtext>", PRODUCT_ROW_COST), 3);
+        assert_eq!(visible_cost("<mtext>a\u{a0}b</mtext>", PRODUCT_ROW_COST), 3);
         assert_eq!(
-            Renderer::visible_cost("<mrow>\n<mi>x</mi>\n<mo>&#x2062;</mo>\n</mrow>"),
+            visible_cost(
+                "<mrow>\n<mi>x</mi>\n<mo>&#x2062;</mo>\n</mrow>",
+                PRODUCT_ROW_COST
+            ),
             2
+        );
+    }
+
+    #[test]
+    fn visible_cost_separates_markup_and_stops_at_the_requested_budget() {
+        let token = format!("<mi data-label=\"{}\">μ</mi>", "x".repeat(16_384));
+        assert_eq!(visible_cost(&token, 768), 1);
+        assert_eq!(visible_cost(&token.repeat(50), 768), 50);
+        assert_eq!(visible_cost(&"<mi>μ</mi>".repeat(1000), 768), 769);
+        assert_eq!(
+            visible_cost(&"<mi>μ</mi>".repeat(100), PRODUCT_ROW_COST),
+            49
         );
     }
 
@@ -2912,7 +2935,7 @@ mod tests {
             .map(|i| format!("x{i}"))
             .collect::<Vec<_>>()
             .join("*");
-        let tail = "<mrow data-symbolica-factor=\"\"><mo form=\"infix\">×</mo><mtext data-symbolica-marker=\"0\">[1]</mtext></mrow>";
+        let tail = "<mrow data-symbolica-factor=\"\"><mo form=\"infix\">×</mo><mspace width=\"0.25em\"/><mtext data-symbolica-marker=\"0\">[1]</mtext></mrow>";
         for (input, fraction, negative) in [
             (product.clone(), false, false),
             (format!("-3*({product})/8"), true, true),
@@ -2984,7 +3007,7 @@ mod tests {
         assert_eq!(page.markers[0].start, 2);
         assert!(
             page.html
-                .contains("</mfrac><mrow><mo form=\"infix\">×</mo>"),
+                .contains("</mfrac><mrow><mo form=\"infix\">×</mo><mspace width=\"0.25em\"/>"),
             "{}",
             page.html
         );
