@@ -32,7 +32,10 @@ not the exact final HTML size or DOM element count. Expansion can increase the
 allowance up to 256 KiB and 16,000 units. Individual leaves remain bounded.
 
 After wrapping, the browser targets an initial height of about eight ordinary
-math lines (12 em). It chooses a shorter prefix of complete terms when possible;
+math lines (12 em). A complete expression with no omissions can use another
+two lines (15 em total), avoiding several markers just to save a small amount
+of height. Partial previews keep the ordinary target, regardless of how much
+markup they contain. It chooses a shorter prefix of complete terms when possible;
 it does not meet the height target by hiding small factors inside those terms.
 The target is soft: if no suitable shorter alternative exists, the taller
 expression remains visible. Show more, Show all and inspection bypass this
