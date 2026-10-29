@@ -164,7 +164,9 @@ impl Renderer<'_, '_> {
     }
     fn fence(body: String) -> String {
         // Natural-size parentheses avoid the extra advance reserved for
-        // stretchy operators in browsers. Keep stretching for tall content.
+        // stretchy operators in browsers. Keep stretching for tall content
+        // and omissions: browser refinement can replace a compact subtree
+        // with a multiline one without replacing its surrounding fences.
         let tall = [
             "<mfrac",
             "<msqrt",
@@ -177,7 +179,8 @@ impl Renderer<'_, '_> {
             "<mmultiscripts",
         ]
         .iter()
-        .any(|tag| body.contains(tag));
+        .any(|tag| body.contains(tag))
+            || body.contains("data-symbolica-marker=");
         let size = if tall { "" } else { " stretchy=\"false\"" };
         Self::row(format!("<mo{size}>(</mo>{body}<mo{size}>)</mo>"))
     }
@@ -316,7 +319,9 @@ impl Renderer<'_, '_> {
             symbol
                 .format_with_custom(self.opts, PrintState::new(), false, &mut name)
                 .ok()?;
-            let cost = name.chars().take(budget + 1).count().max(1);
+            // MathML symbol formatting includes tags and escaped entities.
+            // Only its displayed text contributes to this cheap estimate.
+            let cost = visible_cost(&name, budget).max(1);
             (cost <= budget).then_some(cost)
         };
         let mut cost = match atom {
@@ -368,7 +373,7 @@ impl Renderer<'_, '_> {
     // and their budget charges on success, so callbacks are never repeated.
     // The few-glyph allowance favors readable notation; the browser still
     // selects the responsive layout using actual measured widths.
-    fn compact_semantic_tail(
+    fn compact_tail(
         &mut self,
         atom: AtomView<'_>,
         path: &mut Vec<usize>,
@@ -376,7 +381,7 @@ impl Renderer<'_, '_> {
         start: usize,
         state: PrintState,
     ) -> Vec<(String, Option<FractionParts>)> {
-        if self.semantic.is_none() || depth == 0 {
+        if depth == 0 {
             return vec![];
         }
         self.compact_rendered_tail(atom, path, depth, start..atom.mathml_child_count(), state)
@@ -403,19 +408,27 @@ impl Renderer<'_, '_> {
         self.probing_compact_tail = true;
         let mut tail = Vec::new();
         let mut visible = String::new();
+        // A product omission includes a cross, spacing and a numbered button.
+        // Keep short powers visible when replacing them saves little width.
+        let product = matches!(atom, AtomView::Mul(_));
+        let glyph_budget = if product { 6 } else { 4 };
         for (i, child) in MathMlChildren::new(atom, range.start, self.cursors).take(range.len()) {
             path.push(i);
             let mut parts = None;
             let html = self.render_factor(child, path, depth + 1, &mut parts, state);
             path.pop();
             if !tail.is_empty() {
-                visible.push_str("<mo>,</mo>");
+                visible.push_str(if product {
+                    "<mspace width=\"0.167em\"/>"
+                } else {
+                    "<mo>,</mo>"
+                });
             }
             visible.push_str(&html);
             if self.failed
                 || self.budget_exhausted
                 || self.markers.len() != checkpoint.2
-                || !compact::fits(&visible, 4)
+                || !compact::fits(&visible, glyph_budget)
             {
                 self.restore(checkpoint);
                 self.probing_compact_tail = false;
@@ -926,6 +939,17 @@ impl Renderer<'_, '_> {
         let expanded_sum = depth > 0
             && matches!(atom, AtomView::Add(_))
             && (self.multiline_sums || self.expansions.iter().any(|(p, _)| p == path));
+        let previous_nested_limit = self.nested_limit;
+        if matches!(atom, AtomView::Add(_))
+            && ((depth == 0 && limit > DEFAULT_PAGE_SIZE)
+                || self.expansions.iter().any(|(p, _)| p == path))
+        {
+            // Show more asks for additional complete terms. Responsive
+            // alternatives must not pay for them by folding each term's
+            // factors. Keep the ordinary node/text/depth bounds: if a term
+            // exhausts them, the loop retains one navigable sum suffix.
+            self.nested_limit = LAYOUTS[0].0;
+        }
         let mut expanded_terms = Vec::new();
         let markers_before = self.markers.len();
         let mut arguments = Vec::new();
@@ -946,7 +970,7 @@ impl Renderer<'_, '_> {
             }
             if i == start + limit {
                 tail = self
-                    .compact_semantic_tail(atom, path, depth, i, self.state_at(depth + 1))
+                    .compact_tail(atom, path, depth, i, self.state_at(depth + 1))
                     .into_iter();
             }
             let preview = if i >= start + limit {
@@ -1051,6 +1075,7 @@ impl Renderer<'_, '_> {
         let columns = self
             .nested_limit
             .clamp(2, if self.multiline_sums { 6 } else { 8 });
+        self.nested_limit = previous_nested_limit;
         if expanded_sum && expanded_terms.len() > columns {
             body = "<mtable data-symbolica-sum=\"\" columnalign=\"left\" rowspacing=\"0.35em\">"
                 .to_owned();
@@ -1133,9 +1158,7 @@ impl Renderer<'_, '_> {
                 break;
             }
             if i == start + limit {
-                tail = self
-                    .compact_semantic_tail(atom, path, depth, i, state)
-                    .into_iter();
+                tail = self.compact_tail(atom, path, depth, i, state).into_iter();
             }
             let preview = if let Some(tail) = &mut reserved_tail {
                 let Some(fragment) = tail.next() else {
@@ -1631,6 +1654,60 @@ mod tests {
     }
 
     #[test]
+    fn native_polynomial_tails_use_rendered_script_width() {
+        let expression = parse!("19380*x*y^3*z^16+q");
+        for layout in 0..LAYOUTS.len() {
+            let page =
+                expression
+                    .as_view()
+                    .render_mathml_layout(&PrintOptions::new(), 0, 25, layout, &[]);
+            assert!(page.markers.is_empty(), "layout {layout}: {}", page.html);
+            assert!(page.html.contains("<mn>16</mn>"));
+        }
+        let long = parse!("19380*x*long_variable_y^3*long_variable_z^16+q");
+        let page = long
+            .as_view()
+            .render_mathml_layout(&PrintOptions::new(), 0, 25, 5, &[]);
+        assert!(!page.markers.is_empty());
+    }
+
+    #[test]
+    fn expanded_sum_keeps_complete_terms_in_every_responsive_layout() {
+        let sum = parse!("(x+y+z+w)^20").expand();
+        let expression = &sum * parse!("1+a");
+        let cursors = MathMlCursorCache::new(expression.as_view());
+        let initial =
+            expression
+                .as_view()
+                .render_mathml_layout(&PrintOptions::new(), 0, 25, 1, &[]);
+        let omitted = initial
+            .markers
+            .iter()
+            .find(|marker| matches!(cursors.locate(&marker.path), Some(AtomView::Add(_))))
+            .unwrap();
+        let count = omitted.start + 25;
+        for layout in 0..LAYOUTS.len() {
+            let page = expression.as_view().render_mathml_layout(
+                &PrintOptions::new(),
+                0,
+                25,
+                layout,
+                &[(omitted.path.clone(), count)],
+            );
+            assert!(
+                page.markers
+                    .iter()
+                    .all(|marker| marker.path == omitted.path),
+                "layout {layout}: {}",
+                page.html
+            );
+            assert_eq!(page.markers.len(), 1);
+            assert_eq!(page.markers[0].start, count);
+            assert!(page.html.contains("data-symbolica-sum"));
+        }
+    }
+
+    #[test]
     fn scoped_atoms_precede_soft_abbreviation_and_keep_power_groups() {
         let fragment = "<mi>u</mi><mi>v</mi>";
         let target = crate::symbol!("mathml_scoped::target");
@@ -1811,13 +1888,7 @@ mod tests {
         for _ in 0..3 {
             assert!(
                 renderer
-                    .compact_semantic_tail(
-                        expression.as_view(),
-                        &mut vec![],
-                        1,
-                        0,
-                        PrintState::new(),
-                    )
+                    .compact_tail(expression.as_view(), &mut vec![], 1, 0, PrintState::new(),)
                     .is_empty()
             );
             assert_eq!(renderer.checkpoint(), before);
@@ -1863,7 +1934,7 @@ mod tests {
         let before = renderer.checkpoint();
         assert!(
             renderer
-                .compact_semantic_tail(expression.as_view(), &mut vec![], 1, 0, PrintState::new(),)
+                .compact_tail(expression.as_view(), &mut vec![], 1, 0, PrintState::new(),)
                 .is_empty()
         );
         assert_eq!(renderer.checkpoint(), before);
