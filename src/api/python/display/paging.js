@@ -1220,10 +1220,26 @@ function render({ model, el }) {
     }
   }
   let lastWidth = -1, frame;
+  let nearViewport = true, fitNeeded = false;
   const scheduleFit = () => {
+    fitNeeded = true;
     cancelAnimationFrame(frame);
-    frame = requestAnimationFrame(() => update(true));
+    if (!nearViewport) return;
+    frame = requestAnimationFrame(() => {
+      fitNeeded = false;
+      update(true);
+    });
   };
+  // A notebook resize affects every output, including those far offscreen.
+  // Keep their current layout and height until they approach the viewport.
+  // Navigation still updates immediately; only width/font refits are deferred.
+  const visibility = doc.defaultView.IntersectionObserver
+    ? new doc.defaultView.IntersectionObserver(entries => {
+      nearViewport = entries[entries.length - 1].isIntersecting;
+      if (!nearViewport) cancelAnimationFrame(frame);
+      else if (fitNeeded) scheduleFit();
+    }, { rootMargin: '300px' }) : null;
+  visibility?.observe(math);
   const observer = new ResizeObserver(entries => {
     const width = entries[0].contentRect.width;
     if (Math.abs(width - lastWidth) > 1) {
@@ -1250,6 +1266,7 @@ function render({ model, el }) {
     doc.defaultView.visualViewport?.removeEventListener('resize', schedulePosition);
     doc.defaultView.visualViewport?.removeEventListener('scroll', schedulePosition);
     observer.disconnect();
+    visibility?.disconnect();
     cancelAnimationFrame(frame);
     cancelAnimationFrame(positionFrame);
     doc.fonts?.removeEventListener('loadingdone', fontsLoaded);
