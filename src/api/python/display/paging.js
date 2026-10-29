@@ -1070,6 +1070,12 @@ function render({ model, el }) {
     let page = base, smallestWidth = Infinity, selectedNodes, shown;
     let widthFit;
     const heightLimit = initialHeightLimit(base);
+    // Finishing a modest expression is worth another couple of lines. Keep
+    // the ordinary target for partial previews: giving every prefix this
+    // allowance would just move the cutoff for arbitrarily large output.
+    const complete = candidate => candidate.start === 0 && candidate.end === candidate.total
+      && !candidate.markers.length;
+    const candidateHeightLimit = candidate => complete(candidate) ? heightLimit * 1.25 : heightLimit;
     const measured = new Map();
     function measure(candidate) {
       const saved = measured.get(candidate);
@@ -1091,7 +1097,14 @@ function render({ model, el }) {
       return result;
     }
     let heightFit;
-    if (Number.isFinite(heightLimit) && base.html.length > 16 * 1024 && layouts.length > 1) {
+    // The complete page has a little more room than its partial alternatives,
+    // so it can fit even when a shorter prefix misses the ordinary target.
+    // Check it before the binary search, whose cutoffs must be monotone.
+    if (Number.isFinite(heightLimit) && complete(base)) {
+      const result = measure(base);
+      if (result.width <= available + 1 && result.height <= candidateHeightLimit(base) + 1) heightFit = result;
+    }
+    if (!heightFit && Number.isFinite(heightLimit) && base.html.length > 16 * 1024 && layouts.length > 1) {
       // Alternatives progressively shorten the preview. Search the complete
       // prefixes first, instead of laying out a very long sum just to reject
       // its height. This threshold only chooses the search order; it does not
@@ -1103,7 +1116,7 @@ function render({ model, el }) {
         while (low <= high) {
           const middle = (low + high) >> 1;
           const result = measure(candidates[middle]);
-          if (result.width <= available + 1 && result.height <= heightLimit + 1) {
+          if (result.width <= available + 1 && result.height <= candidateHeightLimit(result.candidate) + 1) {
             heightFit = result;
             high = middle - 1;
           } else low = middle + 1;
@@ -1133,7 +1146,7 @@ function render({ model, el }) {
           page = candidate;
           selectedNodes = nodes;
         }
-        if (height <= heightLimit + 1
+        if (height <= candidateHeightLimit(candidate) + 1
             && (candidate === widthFit || keepsCompleteTerms(candidate, widthFit))) {
           page = candidate;
           selectedNodes = nodes;

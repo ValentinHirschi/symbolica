@@ -136,6 +136,28 @@ def refinement_pages():
     return compact, detailed
 
 
+def short_factor_product(count=6):
+    """Several short binomials: finishing the product costs just one more row."""
+    def html(compact):
+        factors = []
+        for i in range(count):
+            detail = (f'<mtext data-symbolica-marker="{i}">[{i + 1}]</mtext>' if compact else
+                      '<mspace width="180px" height="21px"/><mi>k</mi><mi>γ</mi>')
+            factors.append('<mrow data-symbolica-factor=""><mrow><mo>(</mo>'
+                           f'<mrow data-symbolica-path="{i}"><mi>M</mi><mi>g</mi>'
+                           f'<mo>+</mo>{detail}</mrow><mo>)</mo></mrow></mrow>')
+        return ('<math displaystyle="true"><mtable data-symbolica-product="" '
+                'data-symbolica-row-gap="0.5em" columnalign="left" rowspacing="0">'
+                '<mtr><mtd style="padding:0"><mrow>' + ''.join(factors)
+                + '</mrow></mtd></mtr></mtable></math>')
+
+    page = dict(product_page(), html=html(False), end=count, total=count)
+    page['layouts'] = [{'html': html(True), 'layout': 1,
+                        'markers': [[[i], f'Inspect sum [{i + 1}]'] for i in range(count)],
+                        'marker_ids': list(range(count)), 'marker_starts': [1] * count}]
+    return page
+
+
 def font_handler(font):
     return lambda route: (route.fulfill(path=font, content_type='font/woff2')
                           if font else route.abort())
@@ -180,6 +202,23 @@ class PagerRefinementTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_repeated_fits_keep_the_same_nested_rows_fractions_and_cells(self):
         await self.browser_cases(self.check_repeated_fits)
+
+    async def test_complete_products_get_a_small_height_allowance(self):
+        async def check(page):
+            for count, total, whole in [(6, 6, True), (6, 100, False), (12, 12, False)]:
+                fixture = dict(short_factor_product(count), total=total)
+                await self.mount(page, fixture, 490)
+                state = await page.evaluate("document.querySelector('#host').testPager.repeat('root')[0]")
+                with self.subTest(count=count, total=total):
+                    self.assertEqual(not state['markers'], whole, state)
+                    self.assertLessEqual(state['scroll'][0], 491)
+                    if whole:
+                        self.assertGreater(state['rect'][3], 252)
+                        self.assertLessEqual(state['rect'][3], 315)
+                    else:
+                        self.assertLessEqual(state['rect'][3], 253)
+
+        await self.browser_cases(check)
 
     async def test_fitting_single_rows_are_retained_but_still_reflow_on_resize(self):
         async def check(page):
