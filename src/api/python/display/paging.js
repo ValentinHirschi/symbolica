@@ -959,7 +959,9 @@ function render({ model, el }) {
   doc.defaultView.visualViewport?.addEventListener('resize', schedulePosition, { passive: true });
   doc.defaultView.visualViewport?.addEventListener('scroll', schedulePosition, { passive: true });
   let currentLayout = 0;
-  const send = (action, value) => model.send({ action, value, layout: currentLayout });
+  const send = (action, value) => model.send({
+    action, ...(value === undefined ? {} : { value }), layout: currentLayout
+  });
   function pageArrow(b, label, action) {
     b.classList.add('page-arrow');
     b.title = label;
@@ -987,6 +989,26 @@ function render({ model, el }) {
     rememberExpansion('collapse', collapseAll, {path:[], start:0}, math.getBoundingClientRect());
     send('collapse');
   };
+  function initialHeightLimit(page) {
+    // About eight ordinary math lines. This is a soft target: keep a taller
+    // expression when no shorter alternative retains useful complete terms.
+    // Explicit expansion and inspection must not immediately fold again.
+    return page.can_collapse || page.back || showAllLayout
+      ? Infinity : 12 * parseFloat(getComputedStyle(content).fontSize);
+  }
+  function keepsCompleteTerms(candidate, detailed) {
+    const template = sourceTemplate(candidate.html);
+    return candidate.markers.every(([path, label], index) => {
+      // Replacing a sum suffix removes complete terms. Existing omissions
+      // may also remain; height fitting must not add holes inside those terms.
+      if (label.toLowerCase().includes('sum')) return true;
+      if (detailed.markers.some(([parent], i) => parent.every((p, n) => path[n] === p)
+          && (path[parent.length] ?? candidate.marker_starts[index]) >= detailed.marker_starts[i])) return true;
+      const marker = template.template.content.querySelector(`[data-symbolica-marker="${candidate.marker_ids[index]}"]`);
+      return label.toLowerCase().includes('product') && marker
+        && !marker.closest('[data-symbolica-term]');
+    });
+  }
   function update(preservePreview = false) {
     const expansion = preservePreview === true ? null : pendingExpansions.shift();
     const restoreExpansionFocus = expansion && root.activeElement === expansion.button;
@@ -1017,7 +1039,12 @@ function render({ model, el }) {
     content.style.setProperty('--expression-zoom', 1);
     let available = math.clientWidth;
     let page = base, smallestWidth = Infinity, selectedNodes, shown;
-    for (const candidate of layouts) {
+    let widthFit;
+    const heightLimit = initialHeightLimit(base);
+    const measured = new Map();
+    function measure(candidate) {
+      const saved = measured.get(candidate);
+      if (saved && saved.available === available) return saved;
       putHtml(content, candidate.html);
       shown = candidate;
       decorateMarkers(candidate);
@@ -1028,12 +1055,52 @@ function render({ model, el }) {
       setWrapWidth(content, available);
       const width = widthWithCells(content,
         Math.max(content.scrollWidth, content.getBoundingClientRect().width), available);
-      if (width < smallestWidth) {
+      const result = {candidate, width, height:content.getBoundingClientRect().height,
+        available, nodes:[...content.childNodes]};
+      measured.set(candidate, result);
+      return result;
+    }
+    let heightFit;
+    if (Number.isFinite(heightLimit) && base.html.length > 16 * 1024 && layouts.length > 1) {
+      // Alternatives progressively shorten the preview. Search the complete
+      // prefixes first, instead of laying out a very long sum just to reject
+      // its height. This threshold only chooses the search order; it does not
+      // cap displayed markup. A fitting 64 KiB expression can still win.
+      const candidates = layouts.filter(candidate => candidate === base || keepsCompleteTerms(candidate, base));
+      let low = 0, high = candidates.length - 1;
+      while (low <= high) {
+        const middle = (low + high) >> 1;
+        const result = measure(candidates[middle]);
+        if (result.width <= available + 1 && result.height <= heightLimit + 1) {
+          heightFit = result;
+          high = middle - 1;
+        } else low = middle + 1;
+      }
+    }
+    if (heightFit) {
+      page = heightFit.candidate;
+      selectedNodes = heightFit.nodes;
+    } else for (const candidate of layouts) {
+      const result = measure(candidate);
+      const {width, height, nodes} = result;
+      if (!widthFit && width < smallestWidth) {
         page = candidate;
         smallestWidth = width;
-        selectedNodes = [...content.childNodes];
+        selectedNodes = nodes;
       }
-      if (width <= available + 1) { page = candidate; break; }
+      if (width <= available + 1) {
+        if (!widthFit) {
+          widthFit = candidate;
+          page = candidate;
+          selectedNodes = nodes;
+        }
+        if (height <= heightLimit + 1
+            && (candidate === widthFit || keepsCompleteTerms(candidate, widthFit))) {
+          page = candidate;
+          selectedNodes = nodes;
+          break;
+        }
+      }
     }
     currentLayout = page.layout || 0;
     content.dataset.layout = currentLayout;
@@ -1057,7 +1124,14 @@ function render({ model, el }) {
     const finalWidth = Math.min(available, math.clientWidth);
     if (finalWidth < available - .5) setWrapWidth(content, finalWidth);
     available = finalWidth;
-    revealFittingParts(layouts, available);
+    // Height fitting already rejected the longer prefixes. Refining them
+    // again repeats expensive layout work and cannot add another full page
+    // of terms within the same target. Width-only fits retain local refinement.
+    if (!Number.isFinite(heightLimit) || ((page === base || page === widthFit)
+        && content.getBoundingClientRect().height <= heightLimit + 1)) {
+      revealFittingParts(layouts, available, content, null,
+        Math.max(heightLimit, content.getBoundingClientRect().height));
+    }
     if (numberMarkers(content)) setWrapWidth(content, available);
     content.style.setProperty('--expression-zoom', zoom || 1);
     refitting = false;
@@ -1156,7 +1230,7 @@ function render({ model, el }) {
       marker.replaceChildren(b);
     }
   }
-  function revealFittingParts(layouts, available, container = content, context = null) {
+  function revealFittingParts(layouts, available, container = content, context = null, heightLimit = Infinity) {
     // Reuse only the bounded layouts already in this page. Providers can opt
     // in by marking corresponding MathML subtrees with data-symbolica-path.
     // Each marker keeps its source layout for valid kernel navigation.
@@ -1202,7 +1276,8 @@ function render({ model, el }) {
             : Math.max(container.scrollWidth, container.getBoundingClientRect().width), fittingWidth);
           // Keep DOM/transport-sized work bounded even when mixing layouts.
           fittingWidth = Math.min(fittingWidth, context ? container.clientWidth - 4 : math.clientWidth);
-          if (width <= fittingWidth + 1 && container.querySelectorAll('*').length <= 10000
+          if (width <= fittingWidth + 1 && container.getBoundingClientRect().height <= heightLimit + 1
+              && container.querySelectorAll('*').length <= 10000
               && container.innerHTML.length <= 256 * 1024) {
             changed = true;
             break;

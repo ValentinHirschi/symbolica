@@ -21,15 +21,18 @@ def backend_pages():
 
     factors = 'G^8*' + '*'.join(f'(k{i}+p{i})' for i in range(12))
     imaginary = E('-1i/16*' + factors).mathml_viewer(8)
-    negative_sum = E('a-1i/16*' + factors).mathml_viewer(25)
+    # Complete-term previews retain modest products even in narrow alternatives.
+    # Use a product beyond the per-layout factor bound to exercise expansion.
+    negative_sum = E('a-1i/16*G^8*' + '*'.join(
+        f'(k{i}+p{i})' for i in range(600))).mathml_viewer(25)
     rational = E('-3/16*' + factors).mathml_viewer(8)
     unit = E('-x').mathml_viewer(1)
     try:
         preview = imaginary.page()
         _, expanded = imaginary.handle_message(dict(action='expand_all', value=[]))
-        # A compact layout exposes the nested product's expansion capability.
-        # Expanding it must not add a '+' before its internal infix minus.
-        compact = next(p for p in negative_sum.page()['layouts']
+        # Expanding the nested product must not add a '+' before its infix minus.
+        initial_sum = negative_sum.page()
+        compact = next(p for p in [initial_sum, *initial_sum['layouts']]
                        if any(path == [1] for path, _ in p['markers']))
         _, expanded_sum = negative_sum.handle_message(dict(
             action='expand', value=[1], size=25, layout=compact['layout']))

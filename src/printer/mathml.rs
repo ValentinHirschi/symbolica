@@ -26,6 +26,7 @@ const MAX_NODES: usize = 1_000;
 const MAX_DEPTH: usize = 32;
 const MAX_LEAF_BYTES: usize = 4_096;
 const MAX_TEXT_BYTES: usize = 16_384;
+const MIN_BUDGET_PAGES: usize = 4;
 const PRODUCT_ROW_COST: usize = 48;
 // Scroll HTML containers, not the MathML root: a scrollport on inline math can
 // clip glyph ink and create miniature scrollbars in grid layouts.
@@ -574,12 +575,13 @@ impl Renderer<'_, '_> {
             Self::row(fragment)
         };
         let nodes = fragment.bytes().filter(|c| *c == b'<').count().max(1);
+        // The per-leaf ceiling applies even when a page has a larger allowance.
+        // Decline an oversized scoped fragment so its native arguments remain
+        // navigable instead of replacing it with a marker for itself.
+        if semantic && (fragment.len() > MAX_LEAF_BYTES || nodes > MAX_NODES) {
+            return None;
+        }
         if fragment.len() > MAX_LEAF_BYTES || fragment.len() > self.bytes || nodes > self.nodes {
-            // An opaque scoped fragment that cannot fit should not hide the
-            // native arguments behind a root marker that opens itself forever.
-            if semantic && (fragment.len() > MAX_LEAF_BYTES || nodes > MAX_NODES) {
-                return None;
-            }
             // A bounded semantic leaf only rejected by the remaining budget
             // must not fall back to raw tensor arguments. Let its containing
             // sum keep complete terms and omit the unfinished suffix instead.
@@ -940,15 +942,14 @@ impl Renderer<'_, '_> {
             && matches!(atom, AtomView::Add(_))
             && (self.multiline_sums || self.expansions.iter().any(|(p, _)| p == path));
         let previous_nested_limit = self.nested_limit;
-        if matches!(atom, AtomView::Add(_))
-            && ((depth == 0 && limit > DEFAULT_PAGE_SIZE)
-                || self.expansions.iter().any(|(p, _)| p == path))
-        {
-            // Show more asks for additional complete terms. Responsive
-            // alternatives must not pay for them by folding each term's
-            // factors. Keep the ordinary node/text/depth bounds: if a term
-            // exhausts them, the loop retains one navigable sum suffix.
+        let previous_depth_limit = self.depth_limit;
+        if matches!(atom, AtomView::Add(_)) && (depth == 0 || expanded_sum) {
+            // Wrapped sums vary the number of complete terms, rather than
+            // paying for additional rows by folding each term's factors.
+            // Keep the ordinary node/text/depth bounds: if a term exhausts
+            // them, the loop retains one navigable sum suffix.
             self.nested_limit = LAYOUTS[0].0;
+            self.depth_limit = self.depth_limit.max((depth + 4).min(MAX_DEPTH));
         }
         let mut expanded_terms = Vec::new();
         let markers_before = self.markers.len();
@@ -1015,7 +1016,7 @@ impl Renderer<'_, '_> {
                 _ => "<mo>,</mo>".to_owned(),
             };
             if wrap {
-                body.push_str("<mrow style=\"flex:0 0 auto\">");
+                body.push_str("<mrow data-symbolica-term=\"\" style=\"flex:0 0 auto\">");
             }
             if i > start {
                 if matches!(atom, AtomView::Add(_))
@@ -1072,10 +1073,11 @@ impl Renderer<'_, '_> {
                 arguments.push(omission);
             }
         }
-        let columns = self
-            .nested_limit
-            .clamp(2, if self.multiline_sums { 6 } else { 8 });
+        // The larger child budget keeps each term complete; it must not
+        // widen the compact layout's fallback rows and prevent mobile wraps.
+        let columns = previous_nested_limit.clamp(2, if self.multiline_sums { 6 } else { 8 });
         self.nested_limit = previous_nested_limit;
+        self.depth_limit = previous_depth_limit;
         if expanded_sum && expanded_terms.len() > columns {
             body = "<mtable data-symbolica-sum=\"\" columnalign=\"left\" rowspacing=\"0.35em\">"
                 .to_owned();
@@ -1559,7 +1561,12 @@ impl<'a> AtomView<'a> {
         let requested = expansions
             .iter()
             .fold(limit, |total, (_, count)| total.saturating_add(*count));
-        let budget_pages = requested.div_ceil(DEFAULT_PAGE_SIZE).clamp(1, 16);
+        // Scripted tensors and fractions can exceed 16 KiB of markup while
+        // occupying only a few lines. Give the initial preview 64 KiB as well
+        // as the corresponding node allowance; keep the 256 KiB ceiling.
+        let budget_pages = requested
+            .div_ceil(DEFAULT_PAGE_SIZE)
+            .clamp(MIN_BUDGET_PAGES, 16);
         let mut renderer = Renderer {
             opts: &opts,
             state,
@@ -1605,6 +1612,17 @@ impl<'a> AtomView<'a> {
                 .get_symbol()
                 .is_some_and(|s| s.get_name().len() > MAX_LEAF_BYTES)
         {
+            // Initial root sums need shorter complete prefixes for the
+            // browser's height target. Explicit larger pages and expansions
+            // retain their requested term counts in every alternative.
+            let limit = if matches!(atom, AtomView::Add(_))
+                && limit == DEFAULT_PAGE_SIZE
+                && expansions.is_empty()
+            {
+                limit.min(nested_limit.max(4))
+            } else {
+                limit
+            };
             renderer.sequence(atom, &mut vec![], 0, start, limit.max(1))
         } else if matches!(atom, AtomView::Fun(_)) && !renderer.hard_limit(atom, 0) {
             // A zero-argument function has already tried custom dispatch above.
@@ -1664,7 +1682,7 @@ mod tests {
             assert!(page.markers.is_empty(), "layout {layout}: {}", page.html);
             assert!(page.html.contains("<mn>16</mn>"));
         }
-        let long = parse!("19380*x*long_variable_y^3*long_variable_z^16+q");
+        let long = parse!("f(19380*x*long_variable_y^3*long_variable_z^16+q)");
         let page = long
             .as_view()
             .render_mathml_layout(&PrintOptions::new(), 0, 25, 5, &[]);
@@ -2185,45 +2203,54 @@ mod tests {
 
     #[test]
     fn native_function_keeps_complete_arguments_before_a_budget_refusal() {
-        let arguments = (0..100)
-            .map(|i| format!("g(k{i})"))
-            .collect::<Vec<_>>()
-            .join(",");
-        let expression = parse!(&format!("a*f({arguments})"));
-        let metric = crate::symbol!("g");
-        let fragment = "<msup><mi>g</mi><mrow><mi>μ</mi><mi>ν</mi></mrow></msup>";
-        let cursors = MathMlCursorCache::new(expression.as_view());
-        let mut calls = 0;
-        let mut semantic = |atom: AtomView<'_>, _: &PrintOptions, _: &PrintState| {
-            Ok((atom.get_symbol() == Some(metric)).then(|| {
-                calls += 1;
-                fragment.to_owned()
-            }))
-        };
-        let page = expression
-            .as_view()
-            .render_mathml_layout_cached(
-                &PrintOptions::new(),
-                0,
-                25,
-                0,
-                &[],
-                &cursors,
-                Some(&mut semantic),
-            )
-            .unwrap();
-        assert_eq!((page.end, page.total), (2, 2));
-        assert_eq!(page.html.matches("&#x2061;").count(), 1, "{}", page.html);
-        assert!(page.html.matches(fragment).count() > 1);
-        assert_eq!(page.markers.len(), 1);
-        assert_eq!(page.markers[0].path, [1]);
-        assert!(page.markers[0].start > 0);
-        assert!(calls <= 100);
+        for count in [200, 400] {
+            let arguments = (0..count)
+                .map(|i| format!("g(k{i})"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let expression = parse!(&format!("a*f({arguments})"));
+            let metric = crate::symbol!("g");
+            let fragment = "<msup><mi>g</mi><mrow><mi>μ</mi><mi>ν</mi></mrow></msup>";
+            let cursors = MathMlCursorCache::new(expression.as_view());
+            let mut calls = 0;
+            let mut semantic = |atom: AtomView<'_>, _: &PrintOptions, _: &PrintState| {
+                Ok((atom.get_symbol() == Some(metric)).then(|| {
+                    calls += 1;
+                    fragment.to_owned()
+                }))
+            };
+            let page = expression
+                .as_view()
+                .render_mathml_layout_cached(
+                    &PrintOptions::new(),
+                    0,
+                    25,
+                    0,
+                    &[],
+                    &cursors,
+                    Some(&mut semantic),
+                )
+                .unwrap();
+            assert_eq!((page.end, page.total), (2, 2));
+            assert_eq!(page.html.matches("&#x2061;").count(), 1, "{}", page.html);
+            assert!(page.html.matches(fragment).count() > 1);
+            if count == 200 {
+                // Moderate scripted output fits the initial preview, although its
+                // markup exceeded the old allowance.
+                assert!(page.markers.is_empty());
+                assert_eq!(page.html.matches(fragment).count(), count);
+            } else {
+                assert_eq!(page.markers.len(), 1);
+                assert_eq!(page.markers[0].path, [1]);
+                assert!(page.markers[0].start > 0);
+            }
+            assert!(calls <= count);
+        }
     }
 
     #[test]
     fn compound_function_and_power_factors_keep_useful_sum_previews() {
-        let sum = (0..400)
+        let sum = (0..1600)
             .map(|i| format!("x{i}^2"))
             .collect::<Vec<_>>()
             .join("+");
@@ -2463,7 +2490,7 @@ mod tests {
         let casimir = crate::symbol!("mathml_root_reserve::casimir");
         // Short powers exhaust nodes; long names exhaust the text budget.
         for prefix in ["x".to_owned(), "long".repeat(20)] {
-            let sum = (0..400)
+            let sum = (0..1600)
                 .map(|i| format!("{prefix}{i}^2"))
                 .collect::<Vec<_>>()
                 .join("+");
@@ -2502,9 +2529,9 @@ mod tests {
     }
 
     #[test]
-    fn root_reserve_preserves_requested_pages_and_noncompact_omissions() {
+    fn root_reserve_preserves_requested_pages_and_following_factors() {
         let casimir = crate::symbol!("mathml_root_reserve_limits::casimir");
-        let sum = (0..400)
+        let sum = (0..1600)
             .map(|i| format!("x{i}^2"))
             .collect::<Vec<_>>()
             .join("+");
@@ -2515,7 +2542,7 @@ mod tests {
         for (start, size, fragment, expected_end, expected_calls) in [
             (0, 2, "<msub><mi>C</mi><mi>A</mi></msub>", 2, 0),
             (1, 2, "<msub><mi>C</mi><mi>A</mi></msub>", 3, 1),
-            (0, 25, "<mi>long_visible_casimir_name</mi>", 2, 1),
+            (0, 25, "<mi>long_visible_casimir_name</mi>", 3, 1),
         ] {
             let mut calls = 0;
             let mut semantic = |atom: AtomView<'_>, _: &PrintOptions, _: &PrintState| {
@@ -2557,7 +2584,7 @@ mod tests {
     fn later_factor_previews_respect_budgets_and_keep_remaining_factors_navigable() {
         // Powers exhaust the node budget; long identifiers exhaust the text budget.
         for prefix in ["x".to_owned(), "long".repeat(20)] {
-            let sum = (0..400)
+            let sum = (0..1600)
                 .map(|i| format!("{prefix}{i}^2"))
                 .collect::<Vec<_>>()
                 .join("+");
@@ -2586,20 +2613,14 @@ mod tests {
                         Some(&mut observe),
                     )
                     .unwrap();
-                assert!(nodes <= MAX_NODES);
-                assert!(bytes <= MAX_TEXT_BYTES);
+                assert!(nodes <= MAX_NODES * MIN_BUDGET_PAGES);
+                assert!(bytes <= MAX_TEXT_BYTES * MIN_BUDGET_PAGES);
                 assert_eq!(page.total, 3);
-                assert_eq!(page.end, if fraction { 3 } else { 2 });
+                assert_eq!(page.end, 3);
                 assert!(page.html.contains(&format!("<mi>{prefix}")));
                 assert_eq!(page.html.contains("<mfrac"), fraction);
                 if fraction {
                     assert!(page.html.contains("<mo>−</mo>"));
-                } else {
-                    assert!(
-                        page.markers
-                            .iter()
-                            .any(|m| m.path.is_empty() && m.start == 2)
-                    );
                 }
                 let path = if fraction { vec![2, 0] } else { vec![1] };
                 assert!(page.markers.iter().any(|m| m.path == path && m.start > 0));
@@ -2623,7 +2644,7 @@ mod tests {
     fn oversized_first_root_item_keeps_bounded_preview() {
         // Short names exhaust the node budget; long names exhaust the text budget.
         for prefix in ["x".to_owned(), "long".repeat(20)] {
-            let sum = (0..400)
+            let sum = (0..1600)
                 .map(|i| format!("{prefix}{i}"))
                 .collect::<Vec<_>>()
                 .join("+");
@@ -2654,11 +2675,12 @@ mod tests {
                             Some(&mut observe),
                         )
                         .unwrap();
-                    assert!(nodes <= MAX_NODES);
-                    assert!(bytes <= MAX_TEXT_BYTES);
+                    assert!(nodes <= MAX_NODES * MIN_BUDGET_PAGES);
+                    assert!(bytes <= MAX_TEXT_BYTES * MIN_BUDGET_PAGES);
                     assert!(page.html.contains("<mi>"), "{}", page.html);
                     assert!(page.is_partial());
-                    assert_eq!((page.start, page.end, page.total), (start, start + 1, 2));
+                    assert_eq!((page.start, page.total), (start, 2));
+                    assert_eq!(page.end, if prefix == "x" { 2 } else { start + 1 });
                     assert!(page.markers.iter().any(|marker| marker.path.len() > 1));
                     for marker in &page.markers {
                         let target = cursors.locate(&marker.path).unwrap();
